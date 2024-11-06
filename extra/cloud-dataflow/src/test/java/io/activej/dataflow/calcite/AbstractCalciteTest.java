@@ -4,7 +4,9 @@ import io.activej.common.Utils;
 import org.junit.Test;
 
 import java.math.BigDecimal;
-import java.sql.*;
+import java.sql.Array;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
@@ -1059,7 +1061,7 @@ public abstract class AbstractCalciteTest extends CalciteTestBase {
 	}
 
 	@Test
-	public void testJoinByMultipleColums() {
+	public void testJoinByMultipleColumns() {
 		QueryResult result = query("""
 			SELECT s.lastName, s.firstName, p.courseCode, p.status, p.amount
 			FROM enrollment e
@@ -2032,30 +2034,24 @@ public abstract class AbstractCalciteTest extends CalciteTestBase {
 
 	@Test
 	public void testFailing() {
-		try {
-			query("""
-				SELECT *
-				FROM failing
-				""");
-			fail();
-		} catch (AssertionError e) {
-			Throwable cause = e.getCause();
-			assertThat(cause.getMessage(), containsString(FAILING_TABLE_EXCEPTION.getMessage()));
-		}
+		AssertionError e = assertThrows(AssertionError.class, () -> query("""
+			SELECT *
+			FROM failing
+			"""));
+
+		Throwable cause = e.getCause();
+		assertThat(cause.getMessage(), containsString(FAILING_TABLE_EXCEPTION.getMessage()));
 	}
 
 	@Test
 	public void testFailingFiltered() {
-		try {
-			query("""
-				SELECT *
-				FROM failing_filtered
-				""");
-			fail();
-		} catch (AssertionError e) {
-			Throwable cause = e.getCause();
-			assertThat(cause.getMessage(), containsString(FAILING_TABLE_EXCEPTION.getMessage()));
-		}
+		AssertionError e = assertThrows(AssertionError.class, () -> query("""
+			SELECT *
+			FROM failing_filtered
+			"""));
+
+		Throwable cause = e.getCause();
+		assertThat(cause.getMessage(), containsString(FAILING_TABLE_EXCEPTION.getMessage()));
 	}
 
 	@Test

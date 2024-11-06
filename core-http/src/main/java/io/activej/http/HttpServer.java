@@ -126,7 +126,9 @@ public final class HttpServer extends AbstractReactiveServer {
 
 		@Override
 		public void onServletException(HttpRequest request, Exception e) {
-			servletExceptions.recordException(e, request.toString());
+			HttpServerConnection connection = request.getConnection();
+			InetAddress remoteAddress = connection.getRemoteAddress();
+			servletExceptions.recordException(e, remoteAddress + ": " + request);
 		}
 
 		@Override
@@ -135,7 +137,8 @@ public final class HttpServer extends AbstractReactiveServer {
 			if (e instanceof AsyncTimeoutException) {
 				httpTimeouts.recordEvent();
 			} else {
-				httpErrors.recordException(e);
+				InetAddress remoteAddress = connection.getRemoteAddress();
+				httpErrors.recordException(e, remoteAddress);
 			}
 		}
 
@@ -143,7 +146,8 @@ public final class HttpServer extends AbstractReactiveServer {
 		public void onMalformedHttpRequest(HttpServerConnection connection, MalformedHttpException e, byte[] malformedRequestBytes) {
 			tryDecrementActiveRequests(connection);
 			String requestString = new String(malformedRequestBytes, ISO_8859_1);
-			malformedHttpExceptions.recordException(e, requestString);
+			InetAddress remoteAddress = connection.getRemoteAddress();
+			malformedHttpExceptions.recordException(e, remoteAddress + ": " + requestString);
 		}
 
 		@Override

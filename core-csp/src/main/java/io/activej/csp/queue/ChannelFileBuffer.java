@@ -16,6 +16,7 @@
 
 package io.activej.csp.queue;
 
+import io.activej.async.process.AsyncCloseable;
 import io.activej.bytebuf.ByteBuf;
 import io.activej.common.Checks;
 import io.activej.common.MemSize;
@@ -54,6 +55,8 @@ public final class ChannelFileBuffer extends ImplicitlyReactive implements Chann
 
 	private @Nullable Exception exception;
 
+	private @Nullable AsyncCloseable closeable;
+
 	private ChannelFileBuffer(ChannelFileReader reader, ChannelFileWriter writer, Executor executor, Path path) {
 		this.reader = reader;
 		this.writer = writer;
@@ -83,6 +86,10 @@ public final class ChannelFileBuffer extends ImplicitlyReactive implements Chann
 				ChannelFileReader reader = readerBuilder.build();
 				return new ChannelFileBuffer(reader, writer, executor, path);
 			});
+	}
+
+	public void setCloseable(@Nullable AsyncCloseable closeable) {
+		this.closeable = closeable;
 	}
 
 	@Override
@@ -153,9 +160,14 @@ public final class ChannelFileBuffer extends ImplicitlyReactive implements Chann
 			try {
 				Files.deleteIfExists(path);
 			} catch (IOException io) {
-				logger.error("failed to cleanup channel buffer file " + path, io);
+				logger.error("Failed to cleanup channel buffer file {}", path, io);
 			}
 		});
+
+		if (closeable != null) {
+			closeable.closeEx(e);
+			closeable = null;
+		}
 	}
 
 	public @Nullable Exception getException() {

@@ -246,7 +246,7 @@ public final class DynamicMBeanFactory {
 				} else {
 					throw new RuntimeException(format(
 						"Method \"%s\" of class \"%s\" is annotated with @JmxAnnotation but is neither getter nor setter",
-						method.getName(), method.getClass().getName())
+						method.getName(), method.getDeclaringClass().getName())
 					);
 				}
 			}
@@ -648,7 +648,7 @@ public final class DynamicMBeanFactory {
 			validateJmxMethod(method, JmxOperation.class);
 			JmxOperation annotation = method.getAnnotation(JmxOperation.class);
 			String opName = annotation.name();
-			if (opName.equals("")) {
+			if (opName.isEmpty()) {
 				opName = method.getName();
 			}
 
@@ -723,7 +723,7 @@ public final class DynamicMBeanFactory {
 
 			JmxOperation annotation = method.getAnnotation(JmxOperation.class);
 			String opName = annotation.name();
-			if (opName.equals("")) {
+			if (opName.isEmpty()) {
 				opName = method.getName();
 			}
 			Class<?>[] paramTypes = method.getParameterTypes();
