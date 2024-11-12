@@ -4,14 +4,14 @@
 
   <parent>
     <groupId>io.activej</groupId>
-    <artifactId>activej</artifactId>
+    <artifactId>activej-extra</artifactId>
     <version>6.0-SNAPSHOT</version>
-    <relativePath>../../pom.xml</relativePath>
+    <relativePath>../pom.xml</relativePath>
   </parent>
 
   <artifactId>activej-redis</artifactId>
 
-  <name>ActiveJ : Redis Client</name>
+  <name>ActiveJ : Extra : Redis Client</name>
   <description>
     Asynchronous lightweight high-performance Redis client with extendable API for Redis commands.
   </description>
