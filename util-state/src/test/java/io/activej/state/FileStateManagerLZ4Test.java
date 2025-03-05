@@ -7,7 +7,6 @@ import io.activej.serializer.stream.StreamInput;
 import io.activej.serializer.stream.StreamOutput;
 import io.activej.state.file.FileNamingScheme;
 import io.activej.state.file.FileNamingSchemes;
-import io.activej.state.file.FileState;
 import io.activej.state.file.FileStateManager;
 import net.jpountz.lz4.LZ4FrameInputStream;
 import net.jpountz.lz4.LZ4FrameOutputStream;
@@ -28,9 +27,9 @@ public class FileStateManagerLZ4Test {
 	@Rule
 	public final TemporaryFolder tmpFolder = new TemporaryFolder();
 
-	public static final FileNamingScheme NAMING_SCHEME = FileNamingSchemes.create("", "", "", "", '-');
+	public static final FileNamingScheme<Long> NAMING_SCHEME = FileNamingSchemes.ofLong("", "", "", "", "-");
 
-	private FileStateManager<byte[]> manager;
+	private FileStateManager<Long, byte[]> manager;
 
 	private BlockingFileSystem fileSystem;
 
@@ -40,10 +39,10 @@ public class FileStateManagerLZ4Test {
 		fileSystem = BlockingFileSystem.create(storage);
 		fileSystem.start();
 
-		manager = FileStateManager.<byte[]>builder(fileSystem, NAMING_SCHEME)
+		manager = FileStateManager.<Long, byte[]>builder(fileSystem, NAMING_SCHEME)
 			.withCodec(new BytesCodec())
-			.withUploadMapper(LZ4FrameOutputStream::new)
-			.withDownloadMapper(LZ4FrameInputStream::new)
+			.withUploadWrapper(LZ4FrameOutputStream::new)
+			.withDownloadWrapper(LZ4FrameInputStream::new)
 			.build();
 	}
 
@@ -53,10 +52,12 @@ public class FileStateManagerLZ4Test {
 		Arrays.fill(state, (byte) 10);
 
 		long revision = manager.save(state);
-		FileState<byte[]> loaded = manager.load();
+		//noinspection DataFlowIssue
+		long lastSnapshotRevision = manager.getLastSnapshotRevision();
+		byte[] loaded = manager.loadSnapshot(lastSnapshotRevision);
 
-		assertArrayEquals(state, loaded.state());
-		assertEquals(revision, loaded.revision());
+		assertArrayEquals(state, loaded);
+		assertEquals(revision, lastSnapshotRevision);
 
 		Map<String, FileMetadata> list = fileSystem.list("**");
 		assertEquals(1, list.size());

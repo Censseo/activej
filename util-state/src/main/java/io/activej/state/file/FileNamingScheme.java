@@ -2,21 +2,33 @@ package io.activej.state.file;
 
 import org.jetbrains.annotations.Nullable;
 
-public interface FileNamingScheme {
-	String snapshotGlob();
+import java.io.IOException;
+import java.util.regex.Pattern;
 
-	String encodeSnapshot(long revision);
+public interface FileNamingScheme<R extends Comparable<R>> {
+	boolean hasDiffsSupport();
 
-	@Nullable Long decodeSnapshot(String filename);
+	R nextRevision(@Nullable R previousRevision);
 
-	String diffGlob();
-
-	String diffGlob(long from);
-
-	String encodeDiff(long from, long to);
-
-	@Nullable Diff decodeDiff(String filename);
-
-	record Diff(long from, long to) {
+	default R firstRevision() {
+		return nextRevision(null);
 	}
+
+	Pattern snapshotPattern();
+
+	String snapshotPrefix();
+
+	String encodeSnapshot(R revision);
+
+	@Nullable R decodeSnapshot(String filename) throws IOException;
+
+	Pattern diffPattern();
+
+	String diffPrefix();
+
+	String encodeDiff(R from, R to);
+
+	@Nullable Diff<R> decodeDiff(String filename) throws IOException;
+
+	record Diff<R extends Comparable<R>>(R from, R to) {}
 }

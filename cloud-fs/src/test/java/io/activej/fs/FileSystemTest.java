@@ -30,7 +30,7 @@ import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import static io.activej.bytebuf.ByteBufStrings.wrapUtf8;
-import static io.activej.common.Utils.last;
+import static io.activej.common.collection.CollectionUtils.last;
 import static io.activej.fs.FileSystem.DEFAULT_TEMP_DIR;
 import static io.activej.fs.Utils.createEmptyDirectories;
 import static io.activej.promise.TestUtils.await;
@@ -40,8 +40,8 @@ import static java.nio.file.StandardOpenOption.CREATE;
 import static java.nio.file.StandardOpenOption.TRUNCATE_EXISTING;
 import static java.util.concurrent.Executors.newCachedThreadPool;
 import static java.util.stream.Collectors.toSet;
+import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.instanceOf;
 import static org.junit.Assert.*;
 import static org.junit.Assume.assumeTrue;
 

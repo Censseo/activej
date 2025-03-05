@@ -35,8 +35,8 @@ import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
 
-import static io.activej.common.Utils.concat;
-import static io.activej.common.Utils.intersection;
+import static io.activej.common.collection.CollectionUtils.concat;
+import static io.activej.common.collection.CollectionUtils.intersection;
 import static io.activej.cube.CubeStructure.AggregationConfig.id;
 import static io.activej.cube.TestUtils.dataSource;
 import static io.activej.cube.TestUtils.initializeUplink;
@@ -45,8 +45,8 @@ import static io.activej.cube.linear.CubeSqlNaming.DEFAULT_SQL_NAMING;
 import static io.activej.promise.TestUtils.await;
 import static io.activej.promise.TestUtils.awaitException;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.instanceOf;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 

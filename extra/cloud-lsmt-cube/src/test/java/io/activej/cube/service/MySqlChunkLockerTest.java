@@ -17,7 +17,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.stream.LongStream;
 
-import static io.activej.common.Utils.union;
+import static io.activej.common.collection.CollectionUtils.union;
 import static io.activej.cube.TestUtils.dataSource;
 import static io.activej.cube.linear.CubeSqlNaming.DEFAULT_SQL_NAMING;
 import static io.activej.cube.service.MySqlChunkLocker.DEFAULT_LOCK_TTL;
@@ -25,8 +25,8 @@ import static io.activej.promise.TestUtils.await;
 import static io.activej.promise.TestUtils.awaitException;
 import static java.util.Collections.nCopies;
 import static java.util.stream.Collectors.toSet;
+import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.instanceOf;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 

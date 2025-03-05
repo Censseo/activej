@@ -14,13 +14,13 @@ import org.junit.Test;
 
 import java.util.*;
 
-import static io.activej.common.Utils.last;
+import static io.activej.common.collection.CollectionUtils.last;
 import static io.activej.ot.OTAlgorithms.*;
 import static io.activej.ot.utils.Utils.add;
 import static io.activej.promise.TestUtils.await;
 import static io.activej.promise.TestUtils.awaitException;
+import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.instanceOf;
 import static org.junit.Assert.assertEquals;
 
 public class OTAlgorithmsTest {
