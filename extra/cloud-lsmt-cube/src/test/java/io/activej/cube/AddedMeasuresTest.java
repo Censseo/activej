@@ -497,6 +497,50 @@ public class AddedMeasuresTest extends CubeTestBase {
 		assertEquals(0, record5.getInt("value"));
 	}
 
+	@Test
+	public void notInitializedHyperLogLog() throws QueryException {
+		CubeStructure cubeStructure = CubeStructure.builder()
+			.withDimension("siteId", FieldTypes.ofInt())
+			.withMeasure("value", last(ofInt(), reactor))
+			.withMeasure("estimatedUniqueUserIdCountEmpty", hyperLogLog(1024))
+			.withAggregation(id(AGGREGATION_ID)
+				.withDimensions("siteId")
+				.withMeasures("value"))
+			.withAggregation(id(AGGREGATION_ID + "_empty")
+				.withDimensions("siteId")
+				.withMeasures("estimatedUniqueUserIdCountEmpty"))
+			.build();
+
+		StateManager<LogDiff<CubeDiff>, LogState<CubeDiff, CubeState>> stateManager = stateManagerFactory.create(cubeStructure, description);
+		CubeExecutor cubeExecutor = CubeExecutor.create(reactor, cubeStructure, EXECUTOR, CLASS_LOADER, aggregationChunkStorage);
+
+		StreamSupplier<EventRecord6> supplier = StreamSuppliers.ofValues(
+			new EventRecord6(1, 0),
+			new EventRecord6(2, 2),
+			new EventRecord6(3, 0),
+			new EventRecord6(4, 44)
+		);
+
+		ProtoCubeDiff diff = await(supplier.streamTo(cubeExecutor.consume(EventRecord6.class)));
+		Set<String> protoChunkIds = diff.addedProtoChunks().collect(toSet());
+		Map<String, Long> chunkIds = await(aggregationChunkStorage.finish(protoChunkIds));
+		await(stateManager.push(List.of(LogDiff.forCurrentPosition(materializeProtoDiff(diff, chunkIds)))));
+
+		ICubeReporting cubeReporting = CubeReporting.create(stateManager, cubeStructure, cubeExecutor);
+
+		List<String> measures = List.of("value", "estimatedUniqueUserIdCountEmpty");
+		QueryResult queryResult = await(cubeReporting.query(CubeQuery.builder()
+			.withMeasures(measures)
+			.build()));
+
+		assertEquals(measures, queryResult.getMeasures());
+		assertEquals(1, queryResult.getRecords().size());
+		Record record = first(queryResult.getRecords());
+
+		assertEquals(44, record.getLong("value"));
+		assertEquals(0, record.getInt("estimatedUniqueUserIdCountEmpty"));
+	}
+
 	private static FieldType<Byte> ofByteWrapped() {
 		return new FieldType<>(Byte.class, SerializerDefs.ofByte(false), JsonCodecs.ofByte()) {};
 	}
