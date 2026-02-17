@@ -374,47 +374,215 @@ public class StarterBindingGenerator implements BindingGenerator<Object> {
 
 ---
 
-### 4.3 Starters proposés
+### 4.3 Catalogue complet des starters proposés
 
-En suivant l'**Approche A** (recommandée), voici les starters envisagés :
+En suivant l'**Approche A** (recommandée), voici le catalogue exhaustif des starters envisagés, organisé par catégorie.
 
-| Starter | Contenu | Dépendances agrégées |
-|---------|---------|----------------------|
-| `activej-starter-http` | Eventloop, HttpServer, Config, ServiceGraph | core-http, boot-servicegraph, boot-config, launchers-common |
-| `activej-starter-http-mt` | Idem + WorkerPool, PrimaryServer | idem + boot-workers, core-net |
-| `activej-starter-rpc` | RpcServer, Eventloop, Config, ServiceGraph | cloud-rpc, boot-servicegraph, boot-config |
-| `activej-starter-monitoring` | JMX, Triggers | boot-jmx, boot-triggers |
-| `activej-starter-fs` | FileServer, Eventloop, Config, ServiceGraph | cloud-fs, boot-servicegraph, boot-config |
-| `activej-starter` | BOM (Bill of Materials) pour la gestion des versions | Toutes les versions alignées |
+#### Starters principaux (Core)
 
-### 4.4 Structure Maven proposée
+| Starter | Description | Ce qu'il fournit | Dépendances agrégées |
+|---------|-------------|------------------|----------------------|
+| `activej-starter` | **BOM** — gestion centralisée des versions | `<dependencyManagement>` aligné | Toutes les versions |
+| `activej-starter-http` | Serveur HTTP single/multi-thread | HttpServer, RoutingServlet, Config, ServiceGraph, ReactorModule | core-http, boot-servicegraph, boot-config, launchers-common |
+| `activej-starter-rpc` | Serveur/client RPC haute performance | RpcServer, RpcClient, stratégies d'envoi (round-robin, sharding, rendezvous hash), Config | cloud-rpc, boot-servicegraph, boot-config |
+| `activej-starter-fs` | Serveur de fichiers distribué | FileSystem (local/remote/cluster), opérations CRUD fichiers, Config | cloud-fs, boot-servicegraph, boot-config |
+
+#### Starters monitoring & opérations
+
+| Starter | Description | Ce qu'il fournit | Dépendances agrégées |
+|---------|-------------|------------------|----------------------|
+| `activej-starter-monitoring` | Monitoring JMX + health checks | JmxModule (MBeans auto-générés, métriques par worker), TriggersModule (severités DEBUG→DISASTER, suppression), stats (ValueStats, EventStats, ExceptionStats, histogrammes) | boot-jmx, boot-jmx-api, boot-jmx-stats, boot-triggers |
+
+**Détail du module monitoring :**
+```java
+MonitoringStarterModule.builder()
+    .withJmx()                          // MBeans auto-générés pour tous les services
+    .withTriggers()                     // Health checks avec niveaux de sévérité
+    .withGlobalEventloopStats()         // Métriques agrégées des Eventloops
+    .withBusinessLogicTriggers()        // Alertes sur temps de traitement
+    .withThrottlingTriggers()           // Alertes sur throttling
+    .build()
+```
+
+#### Starters sécurité & authentification
+
+| Starter | Description | Ce qu'il fournit | Dépendances agrégées |
+|---------|-------------|------------------|----------------------|
+| `activej-starter-security` | Authentification & sessions HTTP | BasicAuthServlet, SessionServlet, InMemorySessionStore, SslTcpSocket (TLS), HTTPS support | core-http (déjà existant dans core-http, ce starter configure et simplifie) |
+
+**Ce qui existe déjà dans ActiveJ pour la sécurité :**
+- `BasicAuthServlet` — authentification HTTP Basic avec lookup de credentials configurable
+- `SessionServlet` — gestion de sessions avec `ISessionStore` pluggable
+- `InMemorySessionStore` — store de sessions en mémoire
+- `SslTcpSocket` — support TLS/SSL pour les connexions TCP
+- Support HTTPS natif dans HttpServer et HttpClient
+
+**Ce que le starter apporterait :**
+```java
+SecurityStarterModule.builder()
+    .withBasicAuth(credentials -> ...)       // Auth HTTP Basic
+    .withSessions()                          // Sessions avec store in-memory
+    .withTls(sslContext)                     // TLS pour le serveur
+    .build()
+
+// Exemple d'utilisation
+public class SecureApp extends Launcher {
+    @Provides
+    AsyncServlet servlet(SessionServlet sessionServlet) {
+        return RoutingServlet.builder()
+            .with("/login", BasicAuthServlet.builder(
+                    loginServlet,
+                    credentials -> checkDb(credentials))
+                .build())
+            .with("/app/*", sessionServlet)
+            .build();
+    }
+
+    @Override
+    protected Module getModule() {
+        return Modules.combine(
+            HttpStarterModule.create(),
+            SecurityStarterModule.builder()
+                .withSessions()
+                .withTls(loadSslContext())
+                .build()
+        );
+    }
+}
+```
+
+> **Note** : ActiveJ ne fournit pas nativement OAuth2, JWT, ou RBAC. Le starter sécurité se limiterait à ce qui existe (Basic Auth, Sessions, TLS). Un `activej-starter-security-jwt` nécessiterait une dépendance externe.
+
+#### Starters données & stockage
+
+| Starter | Description | Ce qu'il fournit | Dépendances agrégées |
+|---------|-------------|------------------|----------------------|
+| `activej-starter-redis` | Client Redis async | RedisClient (RESPv2), commandes extensibles | extra/cloud-redis |
+| `activej-starter-serializer` | Sérialisation haute performance | Sérialiseurs bytecode-engineered, format binaire compact, gestion de compatibilité | core-serializer, core-codegen |
+| `activej-starter-dataflow` | Traitement batch distribué | Datasets multi-partition, SQL (Apache Calcite), JDBC driver | extra/cloud-dataflow |
+| `activej-starter-olap` | Base OLAP (cube) | LSM-Tree tables, dimensions/mesures pré-agrégées, requêtes OLAP | extra/cloud-lsmt-cube |
+
+#### Starters distribués & collaboration
+
+| Starter | Description | Ce qu'il fournit | Dépendances agrégées |
+|---------|-------------|------------------|----------------------|
+| `activej-starter-crdt` | Données distribuées sans conflit | Types CRDT, clustering, repartitioning, discovery services | extra/cloud-crdt |
+| `activej-starter-ot` | Transformation opérationnelle | Systèmes collaboratifs (type Google Docs), opérations JSON | extra/cloud-ot |
+| `activej-starter-etl` | Extract-Transform-Load | Pipeline ETL, intégration multilog | extra/cloud-etl |
+
+#### Starters streaming & communication
+
+| Starter | Description | Ce qu'il fournit | Dépendances agrégées |
+|---------|-------------|------------------|----------------------|
+| `activej-starter-streaming` | Streaming réactif | ChannelSupplier/Consumer (CSP), DataStream, rate limiting, compression LZ4, frame encoding | core-csp, core-datastream |
+| `activej-starter-websocket` | WebSocket | WebSocketServlet, upgrade HTTP→WS, frames binaires/texte | core-http (sous-ensemble) |
+
+#### Starters scheduling & lifecycle
+
+| Starter | Description | Ce qu'il fournit | Dépendances agrégées |
+|---------|-------------|------------------|----------------------|
+| `activej-starter-scheduler` | Planification de tâches | TaskScheduler (interval, period, delay), RetryPolicy, métriques JMX | core-promise, boot-jmx-stats |
+
+**Détail du scheduler :**
+```java
+SchedulerStarterModule.builder()
+    .withTask("cleanup", () -> cleanupOldData())
+        .every(Duration.ofHours(1))
+        .withRetryPolicy(RetryPolicy.exponentialBackoff(
+            Duration.ofSeconds(1), Duration.ofMinutes(5)))
+    .withTask("healthPing", () -> pingExternal())
+        .every(Duration.ofSeconds(30))
+    .build()
+```
+
+#### Starter test
+
+| Starter | Description | Ce qu'il fournit | Dépendances agrégées |
+|---------|-------------|------------------|----------------------|
+| `activej-starter-test` | Utilitaires de test | ActiveJRunner (JUnit), EventloopRule, ByteBufRule, UseModules, TestUtils, SQL test utils | test |
+
+### 4.4 Vue d'ensemble par priorité d'implémentation
+
+```
+Priorité 1 (Fondations) :
+  ├── activej-starter          (BOM)
+  ├── activej-starter-http     (serveur web)
+  ├── activej-starter-rpc      (RPC)
+  └── activej-starter-test     (tests)
+
+Priorité 2 (Production-ready) :
+  ├── activej-starter-monitoring    (JMX + triggers)
+  ├── activej-starter-security      (auth + sessions + TLS)
+  ├── activej-starter-scheduler     (tâches planifiées)
+  └── activej-starter-fs            (fichiers distribués)
+
+Priorité 3 (Données) :
+  ├── activej-starter-redis         (cache/store)
+  ├── activej-starter-serializer    (sérialisation binaire)
+  └── activej-starter-streaming     (CSP + datastream)
+
+Priorité 4 (Distribué avancé) :
+  ├── activej-starter-crdt          (données distribuées)
+  ├── activej-starter-dataflow      (batch processing)
+  ├── activej-starter-olap          (OLAP cube)
+  ├── activej-starter-ot            (collaboration)
+  ├── activej-starter-etl           (ETL pipelines)
+  └── activej-starter-websocket     (WebSocket)
+```
+
+### 4.5 Structure Maven proposée
 
 ```
 activej/
 ├── starters/
-│   ├── pom.xml                          # Parent POM des starters
-│   ├── activej-starter/                 # BOM
-│   │   └── pom.xml                      # <packaging>pom</packaging>
-│   ├── activej-starter-http/
-│   │   ├── pom.xml                      # Agrège les dépendances
-│   │   └── src/main/java/.../
-│   │       └── HttpStarterModule.java   # Module auto-configuré
-│   ├── activej-starter-http-mt/
+│   ├── pom.xml                              # Parent POM des starters
+│   │
+│   ├── activej-starter/                     # BOM (Bill of Materials)
+│   │   └── pom.xml
+│   │
+│   │── Priorité 1 : Fondations ─────────────────────────────
+│   ├── activej-starter-http/                # Serveur HTTP (single + multi-thread)
 │   │   ├── pom.xml
-│   │   └── src/main/java/.../
-│   │       └── HttpMtStarterModule.java
-│   ├── activej-starter-rpc/
+│   │   └── src/.../HttpStarterModule.java
+│   ├── activej-starter-rpc/                 # RPC client/serveur
 │   │   ├── pom.xml
-│   │   └── src/main/java/.../
-│   │       └── RpcStarterModule.java
-│   ├── activej-starter-monitoring/
+│   │   └── src/.../RpcStarterModule.java
+│   ├── activej-starter-test/                # Utilitaires de test
 │   │   ├── pom.xml
-│   │   └── src/main/java/.../
-│   │       └── MonitoringStarterModule.java
-│   └── activej-starter-fs/
-│       ├── pom.xml
-│       └── src/main/java/.../
-│           └── FsStarterModule.java
+│   │   └── src/.../TestStarterModule.java
+│   │
+│   │── Priorité 2 : Production ─────────────────────────────
+│   ├── activej-starter-monitoring/          # JMX + Triggers + Stats
+│   │   ├── pom.xml
+│   │   └── src/.../MonitoringStarterModule.java
+│   ├── activej-starter-security/            # Auth + Sessions + TLS
+│   │   ├── pom.xml
+│   │   └── src/.../SecurityStarterModule.java
+│   ├── activej-starter-scheduler/           # Tâches planifiées
+│   │   ├── pom.xml
+│   │   └── src/.../SchedulerStarterModule.java
+│   ├── activej-starter-fs/                  # Fichiers distribués
+│   │   ├── pom.xml
+│   │   └── src/.../FsStarterModule.java
+│   │
+│   │── Priorité 3 : Données ────────────────────────────────
+│   ├── activej-starter-redis/               # Client Redis async
+│   │   ├── pom.xml
+│   │   └── src/.../RedisStarterModule.java
+│   ├── activej-starter-serializer/          # Sérialisation binaire
+│   │   ├── pom.xml
+│   │   └── src/.../SerializerStarterModule.java
+│   ├── activej-starter-streaming/           # CSP + Datastream
+│   │   ├── pom.xml
+│   │   └── src/.../StreamingStarterModule.java
+│   │
+│   │── Priorité 4 : Distribué avancé ──────────────────────
+│   ├── activej-starter-crdt/                # CRDT distribué
+│   ├── activej-starter-dataflow/            # Batch processing
+│   ├── activej-starter-olap/               # OLAP cube
+│   ├── activej-starter-ot/                  # Operational transformation
+│   ├── activej-starter-etl/                 # ETL pipelines
+│   └── activej-starter-websocket/           # WebSocket dédié
 ```
 
 ---
@@ -1280,23 +1448,40 @@ L'approche B (SPI) pourrait être envisagée en **phase 2** si la demande de "ze
 ### Phase 1 : Fondations
 1. Créer le module parent `starters/pom.xml`
 2. Créer le BOM `activej-starter`
-3. Implémenter `activej-starter-http` (refactoring de `HttpServerLauncher`)
-4. Implémenter `activej-starter-http-mt` (refactoring de `MultithreadedHttpServerLauncher`)
-
-### Phase 2 : Extension
+3. Créer le `ReactorModule` partagé (module transversal de threading)
+4. Implémenter `activej-starter-http` (single + multi-thread via builder)
 5. Implémenter `activej-starter-rpc`
-6. Implémenter `activej-starter-monitoring` (JMX + Triggers)
-7. Implémenter `activej-starter-fs`
+6. Implémenter `activej-starter-test`
 
-### Phase 3 : Outillage
-8. Mettre à jour les archetypes pour utiliser les starters
-9. Mettre à jour les exemples
-10. Documentation
+### Phase 2 : Production-ready
+7. Implémenter `activej-starter-monitoring` (JMX + Triggers + Stats)
+8. Implémenter `activej-starter-security` (BasicAuth + Sessions + TLS)
+9. Implémenter `activej-starter-scheduler` (TaskScheduler + RetryPolicy)
+10. Implémenter `activej-starter-fs`
 
-### Phase 4 (optionnelle) : Auto-découverte
-11. Concevoir l'interface `AutoConfigModule`
-12. Implémenter le scanning SPI dans un module optionnel
-13. Adapter les starters pour supporter la découverte automatique
+### Phase 3 : Données & streaming
+11. Implémenter `activej-starter-redis`
+12. Implémenter `activej-starter-serializer`
+13. Implémenter `activej-starter-streaming` (CSP + Datastream)
+14. Implémenter `activej-starter-websocket`
+
+### Phase 4 : Distribué avancé (extra)
+15. Implémenter `activej-starter-crdt`
+16. Implémenter `activej-starter-dataflow`
+17. Implémenter `activej-starter-olap`
+18. Implémenter `activej-starter-ot`
+19. Implémenter `activej-starter-etl`
+
+### Phase 5 : Outillage & écosystème
+20. Mettre à jour les archetypes pour utiliser les starters
+21. Mettre à jour les exemples
+22. Documentation
+23. Migration guide (Launchers → Starters)
+
+### Phase 6 (optionnelle) : Auto-découverte
+24. Concevoir l'interface `AutoConfigModule`
+25. Implémenter le scanning SPI dans un module optionnel
+26. Adapter les starters pour supporter la découverte automatique
 
 ---
 
@@ -1336,4 +1521,23 @@ public class MyApp extends Launcher {
 
 L'introduction de starters dans ActiveJ est faisable et apporterait une amélioration significative de l'expérience développeur. L'approche recommandée (modules composables avec builder) reste fidèle à la philosophie du framework tout en résolvant la limitation principale de l'héritage simple des Launchers.
 
-Le gain principal est la **composabilité** : aujourd'hui, un `HttpServerLauncher` ne peut pas facilement devenir aussi un serveur RPC ou inclure du monitoring JMX sans réécrire toute la configuration. Avec les starters, c'est un simple `Modules.combine(HttpStarterModule.create(), RpcStarterModule.create(), MonitoringStarterModule.create())`.
+Le catalogue identifie **17 starters** répartis en 4 niveaux de priorité, couvrant :
+- **Serveurs** : HTTP (single/multi-thread), RPC, FileSystem, WebSocket
+- **Opérations** : monitoring (JMX/triggers/stats), scheduling, sécurité (auth/sessions/TLS)
+- **Données** : Redis, sérialisation binaire, streaming réactif
+- **Distribué** : CRDT, dataflow, OLAP, OT, ETL
+
+Le gain principal est la **composabilité** : aujourd'hui, un `HttpServerLauncher` ne peut pas facilement devenir aussi un serveur RPC ou inclure du monitoring JMX sans réécrire toute la configuration. Avec les starters :
+
+```java
+// Application HTTP + RPC + monitoring + scheduling + auth en quelques lignes
+Module app = Modules.combine(
+    HttpStarterModule.builder().withWorkers(8).build(),
+    RpcStarterModule.create(),
+    MonitoringStarterModule.create(),
+    SchedulerStarterModule.create(),
+    SecurityStarterModule.builder().withSessions().withTls(sslCtx).build()
+);
+```
+
+Le modèle de threading progressif (reactor partagé → reactors isolés → worker pools) permet d'adapter la performance sans changer d'architecture.
