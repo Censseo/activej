@@ -419,9 +419,332 @@ activej/
 
 ---
 
-## 5. Détail de l'implémentation du starter HTTP
+## 5. Modèle de threading et starters
 
-### 5.1 POM (`activej-starter-http/pom.xml`)
+### 5.1 Rappel : le modèle de threading d'ActiveJ
+
+Dans ActiveJ, le threading repose sur l'`Eventloop` (implémentation de `NioReactor`) :
+
+- **1 Eventloop = 1 Thread** : chaque Eventloop possède exactement un thread dédié qui exécute une boucle infinie (`select()` → I/O → tasks → repeat)
+- **Single-threaded par design** : à l'intérieur d'un Eventloop, tout est single-threaded (pas de locks, pas de synchronisation)
+- **Communication inter-threads** : via `ConcurrentLinkedQueue` (méthode `reactor.execute()`) pour soumettre des tâches d'un thread à un autre
+
+```
+Eventloop.run()
+   └── while (isAlive) {
+           selector.select()           // attente I/O
+           processSelectedKeys()       // traiter les événements réseau
+           executeConcurrentTasks()     // tâches soumises depuis d'autres threads
+           executeLocalTasks()          // tâches internes
+           executeScheduledTasks()      // tâches planifiées
+       }
+```
+
+### 5.2 Les modes de threading existants
+
+**Mode single-thread** (ex: `HttpServerLauncher`) :
+```
+┌─────────────────────────────────────┐
+│ 1 Eventloop (1 thread)              │
+│   └── HttpServer + AsyncServlet     │
+└─────────────────────────────────────┘
+```
+- Un seul `@Provides NioReactor` non qualifié
+- Tous les services partagent le même Eventloop
+
+**Mode multi-thread** (ex: `MultithreadedHttpServerLauncher`) :
+```
+┌─────────────────────────────────────────────────┐
+│ Primary Eventloop (thread 0)                     │
+│   └── PrimaryServer (accepte les connexions)     │
+│        ↓ round-robin                             │
+│ ┌──────────┐ ┌──────────┐ ┌──────────┐          │
+│ │ Worker 0 │ │ Worker 1 │ │ Worker 2 │  ...      │
+│ │ Eventloop│ │ Eventloop│ │ Eventloop│           │
+│ │ (thread) │ │ (thread) │ │ (thread) │           │
+│ │ HttpSrv  │ │ HttpSrv  │ │ HttpSrv  │           │
+│ └──────────┘ └──────────┘ └──────────┘          │
+└─────────────────────────────────────────────────┘
+```
+- `@Provides NioReactor` non qualifié → reactor primaire
+- `@Provides @Worker NioReactor` → un reactor par worker (scope DI isolé)
+- Chaque `WorkerPool.enterScope()` crée un `Injector` séparé avec ses propres instances
+
+### 5.3 Le problème : composition de starters et conflits de binding
+
+Quand on combine `HttpStarterModule` + `RpcStarterModule`, les deux veulent fournir un `NioReactor` :
+
+```java
+// HttpStarterModule
+@Provides NioReactor reactor() { return Eventloop.create(); }
+
+// RpcStarterModule
+@Provides NioReactor reactor() { return Eventloop.create(); }
+
+// → CONFLIT DI : deux bindings pour Key<NioReactor>
+```
+
+Ce conflit n'existe pas aujourd'hui car les Launchers utilisent l'héritage (un seul Launcher actif à la fois).
+
+### 5.4 Stratégies de threading pour les starters
+
+#### Stratégie 1 : Reactor partagé (recommandée par défaut)
+
+**Principe** : extraire le `NioReactor` dans un module dédié, les starters le consomment sans le fournir.
+
+```
+┌─────────────────────────────────────────────┐
+│ 1 Eventloop partagé (1 thread)              │
+│   ├── HttpServer  (fourni par HTTP starter) │
+│   └── RpcServer   (fourni par RPC starter)  │
+└─────────────────────────────────────────────┘
+```
+
+```java
+// ReactorModule — fournit LE reactor unique
+public class ReactorModule extends AbstractModule {
+    @Provides
+    NioReactor reactor(Config config,
+                       OptionalDependency<ThrottlingController> tc) {
+        return Eventloop.builder()
+            .initialize(ofEventloop(config.getChild("eventloop")))
+            .withInspector(tc.orElse(null))
+            .build();
+    }
+}
+
+// HttpStarterModule — consomme le reactor, ne le fournit PAS
+public class HttpStarterModule extends AbstractModule {
+    @Provides
+    HttpServer server(NioReactor reactor, AsyncServlet servlet, Config config) {
+        return HttpServer.builder(reactor, servlet)
+            .initialize(ofHttpServer(config.getChild("http")))
+            .build();
+    }
+}
+
+// RpcStarterModule — consomme le reactor, ne le fournit PAS
+public class RpcStarterModule extends AbstractModule {
+    @Provides
+    RpcServer rpcServer(NioReactor reactor, Config config) {
+        return RpcServer.builder(reactor)
+            .initialize(ofRpcServer(config.getChild("rpc")))
+            .build();
+    }
+}
+
+// Composition — pas de conflit
+Module app = Modules.combine(
+    ReactorModule.create(),        // 1 seul reactor
+    HttpStarterModule.create(),    // consomme le reactor
+    RpcStarterModule.create()      // consomme le même reactor
+);
+```
+
+**Avantages** :
+- Cohérent avec le modèle event-loop unique d'ActiveJ
+- Zéro contention (single-threaded)
+- Simple à comprendre et débugger
+- Performance maximale pour des workloads I/O-bound non-bloquants
+
+**Inconvénients** :
+- Un handler bloquant dans un starter bloque tous les autres
+- Pas d'isolation en cas de charge asymétrique (HTTP saturé, RPC idle)
+
+#### Stratégie 2 : Reactors isolés par qualifieur (1 thread par starter)
+
+**Principe** : chaque starter possède son propre Eventloop via un qualifieur DI.
+
+```
+┌──────────────────────────┐  ┌──────────────────────────┐
+│ Eventloop @Http (thread 1)│  │ Eventloop @Rpc (thread 2) │
+│   └── HttpServer          │  │   └── RpcServer           │
+└──────────────────────────┘  └──────────────────────────┘
+```
+
+```java
+// Annotations qualifieur
+@Qualifier @Retention(RUNTIME) public @interface Http {}
+@Qualifier @Retention(RUNTIME) public @interface Rpc {}
+
+// HttpStarterModule
+public class HttpStarterModule extends AbstractModule {
+    @Provides
+    @Http
+    NioReactor httpReactor(Config config) {
+        return Eventloop.builder()
+            .initialize(ofEventloop(config.getChild("eventloop.http")))
+            .build();
+    }
+
+    @Provides
+    HttpServer server(@Http NioReactor reactor, AsyncServlet servlet, Config config) {
+        return HttpServer.builder(reactor, servlet)
+            .initialize(ofHttpServer(config.getChild("http")))
+            .build();
+    }
+}
+
+// RpcStarterModule
+public class RpcStarterModule extends AbstractModule {
+    @Provides
+    @Rpc
+    NioReactor rpcReactor(Config config) {
+        return Eventloop.builder()
+            .initialize(ofEventloop(config.getChild("eventloop.rpc")))
+            .build();
+    }
+
+    @Provides
+    RpcServer rpcServer(@Rpc NioReactor reactor, Config config) {
+        return RpcServer.builder(reactor)
+            .initialize(ofRpcServer(config.getChild("rpc")))
+            .build();
+    }
+}
+```
+
+**Avantages** :
+- Isolation totale : la charge HTTP n'impacte pas le RPC
+- Configuration indépendante (`eventloop.http.*` vs `eventloop.rpc.*`)
+- Utile pour des workloads mixtes (I/O-bound + CPU-bound)
+
+**Inconvénients** :
+- Plus de threads = plus de ressources
+- Qualifieurs partout dans le code utilisateur
+- La communication entre starters nécessite `reactor.execute()` (cross-thread)
+
+#### Stratégie 3 : Reactor commun + Worker pools indépendants (avancée)
+
+**Principe** : un reactor primaire partagé accepte les connexions, chaque starter a son propre pool de workers.
+
+```
+┌────────────────────────────────────────────────────┐
+│ Primary Eventloop (thread 0) — accepte tout        │
+│    ↓ round-robin HTTP        ↓ round-robin RPC     │
+│ ┌────────────────┐        ┌────────────────┐       │
+│ │ HTTP Workers   │        │ RPC Workers    │       │
+│ │ ┌──────┐┌────┐│        │ ┌──────┐┌────┐ │       │
+│ │ │ EL#1 ││EL#2││        │ │ EL#3 ││EL#4│ │       │
+│ │ │ Http ││Http││        │ │ Rpc  ││Rpc │ │       │
+│ │ └──────┘└────┘│        │ └──────┘└────┘ │       │
+│ └────────────────┘        └────────────────┘       │
+└────────────────────────────────────────────────────┘
+```
+
+```java
+Module app = Modules.combine(
+    ReactorModule.create(),                     // reactor primaire partagé
+    HttpStarterModule.builder()
+        .withWorkers(4)                         // 4 threads dédiés HTTP
+        .build(),
+    RpcStarterModule.builder()
+        .withWorkers(2)                         // 2 threads dédiés RPC
+        .build()
+);
+```
+
+Ceci exploite le mécanisme existant de `WorkerPool` d'ActiveJ :
+- `WorkerPools.createPool(scope, size)` supporte déjà la création de pools multiples
+- Chaque pool crée N scopes DI isolés via `Injector.enterScope()`
+- Chaque scope a son propre `Eventloop` (= thread)
+- Le `PrimaryServer` distribue les connexions en round-robin vers les workers
+
+**Avantages** :
+- Maximum de performance et d'isolation
+- Scalabilité indépendante par protocole
+- Pattern éprouvé dans ActiveJ (MultithreadedHttpServerLauncher)
+
+**Inconvénients** :
+- Complexité accrue (scopes multiples, communication inter-threads)
+- Plus de threads = plus de ressources mémoire
+- Nécessite une attention aux scopes DI lors de la composition
+
+### 5.5 Recommandation : stratégie progressive
+
+La recommandation est une approche **progressive en 3 niveaux** :
+
+| Niveau | Mode | Threads | Cas d'usage |
+|--------|------|---------|-------------|
+| **1. Simple** | Reactor partagé | 1 | Prototypage, faible charge, apps mono-protocole |
+| **2. Isolé** | Reactors qualifiés | 1 par starter | Charge mixte, isolation nécessaire |
+| **3. Scalable** | Workers indépendants | N par starter | Production haute charge |
+
+L'API du builder permet cette progression sans changer d'architecture :
+
+```java
+// Niveau 1 : tout sur 1 thread (défaut)
+HttpStarterModule.create()
+
+// Niveau 2 : reactor isolé
+HttpStarterModule.builder()
+    .withDedicatedReactor()
+    .build()
+
+// Niveau 3 : worker pool dédié
+HttpStarterModule.builder()
+    .withWorkers(8)
+    .build()
+```
+
+Le `ReactorModule` partagé fournit le reactor par défaut. Quand un starter est configuré avec `.withDedicatedReactor()` ou `.withWorkers(n)`, il fournit son propre reactor qualifié et ne dépend plus du reactor partagé.
+
+### 5.6 Impact sur l'architecture des starters
+
+Ce modèle de threading influence la conception des starters :
+
+1. **Les starters ne fournissent PAS de `NioReactor` par défaut** — ils le consomment
+2. **Un `ReactorModule` dédié** est le point central de fourniture du reactor
+3. **Les options `withDedicatedReactor()` / `withWorkers(n)`** activent l'isolation quand nécessaire
+4. **Le `ServiceGraph`** gère automatiquement le démarrage/arrêt dans le bon ordre, quel que soit le nombre de threads
+5. **La communication cross-thread** (si starters sur des threads différents) passe par `reactor.execute()`, ce qui est déjà le mécanisme standard d'ActiveJ
+
+---
+
+## 6. Détail de l'implémentation des starters
+
+### 6.1 ReactorModule (module transversal)
+
+Le `ReactorModule` est le module fondamental partagé par tous les starters. Il fournit le `NioReactor` unique par défaut.
+
+```java
+package io.activej.starter;
+
+import io.activej.config.Config;
+import io.activej.eventloop.Eventloop;
+import io.activej.eventloop.inspector.ThrottlingController;
+import io.activej.inject.annotation.Provides;
+import io.activej.inject.binding.OptionalDependency;
+import io.activej.inject.module.AbstractModule;
+import io.activej.reactor.nio.NioReactor;
+
+import static io.activej.launchers.initializers.Initializers.ofEventloop;
+
+/**
+ * Provides a shared {@link NioReactor} (Eventloop) for all starters.
+ * <p>
+ * By default, all starters share a single Eventloop thread. Individual starters
+ * can opt into dedicated reactors via their builder (e.g. {@code .withDedicatedReactor()}).
+ */
+public final class ReactorModule extends AbstractModule {
+    private ReactorModule() {}
+
+    public static ReactorModule create() {
+        return new ReactorModule();
+    }
+
+    @Provides
+    NioReactor reactor(Config config,
+                       OptionalDependency<ThrottlingController> throttlingController) {
+        return Eventloop.builder()
+            .initialize(ofEventloop(config.getChild("eventloop")))
+            .withInspector(throttlingController.orElse(null))
+            .build();
+    }
+}
+```
+
+### 6.2 POM (`activej-starter-http/pom.xml`)
 
 ```xml
 <project>
@@ -459,7 +782,7 @@ activej/
 </project>
 ```
 
-### 5.2 Module (`HttpStarterModule.java`)
+### 6.3 Module (`HttpStarterModule.java`)
 
 ```java
 package io.activej.starter.http;
@@ -475,8 +798,14 @@ import io.activej.inject.binding.OptionalDependency;
 import io.activej.inject.module.AbstractModule;
 import io.activej.inject.module.Module;
 import io.activej.inject.module.Modules;
+import io.activej.net.PrimaryServer;
 import io.activej.reactor.nio.NioReactor;
 import io.activej.service.ServiceGraphModule;
+import io.activej.starter.ReactorModule;
+import io.activej.worker.WorkerPool;
+import io.activej.worker.WorkerPoolModule;
+import io.activej.worker.WorkerPools;
+import io.activej.worker.annotation.Worker;
 
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
@@ -484,24 +813,30 @@ import java.util.List;
 
 import static io.activej.config.Config.ofClassPathProperties;
 import static io.activej.config.Config.ofSystemProperties;
-import static io.activej.config.converter.ConfigConverters.ofInetSocketAddress;
-import static io.activej.launchers.initializers.Initializers.ofEventloop;
-import static io.activej.launchers.initializers.Initializers.ofHttpServer;
+import static io.activej.config.converter.ConfigConverters.*;
+import static io.activej.launchers.initializers.Initializers.*;
 
 /**
  * Starter module for HTTP server applications.
  * <p>
  * Provides sensible defaults for:
  * <ul>
- *   <li>{@link NioReactor} (Eventloop)</li>
  *   <li>{@link HttpServer} configured from properties</li>
  *   <li>{@link Config} with classpath + system property overrides</li>
  *   <li>{@link ServiceGraphModule} for lifecycle management</li>
+ *   <li>{@link ReactorModule} for the shared NioReactor (single-thread mode)</li>
+ * </ul>
+ * <p>
+ * <b>Threading modes :</b>
+ * <ul>
+ *   <li>{@code create()} — single-thread, reactor partagé (1 Eventloop)</li>
+ *   <li>{@code builder().withWorkers(n)} — multi-thread, N workers + 1 primary</li>
  * </ul>
  * <p>
  * The user only needs to provide an {@link AsyncServlet} binding.
  *
  * <pre>{@code
+ * // Mode simple (1 thread partagé)
  * public class MyApp extends Launcher {
  *     @Provides
  *     AsyncServlet servlet() {
@@ -513,10 +848,19 @@ import static io.activej.launchers.initializers.Initializers.ofHttpServer;
  *     protected Module getModule() {
  *         return HttpStarterModule.create();
  *     }
+ * }
+ *
+ * // Mode multi-thread (8 workers)
+ * public class MyApp extends Launcher {
+ *     @Provides @Worker
+ *     AsyncServlet servlet(@WorkerId int workerId) {
+ *         return request -> HttpResponse.ok200()
+ *             .withPlainText("Hello from worker #" + workerId).toPromise();
+ *     }
  *
  *     @Override
- *     protected void run() throws Exception {
- *         awaitShutdown();
+ *     protected Module getModule() {
+ *         return HttpStarterModule.builder().withWorkers(8).build();
  *     }
  * }
  * }</pre>
@@ -529,29 +873,28 @@ public final class HttpStarterModule extends AbstractModule {
     private final String host;
     private final int port;
     private final String propertiesFile;
+    private final int workers; // 0 = single-thread (reactor partagé)
 
-    private HttpStarterModule(String host, int port, String propertiesFile) {
+    private HttpStarterModule(String host, int port, String propertiesFile, int workers) {
         this.host = host;
         this.port = port;
         this.propertiesFile = propertiesFile;
+        this.workers = workers;
     }
 
-    public static HttpStarterModule create() {
-        return new HttpStarterModule(DEFAULT_HOST, DEFAULT_PORT, DEFAULT_PROPERTIES_FILE);
+    /**
+     * Creates a single-threaded HTTP starter.
+     * Uses the shared {@link ReactorModule} reactor (1 Eventloop thread).
+     */
+    public static Module create() {
+        return new Builder().build();
     }
 
     public static Builder builder() {
         return new Builder();
     }
 
-    @Provides
-    NioReactor reactor(Config config,
-                       OptionalDependency<ThrottlingController> throttlingController) {
-        return Eventloop.builder()
-            .initialize(ofEventloop(config.getChild("eventloop")))
-            .withInspector(throttlingController.orElse(null))
-            .build();
-    }
+    // ── Single-thread mode : consomme le NioReactor fourni par ReactorModule ──
 
     @Provides
     HttpServer server(NioReactor reactor, AsyncServlet rootServlet, Config config) {
@@ -578,10 +921,90 @@ public final class HttpStarterModule extends AbstractModule {
             .build());
     }
 
+    // ── Module interne pour le mode multi-thread ──
+
+    private static final class HttpMultithreadedModule extends AbstractModule {
+        private final String host;
+        private final int port;
+        private final int workers;
+        private final String propertiesFile;
+
+        HttpMultithreadedModule(String host, int port, int workers, String propertiesFile) {
+            this.host = host;
+            this.port = port;
+            this.workers = workers;
+            this.propertiesFile = propertiesFile;
+        }
+
+        @Provides
+        NioReactor primaryReactor(Config config) {
+            return Eventloop.builder()
+                .initialize(ofEventloop(config.getChild("eventloop.primary")))
+                .build();
+        }
+
+        @Provides
+        @Worker
+        NioReactor workerReactor(Config config,
+                                 OptionalDependency<ThrottlingController> tc) {
+            return Eventloop.builder()
+                .initialize(ofEventloop(config.getChild("eventloop.worker")))
+                .withInspector(tc.orElse(null))
+                .build();
+        }
+
+        @Provides
+        WorkerPool workerPool(WorkerPools workerPools, Config config) {
+            return workerPools.createPool(
+                config.get(ofInteger(), "workers", workers));
+        }
+
+        @Provides
+        PrimaryServer primaryServer(NioReactor primaryReactor,
+                                    WorkerPool.Instances<HttpServer> workerServers,
+                                    Config config) {
+            return PrimaryServer.builder(primaryReactor, workerServers.getList())
+                .initialize(ofPrimaryServer(config.getChild("http")))
+                .build();
+        }
+
+        @Provides
+        @Worker
+        HttpServer workerServer(NioReactor reactor, AsyncServlet servlet,
+                                Config config) {
+            return HttpServer.builder(reactor, servlet)
+                .initialize(ofHttpWorker(config.getChild("http")))
+                .build();
+        }
+
+        @Provides
+        Config config() {
+            return Config.create()
+                .with("http.listenAddresses",
+                    Config.ofValue(ofInetSocketAddress(),
+                        new InetSocketAddress(host, port)))
+                .with("workers", "" + workers)
+                .overrideWith(ofClassPathProperties(propertiesFile, true))
+                .overrideWith(ofSystemProperties("config"));
+        }
+
+        @Override
+        protected void configure() {
+            install(ServiceGraphModule.create());
+            install(WorkerPoolModule.create());
+            install(ConfigModule.builder()
+                .withEffectiveConfigLogger()
+                .build());
+        }
+    }
+
+    // ── Builder ──
+
     public static final class Builder {
         private String host = DEFAULT_HOST;
         private int port = DEFAULT_PORT;
         private String propertiesFile = DEFAULT_PROPERTIES_FILE;
+        private int workers = 0;
         private final List<Module> extraModules = new ArrayList<>();
 
         private Builder() {}
@@ -601,40 +1024,57 @@ public final class HttpStarterModule extends AbstractModule {
             return this;
         }
 
+        /**
+         * Enables multithreaded mode with N worker threads.
+         * Each worker gets its own Eventloop (thread) + HttpServer instance.
+         * A primary Eventloop accepts connections and distributes via round-robin.
+         * <p>
+         * Note: in this mode, the starter provides its OWN reactors
+         * and does NOT use the shared ReactorModule.
+         */
+        public Builder withWorkers(int workers) {
+            this.workers = workers;
+            return this;
+        }
+
         public Builder withModule(Module module) {
             this.extraModules.add(module);
             return this;
         }
 
         public Module build() {
-            Module starter = new HttpStarterModule(host, port, propertiesFile);
-            if (extraModules.isEmpty()) {
-                return starter;
+            List<Module> modules = new ArrayList<>();
+
+            if (workers > 0) {
+                // Multi-thread : le starter fournit ses propres reactors
+                modules.add(new HttpMultithreadedModule(host, port, workers, propertiesFile));
+            } else {
+                // Single-thread : utilise le reactor partagé de ReactorModule
+                modules.add(ReactorModule.create());
+                modules.add(new HttpStarterModule(host, port, propertiesFile, 0));
             }
-            List<Module> all = new ArrayList<>();
-            all.add(starter);
-            all.addAll(extraModules);
-            return Modules.combine(all);
+
+            modules.addAll(extraModules);
+            return Modules.combine(modules);
         }
     }
 }
 ```
 
-### 5.3 Expérience utilisateur résultante
+### 6.4 Expérience utilisateur résultante
 
 **Avant (avec Launcher hérité) :**
 ```java
-// Obligation d'hériter de HttpServerLauncher
-// Pas possible de combiner HTTP + RPC dans un même launcher
+// Obligation d'hériter — pas possible de combiner HTTP + RPC
 public class MyApp extends HttpServerLauncher {
     @Provides
     AsyncServlet servlet() { ... }
 }
 ```
 
-**Après (avec starters composables) :**
+**Après — Niveau 1 : simple, 1 thread partagé (défaut) :**
 ```java
-// Composition libre — on peut mixer HTTP + monitoring + custom
+// HTTP + RPC sur le même Eventloop (1 thread)
 public class MyApp extends Launcher {
     @Provides
     AsyncServlet servlet() { ... }
@@ -642,21 +1082,91 @@ public class MyApp extends Launcher {
     @Override
     protected Module getModule() {
         return Modules.combine(
-            HttpStarterModule.create(),
+            HttpStarterModule.create(),      // consomme le reactor partagé
+            RpcStarterModule.create(),       // consomme le même reactor
             MonitoringStarterModule.create()
         );
     }
 
     @Override
-    protected void run() throws Exception {
-        awaitShutdown();
-    }
+    protected void run() throws Exception { awaitShutdown(); }
 }
+```
+
+```
+Threading résultant :
+  1 Eventloop (1 thread) ── HttpServer + RpcServer + JMX
+```
+
+**Après — Niveau 2 : multi-thread HTTP, RPC partagé :**
+```java
+public class MyApp extends Launcher {
+    @Provides @Worker
+    AsyncServlet servlet(@WorkerId int id) { ... }
+
+    @Override
+    protected Module getModule() {
+        return Modules.combine(
+            HttpStarterModule.builder()
+                .withWorkers(4)              // 4 workers HTTP (4 threads)
+                .build(),
+            RpcStarterModule.create(),       // partage le reactor primaire
+            MonitoringStarterModule.create()
+        );
+    }
+
+    @Override
+    protected void run() throws Exception { awaitShutdown(); }
+}
+```
+
+```
+Threading résultant :
+  Primary Eventloop (thread 0) ── PrimaryServer (accept) + RpcServer + JMX
+    ├── Worker Eventloop (thread 1) ── HttpServer #0
+    ├── Worker Eventloop (thread 2) ── HttpServer #1
+    ├── Worker Eventloop (thread 3) ── HttpServer #2
+    └── Worker Eventloop (thread 4) ── HttpServer #3
+```
+
+**Après — Niveau 3 : tout multi-thread :**
+```java
+public class MyApp extends Launcher {
+    @Provides @Worker
+    AsyncServlet servlet(@WorkerId int id) { ... }
+
+    @Override
+    protected Module getModule() {
+        return Modules.combine(
+            HttpStarterModule.builder()
+                .withWorkers(4)              // 4 workers HTTP
+                .build(),
+            RpcStarterModule.builder()
+                .withWorkers(2)              // 2 workers RPC
+                .build(),
+            MonitoringStarterModule.create()
+        );
+    }
+
+    @Override
+    protected void run() throws Exception { awaitShutdown(); }
+}
+```
+
+```
+Threading résultant :
+  Primary Eventloop (thread 0) ── PrimaryServer (accept HTTP + RPC) + JMX
+    ├── HTTP Worker Eventloop (thread 1) ── HttpServer #0
+    ├── HTTP Worker Eventloop (thread 2) ── HttpServer #1
+    ├── HTTP Worker Eventloop (thread 3) ── HttpServer #2
+    ├── HTTP Worker Eventloop (thread 4) ── HttpServer #3
+    ├── RPC Worker Eventloop  (thread 5) ── RpcServer #0
+    └── RPC Worker Eventloop  (thread 6) ── RpcServer #1
 ```
 
 ---
 
-## 6. BOM (Bill of Materials)
+## 7. BOM (Bill of Materials)
 
 ### `activej-starter/pom.xml`
 
@@ -739,7 +1249,7 @@ public class MyApp extends Launcher {
 
 ---
 
-## 7. Comparaison des approches
+## 8. Comparaison des approches
 
 | Critère | A: Modules composables | B: Auto-découverte SPI | C: BindingGenerator |
 |---------|------------------------|------------------------|---------------------|
@@ -765,7 +1275,7 @@ L'approche B (SPI) pourrait être envisagée en **phase 2** si la demande de "ze
 
 ---
 
-## 8. Plan d'implémentation suggéré
+## 9. Plan d'implémentation suggéré
 
 ### Phase 1 : Fondations
 1. Créer le module parent `starters/pom.xml`
@@ -790,7 +1300,7 @@ L'approche B (SPI) pourrait être envisagée en **phase 2** si la demande de "ze
 
 ---
 
-## 9. Risques et considérations
+## 10. Risques et considérations
 
 ### Risques
 - **Fragmentation** : deux façons de faire la même chose (Launchers existants + Starters)
@@ -822,7 +1332,7 @@ public class MyApp extends Launcher {
 
 ---
 
-## 10. Conclusion
+## 11. Conclusion
 
 L'introduction de starters dans ActiveJ est faisable et apporterait une amélioration significative de l'expérience développeur. L'approche recommandée (modules composables avec builder) reste fidèle à la philosophie du framework tout en résolvant la limitation principale de l'héritage simple des Launchers.
 
