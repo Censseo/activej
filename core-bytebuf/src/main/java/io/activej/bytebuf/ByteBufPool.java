@@ -527,7 +527,9 @@ public final class ByteBufPool {
 		}
 
 		public Map<ByteBuf, Entry> getUnrecycledBufs() {
-			return new HashMap<>(allocateRegistry);
+			synchronized (allocateRegistry) {
+				return new HashMap<>(allocateRegistry);
+			}
 		}
 
 		@Override

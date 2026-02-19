@@ -43,7 +43,7 @@ public final class HyperLogLog extends Measure {
 
 	@Override
 	public Expression valueOfAccumulator(Expression accumulator) {
-		return call(accumulator, "estimate");
+		return ifNull(accumulator, value(0), call(accumulator, "estimate"));
 	}
 
 	@Override
@@ -55,12 +55,12 @@ public final class HyperLogLog extends Measure {
 	public Expression initAccumulatorWithAccumulator(Variable accumulator, Expression firstAccumulator) {
 		return sequence(
 			Expressions.set(accumulator, constructor(io.activej.cube.aggregation.util.HyperLogLog.class, value(registers))),
-			call(accumulator, "union", firstAccumulator));
+			ifNull(firstAccumulator, voidExp(), call(accumulator, "union", firstAccumulator)));
 	}
 
 	@Override
 	public Expression reduce(Variable accumulator, Variable nextAccumulator) {
-		return call(accumulator, "union", nextAccumulator);
+		return ifNull(nextAccumulator, voidExp(), call(accumulator, "union", nextAccumulator));
 	}
 
 	@Override

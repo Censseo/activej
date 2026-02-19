@@ -71,7 +71,7 @@ public final class ServiceGraph implements ConcurrentJmxBean {
 	 * adding to this SetMultimap element <N1,N2>. This collection consist of
 	 * nodes in which there are edges and their keys - previous nodes.
 	 */
-	private final Map<Key, Set<Key>> forwards = new HashMap<>();
+	private final Map<Key, Set<Key>> forwards = new ConcurrentHashMap<>();
 
 	/**
 	 * This set used to represent edges between vertices. If N1 and N2 - nodes
@@ -79,9 +79,9 @@ public final class ServiceGraph implements ConcurrentJmxBean {
 	 * adding to this SetMultimap element <N2,N1>. This collection consist of
 	 * nodes in which there are edges and their keys - previous nodes.
 	 */
-	private final Map<Key, Set<Key>> backwards = new HashMap<>();
+	private final Map<Key, Set<Key>> backwards = new ConcurrentHashMap<>();
 
-	private final Map<Key, Service> services = new HashMap<>();
+	private final Map<Key, Service> services = new ConcurrentHashMap<>();
 
 	private volatile long startBegin;
 	private volatile long startEnd;

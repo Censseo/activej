@@ -348,6 +348,7 @@ public final class BinarySerializers {
 	}
 
 	public static <E extends Enum<E>> BinarySerializer<E> ofEnum(Class<E> enumType) {
+		E[] enumConstants = enumType.getEnumConstants();
 		return new BinarySerializer<>() {
 			@Override
 			public void encode(BinaryOutput out, E item) {
@@ -356,7 +357,7 @@ public final class BinarySerializers {
 
 			@Override
 			public E decode(BinaryInput in) throws CorruptedDataException {
-				return enumType.getEnumConstants()[in.readVarInt()];
+				return enumConstants[in.readVarInt()];
 			}
 		};
 	}
