@@ -501,6 +501,243 @@ SchedulerStarterModule.builder()
 |---------|-------------|------------------|----------------------|
 | `activej-starter-test` | Utilitaires de test | ActiveJRunner (JUnit), EventloopRule, ByteBufRule, UseModules, TestUtils, SQL test utils | test |
 
+#### Starter AI (inspiré de Spring AI)
+
+| Starter | Description | Ce qu'il fournit | Dépendances agrégées |
+|---------|-------------|------------------|----------------------|
+| `activej-starter-ai` | Intégration LLM/AI | ChatClient async, streaming SSE, multi-provider (OpenAI, Anthropic, etc.), tool calling, RAG basique | core-http, core-csp, core-promise |
+
+##### Contexte : ce que fait Spring AI
+
+Spring AI (1.0 GA mai 2025) est devenu le standard Java pour l'intégration IA :
+- **ChatModel** : abstraction portable multi-provider (OpenAI, Anthropic, Google, AWS Bedrock, etc.)
+- **Streaming** : réponses en streaming via SSE (Server-Sent Events)
+- **Tool/Function Calling** : le LLM peut appeler des fonctions Java, Spring AI orchestre l'aller-retour
+- **RAG** : Retrieval-Augmented Generation avec vector stores (pgvector, Redis, Pinecone, etc.)
+- **MCP** (Model Context Protocol) : protocole standardisé pour connecter les modèles aux données/outils
+- **Memory** : gestion de l'historique conversationnel avec compaction et rétention
+- **Embeddings** : génération de vecteurs pour la recherche sémantique
+- **Observability** : métriques via Spring Boot Actuator / OpenTelemetry
+- **Agents** : orchestration multi-étapes avec le pattern Advisor
+
+##### Ce qu'ActiveJ a déjà pour le supporter
+
+ActiveJ possède d'excellentes fondations pour une intégration IA :
+
+| Capacité | Composant ActiveJ | Niveau de maturité |
+|----------|-------------------|-------------------|
+| **HTTP Client async** | `HttpClient` (core-http) | Prêt — pooling, TLS, headers |
+| **Streaming responses** | `ChannelSupplier<ByteBuf>` (core-csp) | Prêt — backpressure, composition |
+| **Async orchestration** | `Promise<T>`, `Promises.all()` | Prêt — chaînage, gestion d'erreurs |
+| **WebSocket** | `WebSocket`, `IWebSocketClient` | Prêt — bidirectionnel |
+| **JSON** | `MediaType.JSON`, `withJson()` | Partiel — pas de parser JSON intégré |
+| **SSE decoder** | Non existant | **À créer** |
+| **Sérialisation** | `BinarySerializer` (core-serializer) | Format binaire — pas JSON |
+
+##### Ce qu'il manque (à développer)
+
+1. **SSE (Server-Sent Events) decoder** : parser `text/event-stream` en flux de `ChatEvent`
+2. **JSON parser/mapper** : ActiveJ n'a pas de Jackson/Gson intégré (philosophie zero-deps)
+3. **Abstraction ChatModel** : interface unifiée multi-provider
+4. **Tool Calling orchestration** : boucle LLM → function call → résultat → LLM
+5. **Vector store client** : pour RAG (pourrait s'appuyer sur le Redis starter)
+
+##### Architecture proposée
+
+```java
+// ── Interface centrale ──
+public interface ChatClient {
+    /** Appel synchrone (bloquant au sens async — retourne un Promise) */
+    Promise<ChatResponse> chat(ChatRequest request);
+
+    /** Appel en streaming — retourne un flux de tokens */
+    ChannelSupplier<ChatEvent> chatStream(ChatRequest request);
+}
+
+// ── Implémentation OpenAI ──
+public class OpenAiChatClient implements ChatClient {
+    private final HttpClient httpClient;
+    private final String apiKey;
+    private final String model;
+
+    @Override
+    public Promise<ChatResponse> chat(ChatRequest request) {
+        return httpClient.request(
+                HttpRequest.post("https://api.openai.com/v1/chat/completions")
+                    .withHeader(AUTHORIZATION, "Bearer " + apiKey)
+                    .withHeader(CONTENT_TYPE, "application/json")
+                    .withBody(toJson(request))
+                    .build())
+            .then(response -> response.loadBody())
+            .map(body -> parseResponse(body.getString(UTF_8)));
+    }
+
+    @Override
+    public ChannelSupplier<ChatEvent> chatStream(ChatRequest request) {
+        // Utilise ChannelSupplier + SSE decoder pour le streaming
+        return ChannelSuppliers.ofPromise(
+            httpClient.request(streamRequest(request))
+                .map(response -> response.takeBodyStream()
+                    .transformWith(new SseDecoder())
+                    .map(this::parseChatEvent)));
+    }
+}
+
+// ── SSE Decoder (nouveau composant) ──
+public class SseDecoder implements ChannelSupplierTransformer<ByteBuf, String> {
+    // Découpe le flux de bytes en événements SSE
+    // Format: "data: {...json...}\n\n"
+    // Gère les lignes "data:", "event:", "id:", "retry:"
+}
+```
+
+##### Module DI proposé
+
+```java
+// ── Starter Module ──
+public final class AiStarterModule extends AbstractModule {
+    private AiStarterModule() {}
+
+    public static Builder builder() { return new Builder(); }
+
+    public static class Builder {
+        private AiProvider provider = AiProvider.OPENAI;
+        private String apiKey;
+        private String model = "gpt-4o";
+        private String baseUrl; // pour endpoints custom / proxies
+
+        public Builder withOpenAi(String apiKey) {
+            this.provider = AiProvider.OPENAI;
+            this.apiKey = apiKey;
+            return this;
+        }
+
+        public Builder withAnthropic(String apiKey) {
+            this.provider = AiProvider.ANTHROPIC;
+            this.apiKey = apiKey;
+            this.model = "claude-sonnet-4-5-20250929";
+            return this;
+        }
+
+        public Builder withModel(String model) {
+            this.model = model;
+            return this;
+        }
+
+        public Builder withBaseUrl(String baseUrl) {
+            this.baseUrl = baseUrl;
+            return this;
+        }
+
+        public Module build() { ... }
+    }
+}
+
+// ── Utilisation ──
+public class MyAiApp extends Launcher {
+
+    @Inject
+    ChatClient chatClient;
+
+    @Provides
+    AsyncServlet servlet(ChatClient chatClient) {
+        return RoutingServlet.builder()
+            .with(POST, "/chat", request -> {
+                return request.loadBody()
+                    .then(body -> chatClient.chat(
+                        ChatRequest.of(body.getString(UTF_8))))
+                    .map(response -> HttpResponse.ok200()
+                        .withJson(toJson(response)));
+            })
+            .with(GET, "/chat/stream", request -> {
+                String prompt = request.getQueryParameter("q");
+                ChannelSupplier<ChatEvent> stream =
+                    chatClient.chatStream(ChatRequest.of(prompt));
+
+                return HttpResponse.ok200()
+                    .withHeader(CONTENT_TYPE, "text/event-stream")
+                    .withBodyStream(stream
+                        .map(event -> wrapBuf("data: " + toJson(event) + "\n\n")));
+            })
+            .build();
+    }
+
+    @Override
+    protected Module getModule() {
+        return Modules.combine(
+            HttpStarterModule.create(),
+            AiStarterModule.builder()
+                .withAnthropic(System.getenv("ANTHROPIC_API_KEY"))
+                .withModel("claude-sonnet-4-5-20250929")
+                .build()
+        );
+    }
+
+    @Override
+    protected void run() throws Exception { awaitShutdown(); }
+}
+```
+
+##### Comparaison Spring AI vs ActiveJ AI (proposé)
+
+| Aspect | Spring AI | ActiveJ AI (proposé) |
+|--------|-----------|----------------------|
+| **Philosophie** | Convention, auto-config, synchrone par défaut | Explicite, async-first, zero-magic |
+| **Streaming** | `Flux<ChatResponse>` (Reactor) | `ChannelSupplier<ChatEvent>` (CSP) |
+| **Blocking** | Thread pool pour I/O | Event-loop non-bloquant natif |
+| **Providers** | 20+ intégrés | À implémenter (OpenAI, Anthropic prioritaires) |
+| **RAG** | Vector stores intégrés, Advisors | Basique (à combiner avec Redis starter) |
+| **Tool Calling** | Automatique via annotations | Explicite via interfaces |
+| **MCP** | Support natif | Non prévu (phase future) |
+| **JSON** | Jackson intégré | Léger / custom (philosophie zero-deps) |
+| **Memory** | ChatMemory avec compaction | À implémenter |
+| **Performances** | Bon (Spring overhead) | Excellent (event-loop, zero-copy) |
+| **Overhead mémoire** | Élevé (Spring context) | Minimal |
+| **Maturité** | 1.0 GA, écosystème large | Nouveau, à construire |
+
+##### Avantage compétitif d'ActiveJ pour l'IA
+
+L'intérêt d'un starter AI sur ActiveJ vs Spring AI serait la **performance** :
+- **Streaming SSE natif** via CSP channels (pas de conversion Reactor → Servlet)
+- **Event-loop non-bloquant** : pas de thread pool pour les appels API
+- **Zero-copy ByteBuf** : parsing efficace des réponses JSON
+- **Backpressure natif** : ChannelSupplier gère naturellement la pression
+- **Empreinte mémoire minimale** : pas de Spring context, pas de Jackson
+
+Cas d'usage idéal : **passerelle/proxy AI à haute performance** (API gateway LLM).
+
+##### Risques et limites
+
+- **JSON** : ActiveJ n'a pas de mapper JSON. Options :
+  - Dépendance externe optionnelle (Jackson, Gson, DSL-JSON)
+  - Parser JSON minimaliste custom (contre-productif pour la compatibilité)
+  - → **Recommandation** : accepter Jackson comme dépendance optionnelle
+- **Maturité** : Spring AI a 2 ans d'avance et 20+ providers
+- **Écosystème** : pas de vector store, pas d'embeddings, pas de MCP
+- **Maintenance** : les APIs des providers changent fréquemment
+
+##### Plan d'implémentation spécifique
+
+```
+Phase A (MVP) :
+  1. SseDecoder — parser text/event-stream → ChannelSupplier<SseEvent>
+  2. ChatClient interface + ChatRequest/ChatResponse DTOs
+  3. OpenAiChatClient (chat + streaming)
+  4. AnthropicChatClient (chat + streaming)
+  5. AiStarterModule avec builder
+
+Phase B (Fonctionnel) :
+  6. Tool/Function Calling (interface + orchestration)
+  7. ChatMemory (in-memory, configurable retention)
+  8. Retry/fallback entre providers
+
+Phase C (Avancé) :
+  9. Embeddings (OpenAI, Anthropic)
+  10. Vector store basique (in-memory, Redis via starter-redis)
+  11. RAG simplifié (query → embed → search → augment → chat)
+  12. MCP client basique
+```
+
 ### 4.4 Vue d'ensemble par priorité d'implémentation
 
 ```
@@ -521,7 +758,10 @@ Priorité 3 (Données) :
   ├── activej-starter-serializer    (sérialisation binaire)
   └── activej-starter-streaming     (CSP + datastream)
 
-Priorité 4 (Distribué avancé) :
+Priorité 4 (IA / LLM) :
+  └── activej-starter-ai            (ChatClient, streaming SSE, multi-provider)
+
+Priorité 5 (Distribué avancé) :
   ├── activej-starter-crdt          (données distribuées)
   ├── activej-starter-dataflow      (batch processing)
   ├── activej-starter-olap          (OLAP cube)
@@ -576,7 +816,12 @@ activej/
 │   │   ├── pom.xml
 │   │   └── src/.../StreamingStarterModule.java
 │   │
-│   │── Priorité 4 : Distribué avancé ──────────────────────
+│   │── Priorité 4 : IA / LLM ─────────────────────────────
+│   ├── activej-starter-ai/                  # ChatClient async, SSE, multi-provider
+│   │   ├── pom.xml
+│   │   └── src/.../AiStarterModule.java
+│   │
+│   │── Priorité 5 : Distribué avancé ──────────────────────
 │   ├── activej-starter-crdt/                # CRDT distribué
 │   ├── activej-starter-dataflow/            # Batch processing
 │   ├── activej-starter-olap/               # OLAP cube
@@ -1465,23 +1710,31 @@ L'approche B (SPI) pourrait être envisagée en **phase 2** si la demande de "ze
 13. Implémenter `activej-starter-streaming` (CSP + Datastream)
 14. Implémenter `activej-starter-websocket`
 
-### Phase 4 : Distribué avancé (extra)
-15. Implémenter `activej-starter-crdt`
-16. Implémenter `activej-starter-dataflow`
-17. Implémenter `activej-starter-olap`
-18. Implémenter `activej-starter-ot`
-19. Implémenter `activej-starter-etl`
+### Phase 4 : IA / LLM
+15. Implémenter `SseDecoder` (parser text/event-stream)
+16. Concevoir l'abstraction `ChatClient` + DTOs
+17. Implémenter `OpenAiChatClient` (chat + streaming)
+18. Implémenter `AnthropicChatClient` (chat + streaming)
+19. Implémenter `AiStarterModule` avec builder multi-provider
+20. Tool/Function calling et ChatMemory
 
-### Phase 5 : Outillage & écosystème
-20. Mettre à jour les archetypes pour utiliser les starters
-21. Mettre à jour les exemples
-22. Documentation
-23. Migration guide (Launchers → Starters)
+### Phase 5 : Distribué avancé (extra)
+21. Implémenter `activej-starter-crdt`
+22. Implémenter `activej-starter-dataflow`
+23. Implémenter `activej-starter-olap`
+24. Implémenter `activej-starter-ot`
+25. Implémenter `activej-starter-etl`
 
-### Phase 6 (optionnelle) : Auto-découverte
-24. Concevoir l'interface `AutoConfigModule`
-25. Implémenter le scanning SPI dans un module optionnel
-26. Adapter les starters pour supporter la découverte automatique
+### Phase 6 : Outillage & écosystème
+26. Mettre à jour les archetypes pour utiliser les starters
+27. Mettre à jour les exemples
+28. Documentation
+29. Migration guide (Launchers → Starters)
+
+### Phase 7 (optionnelle) : Auto-découverte
+30. Concevoir l'interface `AutoConfigModule`
+31. Implémenter le scanning SPI dans un module optionnel
+32. Adapter les starters pour supporter la découverte automatique
 
 ---
 
@@ -1521,10 +1774,11 @@ public class MyApp extends Launcher {
 
 L'introduction de starters dans ActiveJ est faisable et apporterait une amélioration significative de l'expérience développeur. L'approche recommandée (modules composables avec builder) reste fidèle à la philosophie du framework tout en résolvant la limitation principale de l'héritage simple des Launchers.
 
-Le catalogue identifie **17 starters** répartis en 4 niveaux de priorité, couvrant :
+Le catalogue identifie **18 starters** répartis en 5 niveaux de priorité, couvrant :
 - **Serveurs** : HTTP (single/multi-thread), RPC, FileSystem, WebSocket
 - **Opérations** : monitoring (JMX/triggers/stats), scheduling, sécurité (auth/sessions/TLS)
 - **Données** : Redis, sérialisation binaire, streaming réactif
+- **IA/LLM** : ChatClient async, streaming SSE, multi-provider (OpenAI, Anthropic), tool calling
 - **Distribué** : CRDT, dataflow, OLAP, OT, ETL
 
 Le gain principal est la **composabilité** : aujourd'hui, un `HttpServerLauncher` ne peut pas facilement devenir aussi un serveur RPC ou inclure du monitoring JMX sans réécrire toute la configuration. Avec les starters :
