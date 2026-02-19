@@ -122,6 +122,8 @@ public final class RpcClient extends AbstractNioReactive
 	private long connectTimeoutMillis = DEFAULT_CONNECT_TIMEOUT.toMillis();
 	private long reconnectIntervalMillis = DEFAULT_RECONNECT_INTERVAL.toMillis();
 
+	private int overloadedQueueLimit = 0;
+
 	private BinarySerializer<RpcMessage> requestSerializer;
 	private BinarySerializer<RpcMessage> responseSerializer;
 
@@ -371,6 +373,19 @@ public final class RpcClient extends AbstractNioReactive
 			return this;
 		}
 
+		/**
+		 * Limits the number of 'in-flight' RPC requests that are queued when this client is overloaded.
+		 *
+		 * @param overloadedQueueLimit overloaded queue limit (0 for 'no limit')
+		 * @return the builder for RPC client with limited overloaded queue size
+		 * @see io.activej.rpc.protocol.RpcMandatoryData
+		 */
+		public Builder withOverloadedQueueLimit(int overloadedQueueLimit) {
+			checkNotBuilt(this);
+			RpcClient.this.overloadedQueueLimit = overloadedQueueLimit;
+			return this;
+		}
+
 		@Override
 		protected RpcClient doBuild() {
 			checkState(requestSerializer != null && responseSerializer != null);
@@ -462,7 +477,7 @@ public final class RpcClient extends AbstractNioReactive
 					wrapClientSocket(reactor, tcpSocket, sslContext, sslExecutor);
 				RpcStream stream = new RpcStream(socket, responseSerializer, requestSerializer, defaultPacketSize,
 					autoFlushInterval, frameFormat, false); // , statsSerializer, statsDeserializer, statsCompressor, statsDecompressor);
-				RpcClientConnection connection = new RpcClientConnection(reactor, this, address, stream, keepAliveInterval.toMillis());
+				RpcClientConnection connection = new RpcClientConnection(this, address, stream, keepAliveInterval.toMillis());
 				stream.setListener(connection);
 
 				// jmx
@@ -766,6 +781,28 @@ public final class RpcClient extends AbstractNioReactive
 			.filter(entry -> !entry.getValue().isConnected())
 			.map(entry -> entry.getKey().toString())
 			.collect(toList());
+	}
+
+	@JmxAttribute(reducer = JmxReducerSum.class)
+	public int getOverloadedQueueLimit() {
+		return overloadedQueueLimit;
+	}
+
+	@JmxAttribute(description = "limit number of active mandatory requests when overloaded (0 for no limit)")
+	public void setOverloadedQueueLimit(int limit) {
+		this.overloadedQueueLimit = limit;
+		for (RpcClientConnection connection : connections.values()) {
+			connection.setOverloadedQueueLimit(limit);
+		}
+	}
+
+	@JmxAttribute(reducer = JmxReducerSum.class)
+	public int getOverloadedQueueSize() {
+		int overloadedQueueSize = 0;
+		for (RpcClientConnection connection : connections.values()) {
+			overloadedQueueSize += connection.getOverloadedQueueSize();
+		}
+		return overloadedQueueSize;
 	}
 
 	RpcRequestStats ensureRequestStatsPerClass(Class<?> requestClass) {

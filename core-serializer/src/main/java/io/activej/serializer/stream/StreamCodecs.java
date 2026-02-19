@@ -876,6 +876,7 @@ public class StreamCodecs {
 	}
 
 	public static <E extends Enum<E>> StreamCodec<E> ofEnum(Class<E> enumType) {
+		E[] enumConstants = enumType.getEnumConstants();
 		return new StreamCodec<>() {
 			@Override
 			public void encode(StreamOutput output, E value) throws IOException {
@@ -884,7 +885,7 @@ public class StreamCodecs {
 
 			@Override
 			public E decode(StreamInput input) throws IOException {
-				return enumType.getEnumConstants()[input.readVarInt()];
+				return enumConstants[input.readVarInt()];
 			}
 		};
 	}

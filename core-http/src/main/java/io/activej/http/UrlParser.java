@@ -362,7 +362,7 @@ public final class UrlParser {
 	public Map<String, String> getQueryParameters() {
 		Iterable<QueryParameter> queryParametersIterable = getQueryParametersIterable();
 		if (queryPositions == null) return Map.of();
-		HashMap<String, String> map = new HashMap<>(queryPositions.length);
+		Map<String, String> map = new LinkedHashMap<>(queryPositions.length);
 		for (QueryParameter queryParameter : queryParametersIterable) {
 			map.put(queryParameter.getKey(), queryParameter.getValue());
 		}

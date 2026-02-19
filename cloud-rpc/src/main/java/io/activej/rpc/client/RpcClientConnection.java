@@ -28,7 +28,6 @@ import io.activej.jmx.api.attribute.JmxAttribute;
 import io.activej.jmx.api.attribute.JmxReducers.JmxReducerSum;
 import io.activej.jmx.stats.EventStats;
 import io.activej.reactor.AbstractReactive;
-import io.activej.reactor.Reactor;
 import io.activej.reactor.schedule.ScheduledRunnable;
 import io.activej.rpc.client.jmx.RpcRequestStats;
 import io.activej.rpc.client.sender.RpcSender;
@@ -73,18 +72,20 @@ public final class RpcClientConnection extends AbstractReactive implements RpcSt
 	private final EventStats totalRequests;
 	private final EventStats connectionRequests;
 
+	private int overloadedQueueSize;
+	private int overloadedQueueLimit;
+
 	// keep-alive pings
 	private final long keepAliveMillis;
 	private boolean pongReceived;
 
-	RpcClientConnection(
-		Reactor reactor, RpcClient rpcClient, InetSocketAddress address, RpcStream stream, long keepAliveMillis
-	) {
-		super(reactor);
+	RpcClientConnection(RpcClient rpcClient, InetSocketAddress address, RpcStream stream, long keepAliveMillis) {
+		super(rpcClient.getReactor());
 		this.rpcClient = rpcClient;
 		this.stream = stream;
 		this.address = address;
 		this.keepAliveMillis = keepAliveMillis;
+		this.overloadedQueueLimit = rpcClient.getOverloadedQueueLimit();
 
 		// JMX
 		this.monitoring = false;
@@ -100,26 +101,35 @@ public final class RpcClientConnection extends AbstractReactive implements RpcSt
 		totalRequests.recordEvent();
 		connectionRequests.recordEvent();
 
-		if (!overloaded || request instanceof RpcMandatoryData) {
-			index++;
-
-			// jmx
-			if (monitoring) {
-				cb = doJmxMonitoring(request, timeout, cb);
-			}
-
-			if (timeout == Integer.MAX_VALUE) {
-				activeRequests.put(index, cb);
-			} else {
-				ScheduledCallback<O> scheduledRunnable = new ScheduledCallback<>(reactor.currentTimeMillis() + timeout, index, cb);
-				reactor.scheduleBackground(scheduledRunnable);
-				activeRequests.put(index, scheduledRunnable);
-			}
-
-			downstreamDataAcceptor.accept(new RpcMessage(index, request));
-		} else {
+		if (overloaded && !(request instanceof RpcMandatoryData)) {
 			doProcessOverloaded(cb);
+			return;
 		}
+
+		if (overloaded && overloadedQueueLimit > 0) {
+			if (overloadedQueueSize >= overloadedQueueLimit) {
+				doProcessOverloaded(cb);
+				return;
+			}
+			cb = overloadedMandatoryRequest(cb);
+		}
+
+		index++;
+
+		// jmx
+		if (monitoring) {
+			cb = doJmxMonitoring(request, timeout, cb);
+		}
+
+		if (timeout == Integer.MAX_VALUE) {
+			activeRequests.put(index, cb);
+		} else {
+			ScheduledCallback<O> scheduledRunnable = new ScheduledCallback<>(reactor.currentTimeMillis() + timeout, index, cb);
+			reactor.scheduleBackground(scheduledRunnable);
+			activeRequests.put(index, scheduledRunnable);
+		}
+
+		downstreamDataAcceptor.accept(new RpcMessage(index, request));
 	}
 
 	public class ScheduledCallback<O> extends ScheduledRunnable implements Callback<O> {
@@ -167,26 +177,47 @@ public final class RpcClientConnection extends AbstractReactive implements RpcSt
 		totalRequests.recordEvent();
 		connectionRequests.recordEvent();
 
-		if (!overloaded || request instanceof RpcMandatoryData) {
-			index++;
-
-			// jmx
-			if (monitoring) {
-				cb = doJmxMonitoring(request, Integer.MAX_VALUE, cb);
-			}
-
-			activeRequests.put(index, cb);
-
-			downstreamDataAcceptor.accept(new RpcMessage(index, request));
-		} else {
+		if (overloaded && !(request instanceof RpcMandatoryData)) {
 			doProcessOverloaded(cb);
+			return;
 		}
+
+		if (overloaded && overloadedQueueLimit > 0) {
+			if (overloadedQueueSize >= overloadedQueueLimit) {
+				doProcessOverloaded(cb);
+				return;
+			}
+			cb = overloadedMandatoryRequest(cb);
+		}
+
+		index++;
+
+		// jmx
+		if (monitoring) {
+			cb = doJmxMonitoring(request, Integer.MAX_VALUE, cb);
+		}
+
+		activeRequests.put(index, cb);
+
+		downstreamDataAcceptor.accept(new RpcMessage(index, request));
 	}
 
 	private <I, O> Callback<O> doJmxMonitoring(I request, int timeout, Callback<O> cb) {
 		RpcRequestStats requestStatsPerClass = rpcClient.ensureRequestStatsPerClass(request.getClass());
 		requestStatsPerClass.getTotalRequests().recordEvent();
 		return new JmxConnectionMonitoringResultCallback<>(requestStatsPerClass, cb, timeout);
+	}
+
+	void setOverloadedQueueLimit(int limit) {
+		this.overloadedQueueLimit = limit;
+	}
+
+	private <O> Callback<O> overloadedMandatoryRequest(Callback<O> cb) {
+		overloadedQueueSize++;
+		return (result, e) -> {
+			overloadedQueueSize--;
+			cb.accept(result, e);
+		};
 	}
 
 	private <O> void doProcessOverloaded(Callback<O> cb) {
@@ -358,6 +389,11 @@ public final class RpcClientConnection extends AbstractReactive implements RpcSt
 	@JmxAttribute(reducer = JmxReducerSum.class)
 	public int getActiveRequests() {
 		return activeRequests.size();
+	}
+
+	@JmxAttribute(reducer = JmxReducerSum.class)
+	public int getOverloadedQueueSize() {
+		return overloadedQueueSize;
 	}
 
 	@Override
