@@ -51,6 +51,7 @@
     <module>util-types</module>
     <module>util-state</module>
     <module>test</module>
+    <module>starters</module>
   </modules>
 
   <scm>

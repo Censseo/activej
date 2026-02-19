@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.activej</groupId>
+    <artifactId>activej</artifactId>
+    <version>6.0-SNAPSHOT</version>
+    <relativePath>../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>activej-starters</artifactId>
+  <packaging>pom</packaging>
+
+  <name>ActiveJ : Starters</name>
+  <description>
+    Composable starter modules for ActiveJ applications.
+    Each starter provides pre-configured modules with sensible defaults.
+  </description>
+
+  <modules>
+    <module>activej-starter</module>
+    <module>activej-starter-common</module>
+    <module>activej-starter-http</module>
+    <module>activej-starter-rpc</module>
+    <module>activej-starter-monitoring</module>
+    <module>activej-starter-security</module>
+    <module>activej-starter-scheduler</module>
+    <module>activej-starter-fs</module>
+    <module>activej-starter-redis</module>
+    <module>activej-starter-serializer</module>
+    <module>activej-starter-streaming</module>
+    <module>activej-starter-websocket</module>
+    <module>activej-starter-ai</module>
+    <module>activej-starter-test</module>
+  </modules>
+
+  <profiles>
+    <profile>
+      <id>extra</id>
+      <modules>
+        <module>activej-starter-crdt</module>
+        <module>activej-starter-dataflow</module>
+        <module>activej-starter-olap</module>
+        <module>activej-starter-ot</module>
+        <module>activej-starter-etl</module>
+      </modules>
+    </profile>
+  </profiles>
+
+</project>
