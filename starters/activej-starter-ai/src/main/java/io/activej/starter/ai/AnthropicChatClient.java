@@ -16,6 +16,8 @@
 
 package io.activej.starter.ai;
 
+import io.activej.csp.binary.BinaryChannelSupplier;
+import io.activej.csp.binary.decoder.impl.OfByteTerminated;
 import io.activej.csp.supplier.ChannelSupplier;
 import io.activej.csp.supplier.ChannelSuppliers;
 import io.activej.http.HttpHeaders;
@@ -27,7 +29,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
-import static io.activej.starter.ai.OpenAiChatClient.*;
+import static io.activej.starter.ai.JsonUtils.*;
 
 /**
  * Anthropic-compatible {@link ChatClient} implementation.
@@ -76,22 +78,36 @@ public final class AnthropicChatClient implements ChatClient {
 		double temperature = request.temperature() != 0.0 ? request.temperature() : defaultTemperature;
 		String jsonBody = buildRequestJson(model, request.messages(), true, temperature);
 
-		List<ChatEvent> events = new ArrayList<>();
-		Promise<Void> requestPromise = httpClient.request(
+		Promise<ChannelSupplier<ChatEvent>> promise = httpClient.request(
 				HttpRequest.post(baseUrl + "/messages")
 					.withHeader(HttpHeaders.CONTENT_TYPE, "application/json")
 					.withHeader(HttpHeaders.of("x-api-key"), apiKey)
 					.withHeader(HttpHeaders.of("anthropic-version"), ANTHROPIC_VERSION)
 					.withBody(jsonBody)
 					.build())
-			.then(response -> response.loadBody()
-				.map(body -> {
-					String responseBody = body.asString(StandardCharsets.UTF_8);
-					parseStreamEvents(responseBody, events);
-					return (Void) null;
-				}));
+			.map(response -> {
+				ChannelSupplier<String> lines = BinaryChannelSupplier.of(response.takeBodyStream())
+					.decodeStream(new OfByteTerminated((byte) '\n', 64 * 1024))
+					.map(buf -> buf.asString(StandardCharsets.UTF_8));
 
-		return ChannelSuppliers.ofValues(ChatEvent.of(""), ChatEvent.done());
+				return lines
+					.filter(line -> line.startsWith("data: "))
+					.map(line -> {
+						String data = line.substring(6).trim();
+						String type = extractJsonString(data, "type");
+						if ("message_stop".equals(type)) return null;
+						if ("content_block_delta".equals(type)) {
+							String delta = extractDeltaText(data);
+							if (delta != null && !delta.isEmpty()) {
+								return ChatEvent.of(delta);
+							}
+						}
+						return ChatEvent.of("");
+					})
+					.filter(event -> !event.delta().isEmpty());
+			});
+
+		return ChannelSuppliers.ofPromise(promise);
 	}
 
 	private String buildRequestJson(String model, List<ChatMessage> messages, boolean stream, double temperature) {
@@ -99,7 +115,6 @@ public final class AnthropicChatClient implements ChatClient {
 		sb.append("{\"model\":\"").append(escapeJson(model)).append("\"");
 		sb.append(",\"max_tokens\":4096");
 
-		// Anthropic treats system messages separately
 		String systemMessage = null;
 		List<ChatMessage> nonSystemMessages = new ArrayList<>();
 		for (ChatMessage msg : messages) {
@@ -135,81 +150,27 @@ public final class AnthropicChatClient implements ChatClient {
 		String model = extractJsonString(json, "model");
 		String content = extractAnthropicContent(json);
 
-		// Anthropic uses "input_tokens" and "output_tokens"
 		int inputTokens = extractJsonInt(json, "input_tokens");
 		int outputTokens = extractJsonInt(json, "output_tokens");
 		return new ChatResponse(id, model, content, new ChatResponse.Usage(inputTokens, outputTokens, inputTokens + outputTokens));
 	}
 
 	private String extractAnthropicContent(String json) {
-		// Anthropic returns content as an array: "content": [{"type": "text", "text": "..."}]
 		int contentIdx = json.indexOf("\"content\"");
 		if (contentIdx < 0) return "";
 		int arrayStart = json.indexOf('[', contentIdx);
 		if (arrayStart < 0) return "";
 		int textIdx = json.indexOf("\"text\"", arrayStart);
 		if (textIdx < 0) return "";
-		// Find the second "text" which is the actual content value (first is the type value)
 		int typeIdx = json.indexOf("\"type\"", arrayStart);
 		if (typeIdx >= 0 && typeIdx < textIdx) {
-			// Skip the "type":"text" pair, find the actual "text" key with value
 			int nextTextIdx = json.indexOf("\"text\"", textIdx + 1);
 			if (nextTextIdx < 0) {
-				// Only one "text" key - this is the content value
 				return extractValueAfterKey(json, textIdx);
 			}
 			return extractValueAfterKey(json, nextTextIdx);
 		}
 		return extractValueAfterKey(json, textIdx);
-	}
-
-	private String extractValueAfterKey(String json, int keyIdx) {
-		int colonIdx = json.indexOf(':', keyIdx);
-		if (colonIdx < 0) return "";
-		int start = json.indexOf('"', colonIdx + 1);
-		if (start < 0) return "";
-		start++;
-		StringBuilder sb = new StringBuilder();
-		for (int i = start; i < json.length(); i++) {
-			char c = json.charAt(i);
-			if (c == '\\' && i + 1 < json.length()) {
-				char next = json.charAt(i + 1);
-				switch (next) {
-					case '"' -> { sb.append('"'); i++; }
-					case '\\' -> { sb.append('\\'); i++; }
-					case 'n' -> { sb.append('\n'); i++; }
-					case 't' -> { sb.append('\t'); i++; }
-					case 'r' -> { sb.append('\r'); i++; }
-					default -> sb.append(c);
-				}
-			} else if (c == '"') {
-				break;
-			} else {
-				sb.append(c);
-			}
-		}
-		return sb.toString();
-	}
-
-	private void parseStreamEvents(String responseBody, List<ChatEvent> events) {
-		String[] lines = responseBody.split("\n");
-		for (String line : lines) {
-			if (line.startsWith("data: ")) {
-				String data = line.substring(6);
-				String type = extractJsonString(data, "type");
-				if ("content_block_delta".equals(type)) {
-					String delta = extractDeltaText(data);
-					if (delta != null && !delta.isEmpty()) {
-						events.add(ChatEvent.of(delta));
-					}
-				} else if ("message_stop".equals(type)) {
-					events.add(ChatEvent.done());
-				}
-			}
-		}
-		if (events.isEmpty() || !events.get(events.size() - 1).done()) {
-			events.add(ChatEvent.done());
-		}
 	}
 
 	private String extractDeltaText(String json) {

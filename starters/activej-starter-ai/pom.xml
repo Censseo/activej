@@ -21,37 +21,17 @@
   <dependencies>
     <dependency>
       <groupId>io.activej</groupId>
+      <artifactId>activej-starter-common</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.activej</groupId>
       <artifactId>activej-http</artifactId>
       <version>${project.version}</version>
     </dependency>
     <dependency>
       <groupId>io.activej</groupId>
       <artifactId>activej-csp</artifactId>
-      <version>${project.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>io.activej</groupId>
-      <artifactId>activej-promise</artifactId>
-      <version>${project.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>io.activej</groupId>
-      <artifactId>activej-inject</artifactId>
-      <version>${project.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>io.activej</groupId>
-      <artifactId>activej-eventloop</artifactId>
-      <version>${project.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>io.activej</groupId>
-      <artifactId>activej-servicegraph</artifactId>
-      <version>${project.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>io.activej</groupId>
-      <artifactId>activej-config</artifactId>
       <version>${project.version}</version>
     </dependency>
   </dependencies>

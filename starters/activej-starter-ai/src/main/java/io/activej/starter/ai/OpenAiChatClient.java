@@ -16,6 +16,8 @@
 
 package io.activej.starter.ai;
 
+import io.activej.csp.binary.BinaryChannelSupplier;
+import io.activej.csp.binary.decoder.impl.OfByteTerminated;
 import io.activej.csp.supplier.ChannelSupplier;
 import io.activej.csp.supplier.ChannelSuppliers;
 import io.activej.http.HttpHeaders;
@@ -24,8 +26,9 @@ import io.activej.http.IHttpClient;
 import io.activej.promise.Promise;
 
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.List;
+
+import static io.activej.starter.ai.JsonUtils.*;
 
 /**
  * OpenAI-compatible {@link ChatClient} implementation.
@@ -70,21 +73,29 @@ public final class OpenAiChatClient implements ChatClient {
 		double temperature = request.temperature() != 0.0 ? request.temperature() : defaultTemperature;
 		String jsonBody = buildRequestJson(model, request.messages(), true, temperature);
 
-		List<ChatEvent> events = new ArrayList<>();
-		Promise<Void> requestPromise = httpClient.request(
+		Promise<ChannelSupplier<ChatEvent>> promise = httpClient.request(
 				HttpRequest.post(baseUrl + "/chat/completions")
 					.withHeader(HttpHeaders.CONTENT_TYPE, "application/json")
 					.withHeader(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
 					.withBody(jsonBody)
 					.build())
-			.then(response -> response.loadBody()
-				.map(body -> {
-					String responseBody = body.asString(StandardCharsets.UTF_8);
-					parseStreamEvents(responseBody, events);
-					return (Void) null;
-				}));
+			.map(response -> {
+				ChannelSupplier<String> lines = BinaryChannelSupplier.of(response.takeBodyStream())
+					.decodeStream(new OfByteTerminated((byte) '\n', 64 * 1024))
+					.map(buf -> buf.asString(StandardCharsets.UTF_8));
 
-		return ChannelSuppliers.ofValues(ChatEvent.of(""), ChatEvent.done());
+				return lines
+					.filter(line -> line.startsWith("data: "))
+					.map(line -> {
+						String data = line.substring(6).trim();
+						if ("[DONE]".equals(data)) return null;
+						String delta = extractDeltaContent(data);
+						return ChatEvent.of(delta != null ? delta : "");
+					})
+					.filter(event -> !event.delta().isEmpty());
+			});
+
+		return ChannelSuppliers.ofPromise(promise);
 	}
 
 	private String buildRequestJson(String model, List<ChatMessage> messages, boolean stream, double temperature) {
@@ -116,22 +127,7 @@ public final class OpenAiChatClient implements ChatClient {
 		return new ChatResponse(id, model, content, new ChatResponse.Usage(promptTokens, completionTokens, totalTokens));
 	}
 
-	private void parseStreamEvents(String responseBody, List<ChatEvent> events) {
-		String[] lines = responseBody.split("\n");
-		for (String line : lines) {
-			if (line.startsWith("data: ") && !line.equals("data: [DONE]")) {
-				String data = line.substring(6);
-				String delta = extractDeltaContent(data);
-				if (delta != null && !delta.isEmpty()) {
-					events.add(ChatEvent.of(delta));
-				}
-			}
-		}
-		events.add(ChatEvent.done());
-	}
-
 	private String extractNestedContent(String json) {
-		// Extract "content" from the first choice's message
 		int choicesIdx = json.indexOf("\"choices\"");
 		if (choicesIdx < 0) return "";
 		int messageIdx = json.indexOf("\"message\"", choicesIdx);
@@ -147,82 +143,5 @@ public final class OpenAiChatClient implements ChatClient {
 		int contentIdx = json.indexOf("\"content\"", deltaIdx);
 		if (contentIdx < 0) return null;
 		return extractValueAfterKey(json, contentIdx);
-	}
-
-	private String extractValueAfterKey(String json, int keyIdx) {
-		int colonIdx = json.indexOf(':', keyIdx);
-		if (colonIdx < 0) return "";
-		int start = json.indexOf('"', colonIdx + 1);
-		if (start < 0) return "";
-		start++;
-		StringBuilder sb = new StringBuilder();
-		for (int i = start; i < json.length(); i++) {
-			char c = json.charAt(i);
-			if (c == '\\' && i + 1 < json.length()) {
-				char next = json.charAt(i + 1);
-				switch (next) {
-					case '"' -> { sb.append('"'); i++; }
-					case '\\' -> { sb.append('\\'); i++; }
-					case 'n' -> { sb.append('\n'); i++; }
-					case 't' -> { sb.append('\t'); i++; }
-					case 'r' -> { sb.append('\r'); i++; }
-					default -> sb.append(c);
-				}
-			} else if (c == '"') {
-				break;
-			} else {
-				sb.append(c);
-			}
-		}
-		return sb.toString();
-	}
-
-	static String extractJsonString(String json, String key) {
-		String search = "\"" + key + "\"";
-		int idx = json.indexOf(search);
-		if (idx < 0) return "";
-		int colonIdx = json.indexOf(':', idx + search.length());
-		if (colonIdx < 0) return "";
-		int start = json.indexOf('"', colonIdx + 1);
-		if (start < 0) return "";
-		start++;
-		int end = json.indexOf('"', start);
-		if (end < 0) return "";
-		return json.substring(start, end);
-	}
-
-	static int extractJsonInt(String json, String key) {
-		String search = "\"" + key + "\"";
-		int idx = json.indexOf(search);
-		if (idx < 0) return 0;
-		int colonIdx = json.indexOf(':', idx + search.length());
-		if (colonIdx < 0) return 0;
-		int start = colonIdx + 1;
-		while (start < json.length() && json.charAt(start) == ' ') start++;
-		int end = start;
-		while (end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == '-')) end++;
-		if (start == end) return 0;
-		try {
-			return Integer.parseInt(json.substring(start, end));
-		} catch (NumberFormatException e) {
-			return 0;
-		}
-	}
-
-	static String escapeJson(String s) {
-		if (s == null) return "";
-		StringBuilder sb = new StringBuilder(s.length());
-		for (int i = 0; i < s.length(); i++) {
-			char c = s.charAt(i);
-			switch (c) {
-				case '"' -> sb.append("\\\"");
-				case '\\' -> sb.append("\\\\");
-				case '\n' -> sb.append("\\n");
-				case '\r' -> sb.append("\\r");
-				case '\t' -> sb.append("\\t");
-				default -> sb.append(c);
-			}
-		}
-		return sb.toString();
 	}
 }
