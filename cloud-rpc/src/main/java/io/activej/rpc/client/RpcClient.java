@@ -474,7 +474,7 @@ public final class RpcClient extends AbstractNioReactive
 				tcpSocket.setInspector(statsSocket);
 				ITcpSocket socket = sslContext == null ?
 					tcpSocket :
-					wrapClientSocket(reactor, tcpSocket, sslContext, sslExecutor);
+					wrapClientSocket(reactor, tcpSocket, address.getHostString(), address.getPort(), sslContext, sslExecutor);
 				RpcStream stream = new RpcStream(socket, responseSerializer, requestSerializer, defaultPacketSize,
 					autoFlushInterval, frameFormat, false); // , statsSerializer, statsDeserializer, statsCompressor, statsDecompressor);
 				RpcClientConnection connection = new RpcClientConnection(this, address, stream, keepAliveInterval.toMillis());

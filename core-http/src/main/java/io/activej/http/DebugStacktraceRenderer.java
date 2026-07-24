@@ -100,7 +100,7 @@ public final class DebugStacktraceRenderer {
 	public static HttpResponse.Builder render(Exception e, int code) {
 		StringWriter writer = new StringWriter();
 		e.printStackTrace(new PrintWriter(writer));
-		Matcher matcher = STACK_TRACE_ELEMENT.matcher(writer.toString());
+		Matcher matcher = STACK_TRACE_ELEMENT.matcher(HttpExceptionFormatter.escapeHtml(writer.toString()));
 		StringBuilder stacktrace = new StringBuilder();
 		while (matcher.find()) {
 			String cls = matcher.group(2);

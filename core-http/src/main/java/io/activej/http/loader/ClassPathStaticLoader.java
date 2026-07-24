@@ -21,6 +21,7 @@ import io.activej.common.Checks;
 import io.activej.promise.Promise;
 import io.activej.reactor.AbstractReactive;
 import io.activej.reactor.Reactor;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -43,10 +44,12 @@ public class ClassPathStaticLoader extends AbstractReactive
 	private final Executor executor;
 	private final ClassLoader classLoader;
 	private final String root;
+	private final @Nullable Path rootNormalized;
 
 	private ClassPathStaticLoader(Reactor reactor, Executor executor, ClassLoader classLoader, String root) {
 		super(reactor);
 		this.root = root;
+		this.rootNormalized = root.isEmpty() ? null : Paths.get(root).normalize();
 		this.executor = executor;
 		this.classLoader = classLoader;
 	}
@@ -76,7 +79,12 @@ public class ClassPathStaticLoader extends AbstractReactive
 		}
 		path += name.substring(begin);
 
-		String finalPath = path;
+		Path normalized = Paths.get(path).normalize();
+		if (normalized.isAbsolute() || normalized.startsWith("..") ||
+			(rootNormalized != null && !normalized.startsWith(rootNormalized))) {
+			return Promise.ofException(new ResourceNotFoundException("Could not find '" + name + "' in class path"));
+		}
+		String finalPath = normalized.toString().replace('\\', '/');
 
 		return Promise.ofBlocking(executor, () -> {
 			URL resource = classLoader.getResource(finalPath);

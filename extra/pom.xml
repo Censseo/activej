@@ -33,7 +33,7 @@
   </modules>
 
   <properties>
-    <jackson.version>2.17.2</jackson.version>
+    <jackson.version>2.18.2</jackson.version>
   </properties>
 
   <dependencyManagement>
@@ -96,7 +96,7 @@
       <dependency>
         <groupId>com.mysql</groupId>
         <artifactId>mysql-connector-j</artifactId>
-        <version>9.0.0</version>
+        <version>9.1.0</version>
       </dependency>
       <dependency>
         <groupId>com.dslplatform</groupId>

@@ -34,6 +34,7 @@ import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLEngineResult.HandshakeStatus;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLParameters;
 import java.nio.ByteBuffer;
 import java.util.concurrent.Executor;
 
@@ -80,6 +81,9 @@ public final class SslTcpSocket extends AbstractNioReactive implements ITcpSocke
 	) {
 		SSLEngine sslEngine = sslContext.createSSLEngine(host, port);
 		sslEngine.setUseClientMode(true);
+		SSLParameters sslParameters = sslEngine.getSSLParameters();
+		sslParameters.setEndpointIdentificationAlgorithm("HTTPS");
+		sslEngine.setSSLParameters(sslParameters);
 		return create(reactor, socket, sslEngine, executor);
 	}
 

@@ -86,12 +86,24 @@ public final class HttpCookie {
 	private String extension;
 
 	private HttpCookie(String name, String value) {
+		validate(name);
+		if (value != null) validate(value);
 		this.name = name;
 		this.value = value;
 	}
 
+	private static void validate(String string) {
+		for (int i = 0; i < string.length(); i++) {
+			char c = string.charAt(i);
+			if (c == '\r' || c == '\n') {
+				throw new IllegalArgumentException("Cookie attribute must not contain CR or LF characters");
+			}
+		}
+	}
+
 	public HttpCookie(String name, String value, String path) {
 		this(name, value);
+		validate(path);
 		this.path = path;
 	}
 
@@ -202,6 +214,7 @@ public final class HttpCookie {
 	}
 
 	public void setValue(String value) {
+		if (value != null) validate(value);
 		this.value = value;
 	}
 
@@ -230,6 +243,7 @@ public final class HttpCookie {
 	}
 
 	public void setDomain(String domain) {
+		if (domain != null) validate(domain);
 		this.domain = domain;
 	}
 
@@ -238,6 +252,7 @@ public final class HttpCookie {
 	}
 
 	public void setPath(String path) {
+		if (path != null) validate(path);
 		this.path = path;
 	}
 
@@ -270,6 +285,7 @@ public final class HttpCookie {
 	}
 
 	public void setExtension(String extension) {
+		if (extension != null) validate(extension);
 		this.extension = extension;
 	}
 

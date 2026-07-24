@@ -58,6 +58,22 @@ public interface HttpExceptionFormatter {
 
 	Promise<HttpResponse> formatException(Exception e);
 
+	static String escapeHtml(String string) {
+		StringBuilder sb = new StringBuilder(string.length() + 16);
+		for (int i = 0; i < string.length(); i++) {
+			char c = string.charAt(i);
+			switch (c) {
+				case '&' -> sb.append("&amp;");
+				case '<' -> sb.append("&lt;");
+				case '>' -> sb.append("&gt;");
+				case '"' -> sb.append("&quot;");
+				case '\'' -> sb.append("&#39;");
+				default -> sb.append(c);
+			}
+		}
+		return sb.toString();
+	}
+
 	/**
 	 * Standard formatter maps all exceptions except HttpException to an empty response with 500 status code.
 	 * HttpExceptions are mapped to a response with their status code, message and stacktrace of the cause if it was specified.
@@ -69,12 +85,12 @@ public interface HttpExceptionFormatter {
 			responseBuilder = HttpResponse.ofCode(code)
 				.withHtml(HTTP_ERROR_HTML
 					.replace("{title}", HttpUtils.getHttpErrorTitle(code))
-					.replace("{message}", e.toString()));
+					.replace("{message}", escapeHtml(e.toString())));
 		} else if (e instanceof MalformedHttpException) {
 			responseBuilder = HttpResponse.ofCode(400)
 				.withHtml(HTTP_ERROR_HTML
 					.replace("{title}", "400. Bad Request")
-					.replace("{message}", e.toString()));
+					.replace("{message}", escapeHtml(e.toString())));
 
 		} else {
 			responseBuilder = HttpResponse.ofCode(500)

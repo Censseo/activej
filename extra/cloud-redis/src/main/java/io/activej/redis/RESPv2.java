@@ -320,6 +320,9 @@ public final class RESPv2 {
 	private @Nullable Object @Nullable [] decodeArray() throws MalformedDataException {
 		int length = (int) decodeLong();
 		if (length == -1) return null;
+		if (length < 0) throw new MalformedDataException("Invalid array length: " + length);
+		// each element requires at least one byte, prevents huge allocations on malformed data
+		if (tail - head < length) throw NEED_MORE_DATA;
 		Object[] result = new Object[length];
 		for (int i = 0; i < length; i++) {
 			result[i] = readObject();

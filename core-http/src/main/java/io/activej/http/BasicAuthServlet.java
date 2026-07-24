@@ -23,6 +23,7 @@ import io.activej.promise.Promise;
 import io.activej.reactor.AbstractReactive;
 import io.activej.reactor.Reactor;
 
+import java.security.MessageDigest;
 import java.util.Base64;
 import java.util.Map;
 import java.util.function.BiPredicate;
@@ -135,6 +136,11 @@ public final class BasicAuthServlet extends AbstractReactive
 	}
 
 	public static BiPredicate<String, String> lookupFrom(Map<String, String> credentials) {
-		return (login, pass) -> pass.equals(credentials.get(login));
+		return (login, pass) -> {
+			String expected = credentials.get(login);
+			byte[] passBytes = pass.getBytes(UTF_8);
+			byte[] expectedBytes = (expected == null ? "" : expected).getBytes(UTF_8);
+			return expected != null && MessageDigest.isEqual(passBytes, expectedBytes);
+		};
 	}
 }

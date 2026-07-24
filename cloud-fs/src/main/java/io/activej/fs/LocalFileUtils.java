@@ -65,6 +65,15 @@ public final class LocalFileUtils {
 		if (!path.startsWith(storage) || path.startsWith(tempDir)) {
 			throw new ForbiddenPathException("Path '" + name + "' is forbidden");
 		}
+		if (Files.exists(path)) {
+			try {
+				if (!path.toRealPath().startsWith(storage.toRealPath())) {
+					throw new ForbiddenPathException("Path '" + name + "' is forbidden");
+				}
+			} catch (IOException e) {
+				throw new ForbiddenPathException("Path '" + name + "' is forbidden");
+			}
+		}
 		return path;
 	}
 

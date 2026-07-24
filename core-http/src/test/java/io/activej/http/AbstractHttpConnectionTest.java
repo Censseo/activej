@@ -83,35 +83,12 @@ public final class AbstractHttpConnectionTest {
 	}
 
 	@Test
-	public void testMultiLineHeader() throws Exception {
-		HttpServer.builder(Reactor.getCurrentReactor(),
-				request -> HttpResponse.ok200()
-					.withHeader(DATE, "Mon, 27 Jul 2009 12:28:53 GMT")
-					.withHeader(CONTENT_TYPE, "text/\n          html")
-					.withBody(wrapAscii("""
-						<html>
-							<body>
-								<h1>Hello, World!</h1>
-							</body>
-						</html>"""))
-					.toPromise())
-			.withListenPort(port)
-			.withAcceptOnce()
-			.build()
-			.listen();
-
-		await(client.request(HttpRequest.get(url).build())
-			.then(response -> response.loadBody()
-				.whenComplete(TestUtils.assertCompleteFn(body -> {
-					assertEquals("text/           html", response.getHeader(CONTENT_TYPE));
-					assertEquals("""
-							<html>
-								<body>
-									<h1>Hello, World!</h1>
-								</body>
-							</html>""",
-						body.getString(UTF_8));
-				}))));
+	public void testMultiLineHeader() {
+		// header values containing CR or LF (obs-fold, response splitting) must be rejected
+		assertThrows(IllegalArgumentException.class, () -> HttpResponse.ok200()
+			.withHeader(CONTENT_TYPE, "text/\n          html"));
+		assertThrows(IllegalArgumentException.class, () -> HttpResponse.ok200()
+			.withHeader(CONTENT_TYPE, "text/\r\n          html"));
 	}
 
 	@Test

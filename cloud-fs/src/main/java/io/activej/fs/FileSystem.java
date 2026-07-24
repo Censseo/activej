@@ -257,8 +257,15 @@ public final class FileSystem extends AbstractReactive
 				} else {
 					channel = FileChannel.open(path, appendOptions);
 				}
-				long size = channel.size();
+				long size;
+				try {
+					size = channel.size();
+				} catch (Throwable e) {
+					channel.close();
+					throw e;
+				}
 				if (size < offset) {
+					channel.close();
 					throw new IllegalOffsetException("Offset " + offset + " exceeds file size " + size);
 				}
 				return channel;
@@ -287,8 +294,15 @@ public final class FileSystem extends AbstractReactive
 			() -> {
 				Path path = resolve(name);
 				FileChannel channel = FileChannel.open(path, READ);
-				long size = channel.size();
+				long size;
+				try {
+					size = channel.size();
+				} catch (Throwable e) {
+					channel.close();
+					throw e;
+				}
 				if (size < offset) {
+					channel.close();
 					throw new IllegalOffsetException("Offset " + offset + " exceeds file size " + size);
 				}
 				return channel;

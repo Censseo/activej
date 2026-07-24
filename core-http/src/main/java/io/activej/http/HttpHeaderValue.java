@@ -36,6 +36,12 @@ public abstract class HttpHeaderValue {
 	public abstract String toString();
 
 	public static HttpHeaderValue of(String string) {
+		for (int i = 0; i < string.length(); i++) {
+			char c = string.charAt(i);
+			if (c == '\r' || c == '\n') {
+				throw new IllegalArgumentException("Header value must not contain CR or LF characters");
+			}
+		}
 		return new HttpHeaderValueOfString(string);
 	}
 

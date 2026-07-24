@@ -144,11 +144,8 @@ public final class Transform implements IFileSystem {
 		return transformed.isEmpty() ?
 			Promise.of(result) :
 			parent.infoAll(transformed)
-				.whenResult(map -> map.forEach((name, meta) -> {
-					Optional<String> maybeName = from.apply(name);
-					assert maybeName.isPresent();
-					result.put(maybeName.get(), meta);
-				}))
+				.whenResult(map -> map.forEach((name, meta) ->
+					from.apply(name).ifPresent(originalName -> result.put(originalName, meta))))
 				.map($ -> result);
 	}
 
