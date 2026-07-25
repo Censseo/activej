@@ -34,6 +34,8 @@ public final class BinaryInput {
 
 	public static final AtomicReference<char[]> BUF = new AtomicReference<>(new char[256]);
 
+	private static final int MAX_RETAINED_BUF_SIZE = 1 << 20;
+
 	public BinaryInput(byte[] array) {
 		this.array = array;
 	}
@@ -150,29 +152,45 @@ public final class BinaryInput {
 	}
 
 	public int readVarInt() {
-		byte b;
-		if ((b = array[pos]) >= 0) {
-			pos += 1;
+		int result;
+		byte b = readByteChecked();
+		if (b >= 0) {
 			return b;
 		}
-		int result = b & 0x7f;
-		if ((b = array[pos + 1]) >= 0) {
-			pos += 2;
+		result = b & 0x7f;
+		if ((b = readByteChecked()) >= 0) {
 			return result | b << 7;
 		}
 		result |= (b & 0x7f) << 7;
-		if ((b = array[pos + 2]) >= 0) {
-			pos += 3;
+		if ((b = readByteChecked()) >= 0) {
 			return result | b << 14;
 		}
 		result |= (b & 0x7f) << 14;
-		if ((b = array[pos + 3]) >= 0) {
-			pos += 4;
+		if ((b = readByteChecked()) >= 0) {
 			return result | b << 21;
 		}
-		result = result | (b & 0x7f) << 21 | array[pos + 4] << 28;
-		pos += 5;
-		return result;
+		result |= (b & 0x7f) << 21;
+		if ((b = readByteChecked()) >= 0) {
+			return result | b << 28;
+		}
+		throw new CorruptedDataException("VarInt value takes more than 5 bytes");
+	}
+
+	private byte readByteChecked() {
+		if (pos >= array.length) throw new CorruptedDataException("Unexpected end of data");
+		return array[pos++];
+	}
+
+	private void checkLength(int length) {
+		if (length < 0 || length > array.length - pos) {
+			throw new CorruptedDataException("Insufficient data: length " + length + ", remaining " + (array.length - pos));
+		}
+	}
+
+	private void checkCharLength(int length) {
+		if (length < 0 || length > (array.length - pos) / 2) {
+			throw new CorruptedDataException("Insufficient data: length " + length + ", remaining " + (array.length - pos));
+		}
 	}
 
 	public long readVarLong() {
@@ -201,6 +219,7 @@ public final class BinaryInput {
 
 	public String readUTF8() {
 		int length = readVarInt();
+		checkLength(length);
 		String s = new String(array, pos, length, UTF_8);
 		pos += length;
 		return s;
@@ -210,6 +229,7 @@ public final class BinaryInput {
 		int length = readVarInt();
 		if (length == 0) return null;
 		length--;
+		checkLength(length);
 		String s = new String(array, pos, length, UTF_8);
 		pos += length;
 		return s;
@@ -217,6 +237,7 @@ public final class BinaryInput {
 
 	public String readIso88591() {
 		int length = readVarInt();
+		checkLength(length);
 		String s = new String(array, pos, length, ISO_8859_1);
 		pos += length;
 		return s;
@@ -226,6 +247,7 @@ public final class BinaryInput {
 		int length = readVarInt();
 		if (length == 0) return null;
 		length--;
+		checkLength(length);
 		String s = new String(array, pos, length, ISO_8859_1);
 		pos += length;
 		return s;
@@ -234,6 +256,7 @@ public final class BinaryInput {
 	public String readUTF16() {
 		int length = readVarInt();
 		if (length == 0) return "";
+		checkCharLength(length);
 		if (length >= 40) return readUTF16buf(length);
 		char[] chars = new char[length];
 		for (int i = 0; i < length; i++) {
@@ -246,6 +269,7 @@ public final class BinaryInput {
 	public String readUTF16LE() {
 		int length = readVarInt();
 		if (length == 0) return "";
+		checkCharLength(length);
 		if (length >= 40) return readUTF16LEbuf(length);
 		char[] chars = new char[length];
 		for (int i = 0; i < length; i++) {
@@ -260,6 +284,7 @@ public final class BinaryInput {
 		if (length == 0) return null;
 		length--;
 		if (length == 0) return "";
+		checkCharLength(length);
 		if (length >= 40) return readUTF16buf(length);
 		char[] chars = new char[length];
 		for (int i = 0; i < length; i++) {
@@ -274,6 +299,7 @@ public final class BinaryInput {
 		if (length == 0) return null;
 		length--;
 		if (length == 0) return "";
+		checkCharLength(length);
 		if (length >= 40) return readUTF16LEbuf(length);
 		char[] chars = new char[length];
 		for (int i = 0; i < length; i++) {
@@ -291,7 +317,7 @@ public final class BinaryInput {
 		}
 		pos += length * 2;
 		String s = new String(chars, 0, length);
-		BUF.lazySet(chars);
+		if (chars.length <= MAX_RETAINED_BUF_SIZE) BUF.lazySet(chars);
 		return s;
 	}
 
@@ -303,7 +329,7 @@ public final class BinaryInput {
 		}
 		pos += length * 2;
 		String s = new String(chars, 0, length);
-		BUF.lazySet(chars);
+		if (chars.length <= MAX_RETAINED_BUF_SIZE) BUF.lazySet(chars);
 		return s;
 	}
 }

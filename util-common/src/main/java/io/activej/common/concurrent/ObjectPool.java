@@ -106,6 +106,7 @@ public final class ObjectPool<T> {
 		public T poll() {
 			long pos1, pos2;
 			int head, tail;
+			int spins = 0;
 			do {
 				pos1 = pos.get();
 				head = (int) (pos1 >>> 32);
@@ -115,7 +116,7 @@ public final class ObjectPool<T> {
 				}
 				pos2 = ((long) head << 32) + ((tail + 1) & 0xFFFFFFFFL);
 				if (!pos.compareAndSet(pos1, pos2)) {
-					LockSupport.parkNanos(PARK_NANOS);
+					LockSupport.parkNanos(PARK_NANOS << Math.min(spins++, 6));
 					continue;
 				}
 				break;
@@ -125,6 +126,7 @@ public final class ObjectPool<T> {
 			do {
 				item = items.getAndSet(tail & mask, null);
 				if (item == null) {
+					Thread.onSpinWait();
 					continue;
 				}
 				break;
@@ -136,6 +138,7 @@ public final class ObjectPool<T> {
 		public boolean offer(T item) {
 			long pos1, pos2;
 			int head, tail;
+			int spins = 0;
 			do {
 				pos1 = pos.get();
 				head = (int) (pos1 >>> 32);
@@ -145,7 +148,7 @@ public final class ObjectPool<T> {
 				}
 				pos2 = pos1 + 0x100000000L;
 				if (!pos.compareAndSet(pos1, pos2)) {
-					LockSupport.parkNanos(PARK_NANOS);
+					LockSupport.parkNanos(PARK_NANOS << Math.min(spins++, 6));
 					continue;
 				}
 				break;
@@ -154,6 +157,7 @@ public final class ObjectPool<T> {
 			do {
 				item = items.getAndSet(head & mask, item);
 				if (item != null) {
+					Thread.onSpinWait();
 					continue;
 				}
 				break;

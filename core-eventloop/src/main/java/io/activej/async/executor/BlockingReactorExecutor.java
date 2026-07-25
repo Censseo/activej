@@ -21,6 +21,7 @@ import io.activej.common.function.RunnableEx;
 import io.activej.reactor.Reactor;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
@@ -98,8 +99,9 @@ public final class BlockingReactorExecutor implements ReactorExecutor {
 					complete();
 				}
 			});
-		} catch (InterruptedException ignored) {
+		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
+			handleError(e, runnable);
 		}
 	}
 
@@ -124,20 +126,24 @@ public final class BlockingReactorExecutor implements ReactorExecutor {
 	@Override
 	public <T> CompletableFuture<T> submit(AsyncComputation<? extends T> computation) {
 		CompletableFuture<T> future = new CompletableFuture<>();
+		AtomicBoolean completed = new AtomicBoolean();
 		post(() -> {
 			try {
 				computation.call((result, e) -> {
-					if (e == null) {
-						future.complete(result);
-					} else {
-						future.completeExceptionally(e);
+					try {
+						if (e == null) {
+							future.complete(result);
+						} else {
+							future.completeExceptionally(e);
+						}
+					} finally {
+						if (completed.compareAndSet(false, true)) complete();
 					}
 				});
 			} catch (Exception ex) {
 				handleError(ex, computation);
 				future.completeExceptionally(ex);
-			} finally {
-				complete();
+				if (completed.compareAndSet(false, true)) complete();
 			}
 		}, future);
 		return future;

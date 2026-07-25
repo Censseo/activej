@@ -45,6 +45,7 @@ public abstract class Key<T> {
 	private final @Nullable Object qualifier;
 
 	private int hash;
+	private volatile @Nullable String displayString;
 
 	protected Key() {
 		this.type = simplifyType(getTypeParameter());
@@ -132,7 +133,12 @@ public abstract class Key<T> {
 	 * and prepended qualifier display string if this key has a qualifier.
 	 */
 	public String getDisplayString() {
-		return (qualifier != null ? Utils.getDisplayString(qualifier) + " " : "") + ReflectionUtils.getDisplayName(type);
+		String displayString = this.displayString;
+		if (displayString == null) {
+			displayString = (qualifier != null ? Utils.getDisplayString(qualifier) + " " : "") + ReflectionUtils.getDisplayName(type);
+			this.displayString = displayString;
+		}
+		return displayString;
 	}
 
 	@Override

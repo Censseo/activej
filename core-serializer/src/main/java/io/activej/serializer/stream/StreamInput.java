@@ -8,7 +8,6 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 
-import static java.lang.Math.max;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 public class StreamInput implements Closeable {
@@ -80,6 +79,7 @@ public class StreamInput implements Closeable {
 	}
 
 	public void ensure(int bytes) throws IOException {
+		if (bytes < 0) throw new CorruptedDataException("Negative size: " + bytes);
 		if (remaining() < bytes) {
 			doEnsureRead(bytes);
 		}
@@ -106,7 +106,12 @@ public class StreamInput implements Closeable {
 				limit = readRemaining;
 				in.pos = 0;
 			} else {
-				byte[] bytes = allocate(max(in.array.length, size));
+				if ((long) size + readRemaining > Integer.MAX_VALUE - 8L) {
+					throw new CorruptedDataException("Requested size is too large: " + size);
+				}
+				long newLengthL = Math.min((long) size + readRemaining, Math.max((long) in.array.length * 2, readRemaining + 1L));
+				int newLength = (int) Math.min(newLengthL, Integer.MAX_VALUE - 8L);
+				byte[] bytes = allocate(newLength);
 				System.arraycopy(in.array(), in.pos(), bytes, 0, readRemaining);
 				limit -= in.pos();
 				recycle(in.array);
@@ -125,6 +130,13 @@ public class StreamInput implements Closeable {
 		}
 		limit += bytesRead;
 		return false;
+	}
+
+	private static int charBytes(int length) {
+		if (length < 0 || length > (Integer.MAX_VALUE - 8) / 2) {
+			throw new CorruptedDataException("Invalid char array length: " + length);
+		}
+		return length * 2;
 	}
 
 	private char[] ensureCharArray(int length) {
@@ -278,7 +290,7 @@ public class StreamInput implements Closeable {
 	public final String readUTF16() throws IOException {
 		int length = readVarInt();
 		if (length == 0) return "";
-		ensure(length * 2);
+		ensure(charBytes(length));
 
 		char[] chars = ensureCharArray(length);
 		for (int i = 0; i < length; i++) {
@@ -318,7 +330,7 @@ public class StreamInput implements Closeable {
 		int length = readVarInt();
 		if (length-- == 0) return null;
 		if (length == 0) return "";
-		ensure(length * 2);
+		ensure(charBytes(length));
 
 		char[] chars = ensureCharArray(length);
 		for (int i = 0; i < length; i++) {

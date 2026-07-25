@@ -51,7 +51,6 @@ import static io.activej.http.HttpHeaderValue.ofDecimal;
 import static io.activej.http.HttpHeaders.*;
 import static io.activej.http.HttpUtils.translateToHttpException;
 import static io.activej.http.HttpUtils.trimAndDecodePositiveLong;
-import static java.lang.Math.max;
 import static java.nio.charset.StandardCharsets.ISO_8859_1;
 
 @SuppressWarnings({"WeakerAccess", "PointlessBitwiseExpression"})
@@ -103,6 +102,7 @@ public abstract class AbstractHttpConnection extends AbstractReactive {
 	protected int numberOfRequests;
 
 	protected long contentLength;
+	private boolean contentLengthReceived;
 
 	protected @Nullable Exception closeException;
 
@@ -254,6 +254,7 @@ public abstract class AbstractHttpConnection extends AbstractReactive {
 	protected abstract void readMessage() throws MalformedHttpException;
 
 	protected final void readStartLine() throws MalformedHttpException {
+		contentLengthReceived = false;
 		byte[] array = readBuf.array();
 		int head = readBuf.head();
 		int tail = readBuf.tail();
@@ -282,94 +283,35 @@ public abstract class AbstractHttpConnection extends AbstractReactive {
 
 		assert !isClosed();
 		while (offset < tail) {
-			int i;
-			for (i = offset; i < tail; i++) {
+			for (int i = offset; i < tail; i++) {
 				if (array[i] != LF) continue;
 
-				// check next byte to see if this is multiline header(CRLF + 1*(SP|HT)) rfc2616#2.2
-				if (i <= offset + 1 || (i + 1 < tail && (array[i + 1] != SP && array[i + 1] != HT))) {
-					// fast processing path
-					int limit = (i - 1 >= offset && array[i - 1] == CR) ? i - 1 : i;
-					if (limit != offset) {
-						readHeader(array, offset, limit);
-						offset = i + 1;
-						continue;
-					} else {
-						readBuf.head(i + 1);
-						readBody();
-						return;
-					}
+				if (i - 1 < offset || array[i - 1] != CR) {
+					throw new MalformedHttpException("Bare LF in header line");
 				}
-				break;
+				int limit = i - 1;
+				if (limit != offset) {
+					if (i + 1 == tail) {
+						break; // cannot determine if this is a multiline header, need more data
+					}
+					if (array[i + 1] == SP || array[i + 1] == HT) {
+						throw new MalformedHttpException("Multiline headers (obs-fold) are not allowed");
+					}
+					readHeader(array, offset, limit);
+					offset = i + 1;
+				} else {
+					readBuf.head(i + 1);
+					readBody();
+					return;
+				}
 			}
 
-			if (i == tail && tail - offset <= 1) {
-				break; // cannot determine if this is multiline header or not, need more data
-			}
-
-			int headerLen = scanHeader(max(offset, i - 1), array, offset, tail);
-
-			if (headerLen == -1) {
-				break;
-			}
-			if (headerLen != 0) {
-				readHeader(array, offset, offset + headerLen);
-			}
-			offset += headerLen;
-			if (array[offset] == CR) offset++;
-			if (array[offset] == LF) offset++;
-			if (headerLen == 0) {
-				readBuf.head(offset);
-				readBody();
-				return;
-			}
+			break; // need more data
 		}
 		readBuf.head(offset);
 		if (readBuf.readRemaining() > MAX_HEADER_LINE_SIZE_BYTES)
 			throw new MalformedHttpException("Header line exceeds max header size");
 		socket.read().subscribe(readHeadersConsumer);
-	}
-
-	private int scanHeader(int from, byte[] array, int head, int tail) throws MalformedHttpException {
-		int i = from;
-		while (true) {
-			for (; i < tail; i++) {
-				byte b = array[i];
-				if (b == CR || b == LF) break;
-			}
-			if (i >= tail) return -1;
-			byte b = array[i];
-			if (b == CR) {
-				if (++i >= tail) return -1;
-				b = array[i];
-				if (b != LF) throw new MalformedHttpException("Invalid CRLF");
-				if (i - head == 1) {
-					return 0;
-				} else {
-					if (++i >= tail) return -1;
-					b = array[i];
-					if (b == SP || b == HT) {
-						array[i - 2] = SP;
-						array[i - 1] = SP;
-						continue;
-					}
-					return i - 2 - head;
-				}
-			} else {
-				assert b == LF;
-				if (i - head == 0) {
-					return 0;
-				} else {
-					if (++i >= tail) return -1;
-					b = array[i];
-					if (b == SP || b == HT) {
-						array[i - 1] = SP;
-						continue;
-					}
-					return i - 1 - head;
-				}
-			}
-		}
 	}
 
 	private void readHeader(byte[] array, int off, int limit) throws MalformedHttpException {
@@ -392,7 +334,12 @@ public abstract class AbstractHttpConnection extends AbstractReactive {
 
 		int len = limit - pos;
 		if (header == CONTENT_LENGTH) {
-			contentLength = trimAndDecodePositiveLong(array, pos, len);
+			long length = trimAndDecodePositiveLong(array, pos, len);
+			if (contentLengthReceived && contentLength != length) {
+				throw new MalformedHttpException("Conflicting Content-Length headers");
+			}
+			contentLength = length;
+			contentLengthReceived = true;
 		} else if (header == CONNECTION) {
 			flags = (byte) (
 				(flags & ~KEEP_ALIVE) |
@@ -400,7 +347,7 @@ public abstract class AbstractHttpConnection extends AbstractReactive {
 		} else if (IWebSocket.ENABLED && header == HttpHeaders.UPGRADE) {
 			flags |= equalsLowerCaseAscii(UPGRADE_WEBSOCKET, array, pos, len) ? WEB_SOCKET : 0;
 		} else if (header == TRANSFER_ENCODING) {
-			flags |= equalsLowerCaseAscii(TRANSFER_ENCODING_CHUNKED, array, pos, len) ? CHUNKED : 0;
+			flags |= isChunkedTransferEncoding(array, pos, len) ? CHUNKED : 0;
 		} else if (header == CONTENT_ENCODING) {
 			flags |= equalsLowerCaseAscii(CONTENT_ENCODING_GZIP, array, pos, len) ? GZIPPED : 0;
 		}
@@ -408,8 +355,30 @@ public abstract class AbstractHttpConnection extends AbstractReactive {
 		onHeader(header, array, pos, len);
 	}
 
+	private static boolean isChunkedTransferEncoding(byte[] array, int pos, int len) {
+		// RFC 7230, section 3.3.1: chunked must be the final transfer coding
+		int end = pos + len;
+		int tokenEnd = end;
+		while (tokenEnd > pos && (array[tokenEnd - 1] == SP || array[tokenEnd - 1] == HT)) tokenEnd--;
+		int tokenStart = tokenEnd;
+		while (tokenStart > pos && array[tokenStart - 1] != ',') tokenStart--;
+		int start = tokenStart;
+		while (start < tokenEnd && (array[start] == SP || array[start] == HT)) start++;
+		return equalsLowerCaseAscii(TRANSFER_ENCODING_CHUNKED, array, start, tokenEnd - start);
+	}
+
 	private void readBody() {
 		assert !isClosed();
+		if ((flags & CHUNKED) != 0 && contentLengthReceived) {
+			onMalformedHttpException(new MalformedHttpException(
+				"Both Transfer-Encoding and Content-Length headers are present"));
+			return;
+		}
+		if ((flags & CHUNKED) == 0 && maxBodySize != 0 && contentLength > maxBodySize) {
+			onMalformedHttpException(new MalformedHttpException(
+				"Content length " + contentLength + " exceeds maximum allowed body size"));
+			return;
+		}
 		if ((flags & CHUNKED) == 0) {
 			if (contentLength == 0) {
 				onHeadersReceived(ByteBuf.empty(), null);
@@ -435,12 +404,6 @@ public abstract class AbstractHttpConnection extends AbstractReactive {
 				onBodyReceived();
 				return;
 			}
-		}
-
-		if (maxBodySize != 0 && contentLength > maxBodySize) {
-			onMalformedHttpException(new MalformedHttpException(
-				"Content length " + contentLength + " exceeds maximum allowed body size"));
-			return;
 		}
 
 		ByteBuf readBuf = detachReadBuf();
@@ -482,7 +445,7 @@ public abstract class AbstractHttpConnection extends AbstractReactive {
 			encodedStream.bindTo(decoder.getInput());
 			bodyStream = decoder.getOutput();
 		} else {
-			BufsConsumerChunkedDecoder decoder = BufsConsumerChunkedDecoder.create();
+			BufsConsumerChunkedDecoder decoder = BufsConsumerChunkedDecoder.create(maxBodySize);
 			process = decoder;
 			encodedStream.bindTo(decoder.getInput());
 			bodyStream = decoder.getOutput();

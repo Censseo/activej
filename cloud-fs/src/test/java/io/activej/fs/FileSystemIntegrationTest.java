@@ -200,7 +200,7 @@ public final class FileSystemIntegrationTest {
 			ChannelSuppliers.ofException(new FileSystemIOException("Test exception")),
 			ChannelSuppliers.ofValue(value));
 
-		Exception exception = awaitException(supplier.streamTo(ChannelConsumers.ofPromise(fileSystem.upload(resultFile, Long.MAX_VALUE)))
+		Exception exception = awaitException(supplier.streamTo(ChannelConsumers.ofPromise(fileSystem.upload(resultFile, BIG_FILE.length + 100L)))
 			.whenComplete(server::close));
 
 		assertThat(exception, instanceOf(FileSystemException.class));

@@ -122,7 +122,7 @@ public final class ModuleBuilderImpl<T> implements ModuleBuilder1<T> {
 		BindingDesc desc = ensureCurrent();
 		checkState(desc.binding == null, "Already mapped to a binding");
 		if (binding.getLocation() == null) {
-			binding.at(LocationInfo.from(this));
+			binding = binding.at(LocationInfo.from(this));
 		}
 		desc.binding = binding;
 		return this;
@@ -170,7 +170,7 @@ public final class ModuleBuilderImpl<T> implements ModuleBuilder1<T> {
 			.add((bindings, scope, key) -> {
 				Binding<Object> generated = (Binding<Object>) bindingGenerator.generate(bindings, scope, (Key<E>) key);
 				if (generated != null && generated.getLocation() == null) {
-					generated.at(LocationInfo.from(this));
+					generated = generated.at(LocationInfo.from(this));
 				}
 				return generated;
 			});
@@ -185,7 +185,7 @@ public final class ModuleBuilderImpl<T> implements ModuleBuilder1<T> {
 			.add((bindings, scope, key, binding) -> {
 				Binding<Object> transformed = (Binding<Object>) bindingTransformer.transform(bindings, scope, (Key<E>) key, (Binding<E>) binding);
 				if (!binding.equals(transformed) && transformed.getLocation() == null) {
-					transformed.at(LocationInfo.from(this));
+					transformed = transformed.at(LocationInfo.from(this));
 				}
 				return transformed;
 			});

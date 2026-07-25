@@ -67,7 +67,7 @@ public final class HttpTolerantApplicationTest {
 			GET /abc  HTTP/1.1
 			Host: \tlocalhost
 
-			""");
+			""".replace("\n", "\r\n"));
 		readAndAssert(socket.getInputStream(), """
 			HTTP/1.1 200 OK\r
 			Connection: keep-alive\r
@@ -79,7 +79,7 @@ public final class HttpTolerantApplicationTest {
 			Cost: \tlocalhost \t\s
 			Connection: keep-alive
 
-			""");
+			""".replace("\n", "\r\n"));
 		readAndAssert(socket.getInputStream(), """
 			HTTP/1.1 200 OK\r
 			Connection: keep-alive\r
@@ -90,7 +90,7 @@ public final class HttpTolerantApplicationTest {
 			GET /abc  HTTP/1.0
 			Cost: \tlocalhost \t\s
 
-			""");
+			""".replace("\n", "\r\n"));
 		readAndAssert(socket.getInputStream(), """
 			HTTP/1.1 200 OK\r
 			Connection: close\r
@@ -125,7 +125,8 @@ public final class HttpTolerantApplicationTest {
 						Content-Length:  4
 
 						$text"""
-						.replace("$text", text));
+						.replace("$text", text)
+						.replace("\n", "\r\n"));
 				} catch (IOException ignored) {
 				}
 			}

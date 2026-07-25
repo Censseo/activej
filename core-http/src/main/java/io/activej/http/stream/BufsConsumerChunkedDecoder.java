@@ -19,6 +19,7 @@ package io.activej.http.stream;
 import io.activej.bytebuf.ByteBuf;
 import io.activej.bytebuf.ByteBufs;
 import io.activej.bytebuf.ByteBufs.ByteScanner;
+import io.activej.common.ApplicationSettings;
 import io.activej.common.exception.InvalidSizeException;
 import io.activej.common.exception.MalformedDataException;
 import io.activej.csp.ChannelOutput;
@@ -45,6 +46,7 @@ import static io.activej.reactor.Reactive.checkInReactorThread;
 public final class BufsConsumerChunkedDecoder extends AbstractCommunicatingProcess
 	implements WithChannelTransformer<BufsConsumerChunkedDecoder, ByteBuf, ByteBuf>, WithBinaryChannelInput<BufsConsumerChunkedDecoder> {
 	public static final int MAX_CHUNK_LENGTH_DIGITS = 8;
+	public static final int MAX_TRAILER_SIZE = ApplicationSettings.getInt(BufsConsumerChunkedDecoder.class, "maxTrailerSize", 8192);
 
 	private static final byte[] CRLF = {13, 10};
 
@@ -54,10 +56,19 @@ public final class BufsConsumerChunkedDecoder extends AbstractCommunicatingProce
 
 	int chunkLength;
 
-	private BufsConsumerChunkedDecoder() {}
+	private final int maxBodySize;
+	private int totalBytes;
+
+	private BufsConsumerChunkedDecoder(int maxBodySize) {
+		this.maxBodySize = maxBodySize;
+	}
 
 	public static BufsConsumerChunkedDecoder create() {
-		return new BufsConsumerChunkedDecoder();
+		return new BufsConsumerChunkedDecoder(0);
+	}
+
+	public static BufsConsumerChunkedDecoder create(int maxBodySize) {
+		return new BufsConsumerChunkedDecoder(maxBodySize);
 	}
 
 	@Override
@@ -138,6 +149,12 @@ public final class BufsConsumerChunkedDecoder extends AbstractCommunicatingProce
 
 	private void processData(int chunkLength) {
 		ByteBuf buf = bufs.takeAtMost(chunkLength);
+		totalBytes += buf.readRemaining();
+		if (maxBodySize != 0 && totalBytes > maxBodySize) {
+			buf.recycle();
+			closeEx(new InvalidSizeException("Chunked body size exceeds maximum allowed size"));
+			return;
+		}
 		int newChunkLength = chunkLength - buf.readRemaining();
 		if (newChunkLength != 0) {
 			Promise.complete()
@@ -177,15 +194,19 @@ public final class BufsConsumerChunkedDecoder extends AbstractCommunicatingProce
 			});
 	}
 
+	private int trailerBytes;
+
 	private void validateLastChunk() {
 		int remainingBytes = bufs.remainingBytes();
 		if (remainingBytes >= 4) {
 			try {
+				int budget = MAX_TRAILER_SIZE - trailerBytes;
 				int bytes = bufs.scanBytes(new ByteScanner() {
 					int crlfCrlfSequence;
 
 					@Override
 					public boolean consume(int index, byte b) {
+						if (index >= budget) return true;
 						int remainder = b == CR ? 0 : b == LF ? 1 : -1;
 
 						if (crlfCrlfSequence % 2 == remainder) {
@@ -196,6 +217,10 @@ public final class BufsConsumerChunkedDecoder extends AbstractCommunicatingProce
 					}
 				});
 				if (bytes != 0) {
+					if (bytes - 1 >= budget) {
+						closeEx(new InvalidSizeException("Trailer section exceeds maximum allowed size"));
+						return;
+					}
 					bufs.skip(bytes);
 					input.endOfStream()
 						.then(output::acceptEndOfStream)
@@ -207,6 +232,7 @@ public final class BufsConsumerChunkedDecoder extends AbstractCommunicatingProce
 			}
 
 			bufs.skip(remainingBytes - 3);
+			trailerBytes += remainingBytes - 3;
 		}
 		input.needMoreData()
 			.whenResult(this::validateLastChunk);

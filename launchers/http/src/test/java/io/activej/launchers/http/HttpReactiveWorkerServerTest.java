@@ -88,7 +88,7 @@ public final class HttpReactiveWorkerServerTest {
 				socket0.getOutputStream().write(encodeAscii("""
 					GET /abc HTTP/1.1\r
 					Host: localhost\r
-					Connection: keep-alive
+					Connection: keep-alive\r
 					\r
 					"""));
 				readAndAssert(socket0.getInputStream(), """
@@ -101,7 +101,7 @@ public final class HttpReactiveWorkerServerTest {
 				socket0.getOutputStream().write(encodeAscii("""
 					GET /abc HTTP/1.1\r
 					Host: localhost\r
-					Connection: keep-alive
+					Connection: keep-alive\r
 					\r
 					"""));
 				readAndAssert(socket0.getInputStream(), """
@@ -114,7 +114,7 @@ public final class HttpReactiveWorkerServerTest {
 				socket1.getOutputStream().write(encodeAscii("""
 					GET /abc HTTP/1.1\r
 					Host: localhost\r
-					Connection: keep-alive
+					Connection: keep-alive\r
 					\r
 					"""));
 				readAndAssert(socket1.getInputStream(), """
@@ -127,7 +127,7 @@ public final class HttpReactiveWorkerServerTest {
 				socket1.getOutputStream().write(encodeAscii("""
 					GET /abc HTTP/1.1\r
 					Host: localhost\r
-					Connection: keep-alive
+					Connection: keep-alive\r
 					\r
 					"""));
 				readAndAssert(socket1.getInputStream(), """

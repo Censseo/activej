@@ -114,10 +114,10 @@ public abstract class AbstractCollectionSerializerDef extends AbstractSerializer
 
 	protected Expression doDecode(StaticDecoders staticDecoders, Expression in, int version, CompatibilityLevel compatibilityLevel, Expression length) {
 		Decoder decoder = valueSerializer.defineDecoder(staticDecoders, version, compatibilityLevel);
-		return let(createBuilder(length), builder -> sequence(
+		return checkLength(in, length, let(createBuilder(length), builder -> sequence(
 			iterate(value(0), length,
 				i -> addToBuilder(builder, i, cast(decoder.decode(in), elementType))),
-			build(builder)));
+			build(builder))));
 	}
 
 	protected abstract SerializerDef doEnsureNullable(CompatibilityLevel compatibilityLevel);

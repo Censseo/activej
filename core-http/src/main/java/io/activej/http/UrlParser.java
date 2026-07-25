@@ -63,6 +63,7 @@ public final class UrlParser {
 	}
 
 	private static final ThreadLocal<byte[]> CACHED_BUFFERS = new ThreadLocal<>();
+	private static final int MAX_CACHED_BUFFER_SIZE = ApplicationSettings.getInt(UrlParser.class, "maxCachedBufferSize", 64 * 1024);
 	private static final Charset CHARSET = ApplicationSettings.getCharset(UrlParser.class, "charset", ISO_8859_1);
 
 	private static final byte IPV6_OPENING_BRACKET = '[';
@@ -552,7 +553,9 @@ public final class UrlParser {
 		if (bytes == null || bytes.length < limit - pos) {
 			int newCount = limit - pos + (limit - pos << 1);
 			bytes = new byte[newCount];
-			CACHED_BUFFERS.set(bytes);
+			if (newCount <= MAX_CACHED_BUFFER_SIZE) {
+				CACHED_BUFFERS.set(bytes);
+			}
 		}
 
 		int bytesPos = 0;

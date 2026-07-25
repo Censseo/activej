@@ -98,8 +98,10 @@ public final class MultipartByteBufsDecoder implements ByteBufsDecoder<Multipart
 			.collect(toMap(s -> s[0], s -> {
 				String value = s.length == 1 ? "" : s[1];
 				// stripping double quotation
-				return value.substring(1, value.length() - 1);
-			})));
+				return value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"") ?
+					value.substring(1, value.length() - 1) :
+					value;
+			}, (v1, v2) -> v1)));
 	}
 
 	private Promise<Void> doSplit(
@@ -108,7 +110,7 @@ public final class MultipartByteBufsDecoder implements ByteBufsDecoder<Multipart
 		return getContentDispositionFields(headerFrame)
 			.then(contentDispositionFields -> {
 				String fieldName = contentDispositionFields.get("name");
-				String fileName = contentDispositionFields.get("filename");
+				String fileName = sanitizeFileName(contentDispositionFields.get("filename"));
 				Ref<MultipartFrame> lastRef = new Ref<>();
 				return frames
 					.until(f -> {
@@ -148,6 +150,14 @@ public final class MultipartByteBufsDecoder implements ByteBufsDecoder<Multipart
 				return Promise.ofException(e);
 			})
 			.mapException(HttpUtils::translateToHttpException);
+	}
+
+	private static @Nullable String sanitizeFileName(@Nullable String fileName) {
+		if (fileName == null) {
+			return null;
+		}
+		int lastSeparator = Math.max(fileName.lastIndexOf('/'), fileName.lastIndexOf('\\'));
+		return lastSeparator == -1 ? fileName : fileName.substring(lastSeparator + 1);
 	}
 
 	private boolean sawCrlf = true;
@@ -196,7 +206,8 @@ public final class MultipartByteBufsDecoder implements ByteBufsDecoder<Multipart
 					}
 					return MultipartFrame.of(readingHeaders.stream()
 						.map(s -> s.split(":\\s?", 2))
-						.collect(toMap(s -> s[0].toLowerCase(), s -> s[1])));
+						.filter(s -> s.length == 2)
+						.collect(toMap(s -> s[0].toLowerCase(), s -> s[1], (v1, v2) -> v1)));
 				}
 			} else {
 				sawCrlf = true;

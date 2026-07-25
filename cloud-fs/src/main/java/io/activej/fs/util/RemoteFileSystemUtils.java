@@ -121,6 +121,21 @@ public final class RemoteFileSystemUtils {
 		};
 	}
 
+	public static ChannelConsumerTransformer<ByteBuf, ChannelConsumer<ByteBuf>> ofMaxSize(long maxSize) {
+		return consumer -> {
+			RefLong total = new RefLong(maxSize);
+			return consumer
+				.<ByteBuf>mapAsync(byteBuf -> {
+					long left = total.dec(byteBuf.readRemaining());
+					if (left < 0) {
+						byteBuf.recycle();
+						return Promise.ofException(new UnexpectedDataException("Size exceeds maximum of " + maxSize + " bytes"));
+					}
+					return Promise.of(byteBuf);
+				});
+		};
+	}
+
 	/*
 		Casting received errors before sending to remote peer
 	 */

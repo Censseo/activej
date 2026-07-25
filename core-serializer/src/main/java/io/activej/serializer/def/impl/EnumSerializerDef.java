@@ -20,6 +20,7 @@ import io.activej.codegen.expression.Expression;
 import io.activej.codegen.expression.Variable;
 import io.activej.common.annotation.ExposedInternals;
 import io.activej.serializer.CompatibilityLevel;
+import io.activej.serializer.CorruptedDataException;
 import io.activej.serializer.def.AbstractSerializerDef;
 import io.activej.serializer.def.SerializerDef;
 import io.activej.serializer.def.SerializerDefWithNullable;
@@ -64,19 +65,28 @@ public final class EnumSerializerDef extends AbstractSerializerDef implements Se
 
 	@Override
 	public Expression decode(StaticDecoders staticDecoders, Expression in, int version, CompatibilityLevel compatibilityLevel) {
-		return isSmallEnum() ?
-			let(readByte(in), b ->
-				!nullable ?
-					arrayGet(staticCall(enumType, "values"), b) :
-					ifEq(b, value((byte) 0),
-						nullRef(enumType),
-						arrayGet(staticCall(enumType, "values"), dec(b)))) :
-			let(readVarInt(in), value ->
-				!nullable ?
-					arrayGet(staticCall(enumType, "values"), value) :
-					ifEq(value, value(0),
-						nullRef(enumType),
-						arrayGet(staticCall(enumType, "values"), dec(value))));
+		return let(staticCall(enumType, "values"), values ->
+			isSmallEnum() ?
+				let(cast(readByte(in), int.class), b ->
+					!nullable ?
+						enumValueAt(values, b) :
+						ifEq(b, value(0),
+							nullRef(enumType),
+							enumValueAt(values, dec(b)))) :
+				let(readVarInt(in), value ->
+					!nullable ?
+						enumValueAt(values, value) :
+						ifEq(value, value(0),
+							nullRef(enumType),
+							enumValueAt(values, dec(value)))));
+	}
+
+	private Expression enumValueAt(Expression values, Expression ordinal) {
+		return ifLt(ordinal, value(0),
+			throwException(CorruptedDataException.class, "Invalid enum ordinal"),
+			ifGe(ordinal, length(values),
+				throwException(CorruptedDataException.class, "Invalid enum ordinal"),
+				arrayGet(values, ordinal)));
 	}
 
 	private boolean isSmallEnum() {

@@ -450,7 +450,7 @@ public final class ReflectionUtils {
 				Binding<Set<Object>> binding = Binding.to(Set::of, key);
 
 				if (module != null) {
-					binding.at(LocationInfo.from(module, method));
+					binding = binding.at(LocationInfo.from(module, method));
 				}
 
 				ModuleBuilder1<Set<Object>> setBinder = builder.bind(setKey).to(binding).in(methodScope);

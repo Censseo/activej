@@ -317,7 +317,7 @@ public final class HttpClientTest {
 						testHTTP/1.1 200 OK
 						Content-Length:  4
 
-						test"""));
+						test""".replace("\n", "\r\n")));
 					socket.getOutputStream().write(buf.array(), buf.head(), buf.readRemaining());
 				} catch (IOException ignored) {
 				}

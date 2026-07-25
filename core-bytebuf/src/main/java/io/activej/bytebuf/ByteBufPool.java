@@ -90,6 +90,13 @@ public final class ByteBufPool {
 	static final Duration WATCHDOG_INTERVAL = ApplicationSettings.getDuration(ByteBufPool.class, "watchdogInterval", Duration.ofSeconds(2));
 	static final Duration WATCHDOG_SMOOTHING_WINDOW = ApplicationSettings.getDuration(ByteBufPool.class, "watchdogSmoothingWindow", Duration.ofSeconds(10));
 	static final double WATCHDOG_ERROR_MARGIN = ApplicationSettings.getDouble(ByteBufPool.class, "watchdogErrorMargin", 4.0);
+
+	/**
+	 * Maximal number of ByteBufs retained per slab. Recycled ByteBufs beyond
+	 * this limit are not returned to the pool and are left for garbage collection.
+	 * A value of {@code 0} means no limit. Defaults to 1024.
+	 */
+	static final int MAX_ITEMS_PER_SLAB = ApplicationSettings.getInt(ByteBufPool.class, "maxItemsPerSlab", 1024);
 	private static final double SMOOTHING_COEFF = 1.0 - Math.pow(0.5, (double) WATCHDOG_INTERVAL.toMillis() / WATCHDOG_SMOOTHING_WINDOW.toMillis());
 
 	/**
@@ -315,6 +322,11 @@ public final class ByteBufPool {
 		if (REGISTRY) {
 			recycleRegistry.put(buf, buildRegistryEntry(buf));
 			allocateRegistry.remove(buf);
+		}
+		if (MAX_ITEMS_PER_SLAB > 0 && pool.size() >= MAX_ITEMS_PER_SLAB) {
+			if (REGISTRY) recycleRegistry.remove(buf);
+			if (STATS) created[slab].decrementAndGet();
+			return;
 		}
 		pool.offer(buf);
 	}

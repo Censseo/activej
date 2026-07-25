@@ -3,6 +3,7 @@ package io.activej.inject.binding;
 import io.activej.inject.Key;
 import io.activej.inject.impl.CompiledBinding;
 import io.activej.inject.impl.CompiledBindingLocator;
+import io.activej.inject.util.LocationInfo;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.Set;
@@ -13,6 +14,16 @@ public final class BindingToKey<T> extends Binding<T> {
 	BindingToKey(Key<? extends T> key) {
 		super(Set.of(key));
 		this.key = key;
+	}
+
+	private BindingToKey(Key<? extends T> key, BindingType type, @Nullable LocationInfo location) {
+		super(Set.of(key), type, location);
+		this.key = key;
+	}
+
+	@Override
+	protected Binding<T> copy(BindingType type, @Nullable LocationInfo location) {
+		return new BindingToKey<>(key, type, location);
 	}
 
 	public Key<? extends T> getKey() {

@@ -24,6 +24,7 @@ import io.activej.promise.Promise;
 import io.activej.reactor.AbstractReactive;
 import io.activej.reactor.Reactor;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.Executor;
@@ -54,16 +55,23 @@ public class FileReaderStaticLoader extends AbstractReactive
 
 		return Promise.ofBlocking(executor,
 				() -> {
-					if (Files.isRegularFile(file)) {
-						return;
-					}
 					if (Files.isDirectory(file)) {
 						throw new ResourceIsADirectoryException("Resource '" + path + "' is a directory");
-					} else {
+					}
+					Path realFile;
+					Path realRoot;
+					try {
+						realFile = file.toRealPath();
+						realRoot = root.toRealPath();
+					} catch (IOException e) {
 						throw new ResourceNotFoundException("Could not find '" + path + '\'');
 					}
+					if (!realFile.startsWith(realRoot) || !Files.isRegularFile(realFile)) {
+						throw new ResourceNotFoundException("Could not find '" + path + '\'');
+					}
+					return realFile;
 				})
-			.then(() -> ChannelFileReader.open(executor, file))
+			.then(realFile -> ChannelFileReader.open(executor, realFile))
 			.then(cfr -> cfr.toCollector(ByteBufs.collector()));
 	}
 }

@@ -131,12 +131,12 @@ public abstract class AbstractMapSerializerDef extends AbstractSerializerDef imp
 	protected Expression doDecode(StaticDecoders staticDecoders, Expression in, int version, CompatibilityLevel compatibilityLevel, Expression length) {
 		Decoder keyDecoder = keySerializer.defineDecoder(staticDecoders, version, compatibilityLevel);
 		Decoder valueDecoder = valueSerializer.defineDecoder(staticDecoders, version, compatibilityLevel);
-		return let(createBuilder(length), builder -> sequence(
+		return checkLength(in, length, let(createBuilder(length), builder -> sequence(
 			iterate(value(0), length,
 				i -> putToBuilder(builder, i,
 					cast(keyDecoder.decode(in), keyType),
 					cast(valueDecoder.decode(in), valueType))),
-			build(builder)));
+			build(builder))));
 	}
 
 	protected abstract SerializerDef doEnsureNullable(CompatibilityLevel compatibilityLevel);

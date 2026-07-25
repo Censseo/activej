@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.regex.Pattern;
 
 import static io.activej.common.Checks.checkArgument;
 import static io.activej.config.Config.concatPath;
@@ -125,6 +126,8 @@ public final class EffectiveConfig implements Config {
 	@SuppressWarnings("EqualsWhichDoesntCheckParameterClass")
 	@Override
 	public boolean equals(Object obj) {
+		if (this == obj) return true;
+		if (obj instanceof EffectiveConfig other) return config.equals(other.config);
 		return config.equals(obj);
 	}
 
@@ -163,16 +166,23 @@ public final class EffectiveConfig implements Config {
 
 			if (!register.calls.containsKey(key)) {
 				sb.append("## ");
-				writeProperty(sb, key, value);
+				writeProperty(sb, key, redact(key, value));
 			} else {
 				if (Objects.equals(used, defaultValue)) {
 					sb.append("# ");
 				}
-				writeProperty(sb, key, Objects.toString(used, ""));
+				writeProperty(sb, key, redact(key, Objects.toString(used, "")));
 			}
 		}
 
 		return sb.toString();
+	}
+
+	private static final Pattern SENSITIVE_KEY =
+		Pattern.compile("(?i).*(password|secret|token|credential|api[-_.]?key|private[-_.]?key).*");
+
+	static String redact(String key, String value) {
+		return SENSITIVE_KEY.matcher(key).matches() ? "******" : value;
 	}
 
 	private static int commonDots(String key1, String key2) {

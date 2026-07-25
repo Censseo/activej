@@ -70,7 +70,7 @@ public final class ClusterRepartitionController extends AbstractReactive
 	private final FileSystemPartitions partitions;
 	private final AsyncRunnable repartition = reuse(this::doRepartition);
 
-	private final List<String> processedFiles = new ArrayList<>();
+	private final Set<String> processedFiles = new HashSet<>();
 
 	private IFileSystem fileSystem;
 	private String glob = "**";
@@ -83,6 +83,7 @@ public final class ClusterRepartitionController extends AbstractReactive
 	private int ensuredFiles = 0;
 	private int failedFiles = 0;
 	private boolean isRepartitioning;
+	private boolean stopRequested;
 
 	private Set<Object> lastAlivePartitionIds = Set.of();
 	private long lastPlanRecalculation;
@@ -170,6 +171,7 @@ public final class ClusterRepartitionController extends AbstractReactive
 		}
 
 		isRepartitioning = true;
+		stopRequested = false;
 		processedFiles.clear();
 		return recalculatePlan()
 			.then(() -> Promises.repeat(
@@ -268,12 +270,16 @@ public final class ClusterRepartitionController extends AbstractReactive
 						updateLastAlivePartitionIds();
 					})
 					.toVoid()
-					.then(Promise::of,
-						e -> {
-							logger.warn("Failed to recalculate repartition plan, retrying in 1 second", e);
-							return Promises.delay(Duration.ofSeconds(1))
-								.then(this::recalculatePlan);
-						});
+				.then(Promise::of,
+					e -> {
+						if (stopRequested) {
+							logger.warn("Repartition plan recalculation stopped", e);
+							return Promise.complete();
+						}
+						logger.warn("Failed to recalculate repartition plan, retrying in 1 second", e);
+						return Promises.delay(Duration.ofSeconds(1))
+							.then(this::recalculatePlan);
+					});
 			});
 	}
 
@@ -309,8 +315,8 @@ public final class ClusterRepartitionController extends AbstractReactive
 					.min()
 					.getAsLong();
 
-				ChannelByteSplitter splitter = ChannelByteSplitter.create(1)
-					.withInput(ChannelSuppliers.ofPromise(fileSystem.download(name, offset, meta.getSize())));
+			ChannelByteSplitter splitter = ChannelByteSplitter.create(1)
+				.withInput(ChannelSuppliers.ofPromise(fileSystem.download(name, offset, meta.getSize() - offset)));
 
 				RefInt idx = new RefInt(0);
 				return Promises.toList(infoResults.remoteMetadata.stream() // upload file to target partitions
@@ -416,6 +422,7 @@ public final class ClusterRepartitionController extends AbstractReactive
 	@Override
 	public Promise<Void> stop() {
 		checkInReactorThread(this);
+		stopRequested = true;
 		return isRepartitioning() ?
 			Promise.ofCallback(cb -> this.closeCallback = cb) :
 			Promise.complete();

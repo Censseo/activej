@@ -67,6 +67,9 @@ public final class BasicAuthServlet extends AbstractReactive
 		this.next = next;
 		this.credentialsLookup = credentialsLookup;
 
+		if (realm.indexOf('"') != -1 || realm.indexOf('\r') != -1 || realm.indexOf('\n') != -1) {
+			throw new IllegalArgumentException("Realm must not contain '\"', CR or LF characters");
+		}
 		challenge = PREFIX + "realm=\"" + realm + "\", charset=\"UTF-8\"";
 	}
 
@@ -139,8 +142,9 @@ public final class BasicAuthServlet extends AbstractReactive
 		return (login, pass) -> {
 			String expected = credentials.get(login);
 			byte[] passBytes = pass.getBytes(UTF_8);
-			byte[] expectedBytes = (expected == null ? "" : expected).getBytes(UTF_8);
-			return expected != null && MessageDigest.isEqual(passBytes, expectedBytes);
+			byte[] expectedBytes = (expected != null ? expected : "\0\0\0\0\0\0\0\0").getBytes(UTF_8);
+			boolean equal = MessageDigest.isEqual(passBytes, expectedBytes);
+			return expected != null && equal;
 		};
 	}
 }

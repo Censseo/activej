@@ -56,9 +56,9 @@ public abstract class BlockingTakeQueue<T> extends ImplicitlyReactive {
 	}
 
 	public boolean put(T x) {
+		if (closed) throw new IllegalStateException("Putting into a closed queue");
 		if (CHECKS) {
 			checkInReactorThread(this);
-			checkState(!closed);
 			checkState(!isSaturated());
 		}
 

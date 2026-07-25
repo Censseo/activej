@@ -48,9 +48,9 @@ import static java.util.stream.Collectors.toSet;
 @SuppressWarnings({"unused", "WeakerAccess", "Convert2Lambda", "rawtypes"})
 public abstract class Binding<T> {
 	private final Set<Key<?>> dependencies;
-	private BindingType type;
+	private final BindingType type;
 
-	private @Nullable LocationInfo location;
+	private final @Nullable LocationInfo location;
 
 	protected Binding(Set<Key<?>> dependencies) {
 		this(dependencies, BindingType.REGULAR, null);
@@ -174,13 +174,21 @@ public abstract class Binding<T> {
 	// endregion
 
 	public Binding<T> at(@Nullable LocationInfo location) {
-		this.location = location;
-		return this;
+		return copy(type, location);
 	}
 
 	public Binding<T> as(BindingType type) {
-		this.type = type;
-		return this;
+		return copy(type, location);
+	}
+
+	protected Binding<T> copy(BindingType type, @Nullable LocationInfo location) {
+		Binding<T> self = this;
+		return new Binding<>(dependencies, type, location) {
+			@Override
+			public CompiledBinding<T> compile(CompiledBindingLocator compiledBindings, boolean threadsafe, int scope, @Nullable Integer slot) {
+				return self.compile(compiledBindings, threadsafe, scope, slot);
+			}
+		};
 	}
 
 	public Binding<T> onInstance(Consumer<? super T> consumer) {

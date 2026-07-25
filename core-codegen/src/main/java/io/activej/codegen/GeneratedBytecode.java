@@ -42,6 +42,16 @@ public class GeneratedBytecode implements AutoCloseable {
 		return generatedClass;
 	}
 
+	/**
+	 * Returns {@code true} if the generated class resolves non-primitive constants
+	 * through {@link ClassGenerator#getStaticConstant(int)} at class initialization time.
+	 * Such classes must not be loaded from a persistent bytecode storage, because the
+	 * constants would not be present there.
+	 */
+	public boolean usesStaticConstants() {
+		return false;
+	}
+
 	protected void touchGeneratedClass(Class<?> generatedClass) {
 	}
 

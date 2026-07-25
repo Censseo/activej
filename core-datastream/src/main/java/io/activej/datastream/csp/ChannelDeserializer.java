@@ -45,6 +45,7 @@ public final class ChannelDeserializer<T> extends AbstractStreamSupplier<T>
 	private final ByteBufs bufs = new ByteBufs();
 
 	private boolean explicitEndOfStream = false;
+	private int maxMessageSize = 0;
 
 	private ChannelDeserializer(BinarySerializer<T> valueSerializer) {
 		this.valueSerializer = valueSerializer;
@@ -75,6 +76,18 @@ public final class ChannelDeserializer<T> extends AbstractStreamSupplier<T>
 		public Builder withExplicitEndOfStream(boolean explicitEndOfStream) {
 			checkNotBuilt(this);
 			ChannelDeserializer.this.explicitEndOfStream = explicitEndOfStream;
+			return this;
+		}
+
+		/**
+		 * Sets the maximum allowed size of a single deserialized message in bytes.
+		 * Messages declaring a larger size are rejected as corrupted.
+		 * <p>
+		 * A value of {@code 0} (the default) means no limit.
+		 */
+		public Builder withMaxMessageSize(int maxMessageSize) {
+			checkNotBuilt(this);
+			ChannelDeserializer.this.maxMessageSize = maxMessageSize;
 			return this;
 		}
 
@@ -174,6 +187,8 @@ public final class ChannelDeserializer<T> extends AbstractStreamSupplier<T>
 					messageSize = (encodedSize & 0x0FFFFFFF) + headerSize;
 				}
 
+				checkMessageSize(messageSize - headerSize);
+
 				if (firstBufRemaining >= messageSize) {
 					T item = valueSerializer.decode(array, pos + headerSize);
 					send(item);
@@ -200,6 +215,8 @@ public final class ChannelDeserializer<T> extends AbstractStreamSupplier<T>
 		int messageSize = encodedSize & 0x0FFFFFFF;
 		int headerSize = encodedSize >>> 28;
 
+		checkMessageSize(messageSize);
+
 		if (!bufs.hasRemainingBytes(messageSize)) {
 			return -1;
 		}
@@ -210,6 +227,12 @@ public final class ChannelDeserializer<T> extends AbstractStreamSupplier<T>
 		});
 
 		return 1;
+	}
+
+	private void checkMessageSize(int dataSize) {
+		if (maxMessageSize > 0 && dataSize > maxMessageSize) {
+			throw new CorruptedDataException("Message size " + dataSize + " exceeds maximum " + maxMessageSize);
+		}
 	}
 
 	private static int readEncodedSize(byte[] array, int pos, byte b) {

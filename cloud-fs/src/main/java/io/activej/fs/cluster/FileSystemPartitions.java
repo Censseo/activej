@@ -272,9 +272,6 @@ public final class FileSystemPartitions extends AbstractReactive
 			}
 			alivePartitions.put(partitionId, fs);
 		}
-
-		alivePartitions.clear();
-		deadPartitions.clear();
 	}
 
 	private Promise<Void> doCheckAllPartitions() {

@@ -209,12 +209,12 @@ public final class HttpServerConnection extends AbstractHttpConnection {
 	protected void onStartLine(byte[] line, int pos, int limit) throws MalformedHttpException {
 		switchPool(server.poolReadWrite);
 
-		HttpMethod method = getHttpMethod(line, pos);
+		HttpMethod method = getHttpMethod(line, pos, limit);
 		if (method == null) {
 			if (!DETAILED_ERROR_MESSAGES) throw new MalformedHttpException("Unknown HTTP method");
 			throw new MalformedHttpException(
 				"Unknown HTTP method. First line: " +
-				new String(line, 0, limit, ISO_8859_1));
+				new String(line, pos, limit - pos, ISO_8859_1));
 		}
 
 		int urlStart = pos + method.size + 1;
@@ -252,12 +252,12 @@ public final class HttpServerConnection extends AbstractHttpConnection {
 				if (!DETAILED_ERROR_MESSAGES) throw new MalformedHttpException("Unknown HTTP version");
 				throw new MalformedHttpException(
 					"Unknown HTTP version. First line: " +
-					new String(line, 0, limit, ISO_8859_1));
+					new String(line, pos, limit - pos, ISO_8859_1));
 			}
 		} else {
 			if (!DETAILED_ERROR_MESSAGES) throw new MalformedHttpException("Unsupported HTTP version");
 			throw new MalformedHttpException(
-				"Unsupported HTTP version. First line: " + new String(line, 0, limit, ISO_8859_1));
+				"Unsupported HTTP version. First line: " + new String(line, pos, limit - pos, ISO_8859_1));
 		}
 
 		request = new HttpRequest(version, method, UrlParser.parse(line, urlStart, urlEnd), this);
@@ -268,21 +268,23 @@ public final class HttpServerConnection extends AbstractHttpConnection {
 		}
 	}
 
-	private static HttpMethod getHttpMethod(byte[] line, int pos) {
-		boolean get = line[pos] == 'G' && line[pos + 1] == 'E' && line[pos + 2] == 'T' && (line[pos + 3] == SP || line[pos + 3] == HT);
+	private static HttpMethod getHttpMethod(byte[] line, int pos, int limit) {
+		boolean get = limit - pos >= 4 &&
+			line[pos] == 'G' && line[pos + 1] == 'E' && line[pos + 2] == 'T' && (line[pos + 3] == SP || line[pos + 3] == HT);
 		if (get) {
 			return GET;
 		}
-		boolean post = line[0] == 'P' && line[1] == 'O' && line[2] == 'S' && line[3] == 'T' && (line[4] == SP || line[4] == HT);
+		boolean post = limit - pos >= 5 &&
+			line[pos] == 'P' && line[pos + 1] == 'O' && line[pos + 2] == 'S' && line[pos + 3] == 'T' && (line[pos + 4] == SP || line[pos + 4] == HT);
 		if (post) {
 			return POST;
 		}
-		return getHttpMethodFromMap(line, pos);
+		return getHttpMethodFromMap(line, pos, limit);
 	}
 
-	private static HttpMethod getHttpMethodFromMap(byte[] line, int pos) {
+	private static HttpMethod getHttpMethodFromMap(byte[] line, int pos, int limit) {
 		int hashCode = 0;
-		for (int i = pos; i < min(pos + 10, line.length); i++) {
+		for (int i = pos; i < min(pos + 10, limit); i++) {
 			byte b = line[i];
 			if (b == SP || b == HT) {
 				int slot = hashCode & (METHODS.length - 1);

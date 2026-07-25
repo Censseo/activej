@@ -6,7 +6,11 @@ import static io.activej.codegen.expression.Expressions.*;
 
 public class Utils {
 	public static Expression initialCapacity(Expression initialSize) {
-		return mul(div(add(initialSize, value(2)), value(3)), value(4));
+		return cast(staticCall(Utils.class, "computeInitialCapacity", cast(initialSize, long.class)), int.class);
+	}
+
+	public static long computeInitialCapacity(long initialSize) {
+		return Math.min((initialSize + 2) / 3 * 4, Integer.MAX_VALUE - 8L);
 	}
 
 	public static Class<?> getArrayClass(Class<?> componentType) throws ClassNotFoundException {

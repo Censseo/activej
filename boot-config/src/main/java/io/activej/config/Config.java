@@ -562,7 +562,7 @@ public interface Config {
 		String thisValue = getValue(null);
 		String otherValue = other.getValue(null);
 		if (thisValue != null && otherValue != null) {
-			throw new IllegalArgumentException("Duplicate values\n" + this.toMap() + "\n" + other.toMap());
+			throw new IllegalArgumentException("Duplicate values while combining configs");
 		}
 		Map<String, Config> children = new LinkedHashMap<>(getChildren());
 		other.getChildren().forEach((key, otherChild) -> children.merge(key, otherChild, Config::combineWith));

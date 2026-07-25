@@ -16,6 +16,7 @@
 
 package io.activej.fs.tcp;
 
+import io.activej.common.MemSize;
 import io.activej.common.function.SupplierEx;
 import io.activej.csp.binary.codec.ByteBufsCodec;
 import io.activej.csp.binary.codec.ByteBufsCodecs;
@@ -38,21 +39,28 @@ import io.activej.reactor.nio.NioReactor;
 import java.net.InetAddress;
 import java.time.Duration;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 import static io.activej.async.util.LogUtils.Level.TRACE;
 import static io.activej.async.util.LogUtils.toLogger;
 import static io.activej.fs.util.RemoteFileSystemUtils.castError;
 import static io.activej.fs.util.RemoteFileSystemUtils.ofFixedSize;
+import static io.activej.fs.util.RemoteFileSystemUtils.ofMaxSize;
 
 /**
  * An implementation of {@link AbstractReactiveServer} that works with {@link RemoteFileSystem} client.
  * It exposes some given {@link IFileSystem} via TCP.
  * <p>
- * <b>This server should not be launched as a publicly available server, it is meant for private networks.</b>
+ * <b>WARNING: this server provides no authentication or transport encryption by default.
+ * Any client that can connect is able to upload, download, move and delete files.
+ * It is meant for private, fully trusted networks only.
+ * Use {@link Builder#withRequestAuthorizer(Predicate)} to restrict requests.</b>
  */
 public final class FileSystemServer extends AbstractReactiveServer {
 	public static final Version VERSION = new Version(1, 0);
+
+	public static final MemSize DEFAULT_MAX_UPLOAD_SIZE = MemSize.megabytes(1024);
 
 	private static final ByteBufsCodec<FileSystemRequest, FileSystemResponse> SERIALIZER = ByteBufsCodecs.ofStreamCodecs(
 		RemoteFileSystemUtils.FS_REQUEST_CODEC,
@@ -63,6 +71,9 @@ public final class FileSystemServer extends AbstractReactiveServer {
 
 	private Function<FileSystemRequest.Handshake, FileSystemResponse.Handshake> handshakeHandler = $ ->
 		new FileSystemResponse.Handshake(null);
+
+	private Predicate<FileSystemRequest> requestAuthorizer = $ -> true;
+	private long maxUploadSize = DEFAULT_MAX_UPLOAD_SIZE.toLong();
 
 	// region JMX
 	private final PromiseStats handleRequestPromise = PromiseStats.create(Duration.ofMinutes(5));
@@ -102,6 +113,29 @@ public final class FileSystemServer extends AbstractReactiveServer {
 			FileSystemServer.this.handshakeHandler = handshakeHandler;
 			return this;
 		}
+
+		/**
+		 * Sets a predicate that authorizes each incoming request (after the handshake).
+		 * Requests for which the predicate returns {@code false} are rejected.
+		 * <p>
+		 * By default all requests are authorized.
+		 */
+		public Builder withRequestAuthorizer(Predicate<FileSystemRequest> requestAuthorizer) {
+			checkNotBuilt(this);
+			FileSystemServer.this.requestAuthorizer = requestAuthorizer;
+			return this;
+		}
+
+		/**
+		 * Sets the maximum size of a single upload.
+		 * <p>
+		 * Defaults to {@link #DEFAULT_MAX_UPLOAD_SIZE}.
+		 */
+		public Builder withMaxUploadSize(MemSize maxUploadSize) {
+			checkNotBuilt(this);
+			FileSystemServer.this.maxUploadSize = maxUploadSize.toLong();
+			return this;
+		}
 	}
 
 	public IFileSystem getFileSystem() {
@@ -119,7 +153,12 @@ public final class FileSystemServer extends AbstractReactiveServer {
 				return handleHandshake(messaging, handshake);
 			})
 			.then(messaging::receive)
-			.then(msg -> dispatch(messaging, msg))
+			.then(msg -> {
+				if (!requestAuthorizer.test(msg)) {
+					return Promise.ofException(new FileSystemException("Request is not authorized: " + msg.getClass().getSimpleName()));
+				}
+				return dispatch(messaging, msg);
+			})
 			.whenComplete(handleRequestPromise.recordStats())
 			.whenException(e -> {
 				logger.warn("got an error while handling message : {}", this, e);
@@ -186,8 +225,13 @@ public final class FileSystemServer extends AbstractReactiveServer {
 	private Promise<Void> handleUpload(IMessaging<FileSystemRequest, FileSystemResponse> messaging, FileSystemRequest.Upload upload) {
 		String name = upload.name();
 		long size = upload.size();
+		if (size > maxUploadSize) {
+			return Promise.ofException(new FileSystemException("Upload size " + size + " exceeds maximum of " + maxUploadSize + " bytes"));
+		}
 		return (size == -1 ? fileSystem.upload(name) : fileSystem.upload(name, size))
-			.map(uploader -> size == -1 ? uploader : uploader.transformWith(ofFixedSize(size)))
+			.map(uploader -> size == -1 ?
+				uploader.transformWith(ofMaxSize(maxUploadSize)) :
+				uploader.transformWith(ofFixedSize(size)))
 			.then(uploader -> messaging.send(new FileSystemResponse.UploadAck())
 				.then(() -> messaging.receiveBinaryStream()
 					.streamTo(uploader.withAcknowledgement(

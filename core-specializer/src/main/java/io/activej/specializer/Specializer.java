@@ -106,6 +106,7 @@ public final class Specializer {
 
 		final Map<Field, String> specializedFields = new LinkedHashMap<>();
 		final Map<java.lang.reflect.Method, String> specializedMethods = new LinkedHashMap<>();
+		final List<Integer> registeredStaticValues = new ArrayList<>();
 
 		Specialization(Object instance) {
 			this.instance = instance;
@@ -164,15 +165,26 @@ public final class Specializer {
 
 		public Class<?> ensureClass() {
 			if (specializedClass != null) return specializedClass;
-			byte[] bytecode = defineNewClass();
-			String className = specializedType.getClassName();
-			classLoader.register(className, bytecode);
 			try {
+				byte[] bytecode = defineNewClass();
+				String className = specializedType.getClassName();
+				classLoader.register(className, bytecode);
 				specializedClass = classLoader.loadClass(className);
-			} catch (ClassNotFoundException e) {
-				throw new RuntimeException(e);
+			} catch (Throwable t) {
+				for (int idx : registeredStaticValues) {
+					STATIC_VALUES.remove(idx);
+				}
+				if (t instanceof RuntimeException runtimeException) throw runtimeException;
+				if (t instanceof Error error) throw error;
+				throw new RuntimeException(t);
 			}
 			return specializedClass;
+		}
+
+		private int registerStaticValue(Object value) {
+			int idx = Specializer.registerStaticValue(value);
+			registeredStaticValues.add(idx);
+			return idx;
 		}
 
 		byte[] defineNewClass() {
@@ -798,9 +810,12 @@ public final class Specializer {
 			try {
 				ClassLoader classLoader = clazz.getClassLoader();
 				String pathToClass = clazz.getName().replace('.', '/') + ".class";
-				InputStream classInputStream = classLoader.getResourceAsStream(pathToClass);
-				//noinspection ConstantConditions - null is allowed
-				cr = new ClassReader(classInputStream);
+				try (InputStream classInputStream = classLoader.getResourceAsStream(pathToClass)) {
+					if (classInputStream == null) {
+						throw new IllegalArgumentException("Class bytecode not found: " + pathToClass);
+					}
+					cr = new ClassReader(classInputStream);
+				}
 			} catch (IOException e) {
 				throw new IllegalArgumentException(e);
 			}
@@ -826,8 +841,10 @@ public final class Specializer {
 		if (predicate != null && !predicate.test(instance.getClass())) return instance;
 		ensureAccessibility(instance.getClass());
 		Specialization specialization = ensureSpecialization(instance);
-		for (Specialization s : specializations.values()) {
-			s.ensureClass();
+		synchronized (specializations) {
+			for (Specialization s : specializations.values()) {
+				s.ensureClass();
+			}
 		}
 		//noinspection unchecked
 		return (T) specialization.ensureInstance();
@@ -847,17 +864,21 @@ public final class Specializer {
 
 	private <T> Specialization ensureSpecialization(T instance) {
 		IdentityKey<Object> key = new IdentityKey<>(instance);
-		Specialization specialization = specializations.get(key);
-		if (specialization == null) {
-			specialization = new Specialization(instance);
-			specializations.put(key, specialization);
-			specialization.scanInstance();
+		synchronized (specializations) {
+			Specialization specialization = specializations.get(key);
+			if (specialization == null) {
+				specialization = new Specialization(instance);
+				specializations.put(key, specialization);
+				specialization.scanInstance();
+			}
+			return specialization;
 		}
-		return specialization;
 	}
 
 	public boolean isSpecialized(Object instance) {
-		return specializations.containsKey(new IdentityKey<>(instance));
+		synchronized (specializations) {
+			return specializations.containsKey(new IdentityKey<>(instance));
+		}
 	}
 
 	public BytecodeClassLoader getClassLoader() {

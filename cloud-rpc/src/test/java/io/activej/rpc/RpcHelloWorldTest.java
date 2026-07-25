@@ -76,6 +76,7 @@ public final class RpcHelloWorldTest {
 				return "Hello, " + name + "!";
 			}))
 			.withListenPort(port)
+			.withDetailedErrorMessages(true)
 			.build();
 	}
 

@@ -97,7 +97,7 @@ public final class SimpleProxyServerTest {
 		stream.write(encodeAscii("""
 			GET /abc HTTP/1.1\r
 			Host: localhost\r
-			Connection: keep-alive
+			Connection: keep-alive\r
 			\r
 			"""));
 		readAndAssert(socket.getInputStream(), """
@@ -109,7 +109,7 @@ public final class SimpleProxyServerTest {
 		stream.write(encodeAscii("""
 			GET /hello HTTP/1.1\r
 			Host: localhost\r
-			Connection: close
+			Connection: close\r
 			\r
 			"""));
 		readAndAssert(socket.getInputStream(), """

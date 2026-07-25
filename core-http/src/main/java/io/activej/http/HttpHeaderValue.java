@@ -46,6 +46,12 @@ public abstract class HttpHeaderValue {
 	}
 
 	public static HttpHeaderValue ofBytes(byte[] array, int offset, int size) {
+		for (int i = offset; i < offset + size; i++) {
+			byte b = array[i];
+			if (b == '\r' || b == '\n') {
+				throw new IllegalArgumentException("Header value must not contain CR or LF characters");
+			}
+		}
 		return new HttpHeaderValueOfBytes(array, offset, size);
 	}
 
@@ -385,9 +391,9 @@ public abstract class HttpHeaderValue {
 
 		@Override
 		int writeTo(byte[] array, int offset) {
-			if (this.array.length < 10) {
-				for (byte b : this.array) {
-					array[offset++] = b;
+			if (size < 10) {
+				for (int i = 0; i < size; i++) {
+					array[offset++] = this.array[this.offset + i];
 				}
 				return offset;
 			} else {

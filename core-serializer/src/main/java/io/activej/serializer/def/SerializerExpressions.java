@@ -18,6 +18,7 @@ package io.activej.serializer.def;
 
 import io.activej.codegen.expression.Expression;
 import io.activej.codegen.expression.Variable;
+import io.activej.serializer.CorruptedDataException;
 import io.activej.serializer.util.BinaryOutputUtils;
 
 import static io.activej.codegen.expression.Expressions.*;
@@ -217,6 +218,14 @@ public final class SerializerExpressions {
 
 	public static Expression readVarInt(Expression in) {
 		return call(in, "readVarInt");
+	}
+
+	public static Expression checkLength(Expression in, Expression length, Expression next) {
+		return ifLt(length, value(0),
+			throwException(CorruptedDataException.class, "Negative decoded length"),
+			ifGt(length, sub(length(array(in)), pos(in)),
+				throwException(CorruptedDataException.class, "Decoded length exceeds available data"),
+				next));
 	}
 
 	public static Expression readVarLong(Expression in) {

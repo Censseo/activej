@@ -319,7 +319,10 @@ public final class RpcClientConnection extends AbstractReactive implements RpcSt
 		if (isClosed()) return;
 		logger.error("Serialization error: {} for message {}", address, message.getMessage(), e);
 		rpcClient.getLastProtocolError().recordException(e, address);
-		activeRequests.remove(message.getIndex()).accept(null, e);
+		Callback<?> callback = activeRequests.remove(message.getIndex());
+		if (callback != null) {
+			callback.accept(null, e);
+		}
 	}
 
 	@Override

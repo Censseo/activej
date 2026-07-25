@@ -86,7 +86,7 @@ public final class HttpClient extends AbstractNioReactive
 	public static final Duration READ_WRITE_TIMEOUT = ApplicationSettings.getDuration(HttpClient.class, "readWriteTimeout", Duration.ZERO);
 	public static final Duration READ_WRITE_TIMEOUT_SHUTDOWN = ApplicationSettings.getDuration(HttpClient.class, "readWriteTimeout_Shutdown", Duration.ofSeconds(3));
 	public static final Duration KEEP_ALIVE_TIMEOUT = ApplicationSettings.getDuration(HttpClient.class, "keepAliveTimeout", Duration.ZERO);
-	public static final MemSize MAX_BODY_SIZE = ApplicationSettings.getMemSize(HttpClient.class, "maxBodySize", MemSize.ZERO);
+	public static final MemSize MAX_BODY_SIZE = ApplicationSettings.getMemSize(HttpClient.class, "maxBodySize", MemSize.megabytes(100));
 	public static final MemSize MAX_WEB_SOCKET_MESSAGE_SIZE = ApplicationSettings.getMemSize(HttpClient.class, "maxWebSocketMessageSize", MemSize.megabytes(1));
 	public static final int MAX_KEEP_ALIVE_REQUESTS = ApplicationSettings.getInt(HttpClient.class, "maxKeepAliveRequests", 0);
 
@@ -570,7 +570,7 @@ public final class HttpClient extends AbstractNioReactive
 			.then((v, e) -> handleShutdown(v, e, --pendingConnects))
 			.then(
 				tcpSocket -> {
-					TcpSocket.Inspector socketInspector = isSecure ? this.socketInspector : socketSslInspector;
+					TcpSocket.Inspector socketInspector = isSecure ? socketSslInspector : this.socketInspector;
 					if (socketInspector != null) {
 						socketInspector.onConnect(tcpSocket);
 						tcpSocket.setInspector(socketInspector);

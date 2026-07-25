@@ -154,27 +154,31 @@ public final class HttpClientConnection extends AbstractHttpConnection {
 
 	@Override
 	protected void onStartLine(byte[] line, int pos, int limit) throws MalformedHttpException {
+		if (limit - pos < 9) {
+			if (!DETAILED_ERROR_MESSAGES) throw new MalformedHttpException("Invalid response");
+			throw new MalformedHttpException("Invalid response. First line: " + new String(line, pos, limit - pos, ISO_8859_1));
+		}
 		//noinspection PointlessArithmeticExpression
 		boolean http1x = line[pos + 0] == 'H' && line[pos + 1] == 'T' && line[pos + 2] == 'T' && line[pos + 3] == 'P' && line[pos + 4] == '/' && line[pos + 5] == '1';
 		boolean http11 = line[pos + 6] == '.' && line[pos + 7] == '1' && line[pos + 8] == SP;
 
 		if (!http1x) {
 			if (!DETAILED_ERROR_MESSAGES) throw new MalformedHttpException("Invalid response");
-			throw new MalformedHttpException("Invalid response. First line: " + new String(line, 0, limit, ISO_8859_1));
+			throw new MalformedHttpException("Invalid response. First line: " + new String(line, pos, limit - pos, ISO_8859_1));
 		}
 
 		int i = pos + 9;
 		HttpVersion version = HttpVersion.HTTP_1_1;
 		if (http11) {
 			flags |= KEEP_ALIVE;
-		} else if (line[6] == '.' && line[7] == '0' && line[8] == SP) {
+		} else if (line[pos + 6] == '.' && line[pos + 7] == '0' && line[pos + 8] == SP) {
 			version = HttpVersion.HTTP_1_0;
-		} else if (line[6] == SP) {
+		} else if (line[pos + 6] == SP) {
 			version = HttpVersion.HTTP_1_0;
 			i += 7 - 9;
 		} else {
 			if (!DETAILED_ERROR_MESSAGES) throw new MalformedHttpException("Invalid response");
-			throw new MalformedHttpException("Invalid response. First line: " + new String(line, 0, limit, ISO_8859_1));
+			throw new MalformedHttpException("Invalid response. First line: " + new String(line, pos, limit - pos, ISO_8859_1));
 		}
 
 		int statusCode = decodePositiveInt(line, i, 3);

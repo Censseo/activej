@@ -16,6 +16,7 @@
 
 package io.activej.bytebuf;
 
+import io.activej.common.ApplicationSettings;
 import io.activej.common.Checks;
 import io.activej.common.Utils;
 import io.activej.common.recycle.Recyclable;
@@ -46,7 +47,9 @@ import static java.lang.Math.min;
 public class ByteBuf implements Recyclable {
 	private static final boolean CHECKS = Checks.isEnabled(ByteBuf.class);
 
-	static final boolean CHECK_RECYCLE = ByteBufPool.REGISTRY || CHECKS;
+	static final boolean STRICT_RECYCLE =
+		ApplicationSettings.getBoolean(ByteBuf.class, "strictRecycle", false);
+	static final boolean CHECK_RECYCLE = ByteBufPool.REGISTRY || CHECKS || STRICT_RECYCLE;
 
 	/**
 	 * Allows creating slices of {@link ByteBuf}, helper class.
@@ -370,6 +373,7 @@ public class ByteBuf implements Recyclable {
 	 */
 	public void head(int pos) {
 		if (CHECKS) checkArgument(pos <= tail);
+		if (this == EMPTY && pos != 0) throw new IllegalStateException("Mutating shared empty ByteBuf");
 		head = pos;
 	}
 
@@ -392,6 +396,7 @@ public class ByteBuf implements Recyclable {
 	 */
 	public void tail(int pos) {
 		if (CHECKS) checkArgument(pos >= head && pos <= array.length);
+		if (this == EMPTY && pos != 0) throw new IllegalStateException("Mutating shared empty ByteBuf");
 		tail = pos;
 	}
 
@@ -409,6 +414,7 @@ public class ByteBuf implements Recyclable {
 			checkArgument(head + delta >= 0, "New head cannot be negative");
 			checkArgument(head + delta <= tail, "New head cannot be greater than tail");
 		}
+		if (this == EMPTY && delta != 0) throw new IllegalStateException("Mutating shared empty ByteBuf");
 		head += delta;
 	}
 
@@ -426,6 +432,7 @@ public class ByteBuf implements Recyclable {
 			checkArgument(tail + delta >= head, "New tail cannot be lesser than head");
 			checkArgument(tail + delta <= array.length, "New tail cannot be greater than size of underlying array");
 		}
+		if (this == EMPTY && delta != 0) throw new IllegalStateException("Mutating shared empty ByteBuf");
 		tail += delta;
 	}
 
@@ -810,6 +817,7 @@ public class ByteBuf implements Recyclable {
 
 	public byte readByte() {
 		if (CHECK_RECYCLE && isRecycled()) throw ByteBufPool.onByteBufRecycled(this);
+		checkReadRemaining(1);
 		return array[head++];
 	}
 
@@ -819,6 +827,7 @@ public class ByteBuf implements Recyclable {
 
 	public char readChar() {
 		if (CHECK_RECYCLE && isRecycled()) throw ByteBufPool.onByteBufRecycled(this);
+		checkReadRemaining(2);
 		char c = (char) (((array[head] & 0xFF) << 8) | (array[head + 1] & 0xFF));
 		head += 2;
 		return c;
@@ -836,6 +845,7 @@ public class ByteBuf implements Recyclable {
 
 	public int readInt() {
 		if (CHECK_RECYCLE && isRecycled()) throw ByteBufPool.onByteBufRecycled(this);
+		checkReadRemaining(4);
 		int result =
 			(array[head] & 0xFF) << 24 |
 			(array[head + 1] & 0xFF) << 16 |
@@ -848,42 +858,32 @@ public class ByteBuf implements Recyclable {
 	public int readVarInt() {
 		if (CHECK_RECYCLE && isRecycled()) throw ByteBufPool.onByteBufRecycled(this);
 		int result;
-		byte b = array[head];
+		byte b = readByte();
 		if (b >= 0) {
-			result = b;
-			head += 1;
-		} else {
-			result = b & 0x7f;
-			if ((b = array[head + 1]) >= 0) {
-				result |= b << 7;
-				head += 2;
-			} else {
-				result |= (b & 0x7f) << 7;
-				if ((b = array[head + 2]) >= 0) {
-					result |= b << 14;
-					head += 3;
-				} else {
-					result |= (b & 0x7f) << 14;
-					if ((b = array[head + 3]) >= 0) {
-						result |= b << 21;
-						head += 4;
-					} else {
-						result |= (b & 0x7f) << 21;
-						if ((b = array[head + 4]) >= 0) {
-							result |= b << 28;
-							head += 5;
-						} else {
-							throw new IllegalStateException("Read varint was too long");
-						}
-					}
-				}
-			}
+			return b;
 		}
-		return result;
+		result = b & 0x7f;
+		if ((b = readByte()) >= 0) {
+			return result | b << 7;
+		}
+		result |= (b & 0x7f) << 7;
+		if ((b = readByte()) >= 0) {
+			return result | b << 14;
+		}
+		result |= (b & 0x7f) << 14;
+		if ((b = readByte()) >= 0) {
+			return result | b << 21;
+		}
+		result |= (b & 0x7f) << 21;
+		if ((b = readByte()) >= 0) {
+			return result | b << 28;
+		}
+		throw new IllegalStateException("Read varint was too long");
 	}
 
 	public long readLong() {
 		if (CHECK_RECYCLE && isRecycled()) throw ByteBufPool.onByteBufRecycled(this);
+		checkReadRemaining(8);
 		long result =
 			(long) array[head] << 56 |
 			(long) (array[head + 1] & 0xFF) << 48 |
@@ -899,9 +899,17 @@ public class ByteBuf implements Recyclable {
 
 	public short readShort() {
 		if (CHECK_RECYCLE && isRecycled()) throw ByteBufPool.onByteBufRecycled(this);
+		checkReadRemaining(2);
 		short result = (short) (((array[head] & 0xFF) << 8) | (array[head + 1] & 0xFF));
 		head += 2;
 		return result;
+	}
+
+	private void checkReadRemaining(int bytes) {
+		if (bytes > tail - head) {
+			throw new IndexOutOfBoundsException(
+				"Not enough readable bytes: required " + bytes + ", remaining " + (tail - head));
+		}
 	}
 
 	public long readVarLong() {

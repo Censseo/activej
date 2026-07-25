@@ -516,7 +516,7 @@ public final class ClassGenerator<T> {
 			g.endMethod();
 		}
 
-		{
+		try {
 			Method m = getMethod("void <clinit> ()");
 			GeneratorAdapter g = new GeneratorAdapter(ACC_PUBLIC + ACC_STATIC, m, null, null, cw);
 
@@ -557,34 +557,48 @@ public final class ClassGenerator<T> {
 
 			g.returnValue();
 			g.endMethod();
+
+			cw.visitEnd();
+
+			byte[] bytecode = cw.toByteArray();
+
+			return new GeneratedBytecode(className, bytecode) {
+				@Override
+				public boolean usesStaticConstants() {
+					return fieldConstants.values().stream().anyMatch(constant -> !isJvmPrimitive(constant.value)) ||
+						!constantMap.isEmpty();
+				}
+
+				@Override
+				protected void touchGeneratedClass(Class<?> generatedClass) {
+					try {
+						Field field = generatedClass.getField(GENERATED_MARKER);
+						//noinspection ResultOfMethodCallIgnored
+						field.get(null);
+					} catch (IllegalAccessException | NoSuchFieldException e) {
+						throw new AssertionError(e);
+					}
+				}
+
+				@Override
+				public void close() {
+					for (Map.Entry<String, Constant> entry : fieldConstants.entrySet()) {
+						STATIC_CONSTANTS.remove(entry.getValue().id);
+					}
+					for (Constant expression : constantMap.values()) {
+						STATIC_CONSTANTS.remove(expression.id);
+					}
+				}
+			};
+		} catch (Throwable t) {
+			for (Map.Entry<String, Constant> entry : fieldConstants.entrySet()) {
+				STATIC_CONSTANTS.remove(entry.getValue().id);
+			}
+			for (Constant expression : constantMap.values()) {
+				STATIC_CONSTANTS.remove(expression.id);
+			}
+			throw t;
 		}
-
-		cw.visitEnd();
-
-		byte[] bytecode = cw.toByteArray();
-
-		return new GeneratedBytecode(className, bytecode) {
-			@Override
-			protected void touchGeneratedClass(Class<?> generatedClass) {
-				try {
-					Field field = generatedClass.getField(GENERATED_MARKER);
-					//noinspection ResultOfMethodCallIgnored
-					field.get(null);
-				} catch (IllegalAccessException | NoSuchFieldException e) {
-					throw new AssertionError(e);
-				}
-			}
-
-			@Override
-			public void close() {
-				for (Map.Entry<String, Constant> entry : fieldConstants.entrySet()) {
-					STATIC_CONSTANTS.remove(entry.getValue().id);
-				}
-				for (Constant expression : constantMap.values()) {
-					STATIC_CONSTANTS.remove(expression.id);
-				}
-			}
-		};
 	}
 
 }

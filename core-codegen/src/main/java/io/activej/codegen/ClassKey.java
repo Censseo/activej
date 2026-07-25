@@ -34,15 +34,15 @@ public final class ClassKey<T> {
 
 	public static <T> ClassKey<T> of(Class<? super T> clazz, Object... parameters) {
 		//noinspection unchecked,rawtypes
-		return new ClassKey<>((Class) clazz, parameters);
+		return new ClassKey<>((Class) clazz, parameters != null ? parameters.clone() : null);
+	}
+
+	public Object[] getParameters() {
+		return parameters != null ? parameters.clone() : null;
 	}
 
 	public Class<T> getKeyClass() {
 		return clazz;
-	}
-
-	public Object[] getParameters() {
-		return parameters;
 	}
 
 	@Override

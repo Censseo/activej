@@ -42,6 +42,7 @@ import org.jetbrains.annotations.Nullable;
 import java.net.InetAddress;
 import java.time.Duration;
 import java.util.*;
+import java.util.function.Predicate;
 
 import static io.activej.common.Checks.checkArgument;
 import static io.activej.common.Checks.checkState;
@@ -76,10 +77,16 @@ import static io.activej.common.Checks.checkState;
  */
 public final class RpcServer extends AbstractReactiveServer {
 	public static final MemSize DEFAULT_INITIAL_BUFFER_SIZE = ChannelSerializer.DEFAULT_INITIAL_BUFFER_SIZE;
+	public static final MemSize DEFAULT_MAX_MESSAGE_SIZE = MemSize.megabytes(100);
+	public static final int DEFAULT_MAX_IN_FLIGHT_REQUESTS = 100_000;
 
 	private MemSize initialBufferSize = DEFAULT_INITIAL_BUFFER_SIZE;
 	private @Nullable FrameFormat frameFormat;
 	private Duration autoFlushInterval = Duration.ZERO;
+	private int maxMessageSize = (int) DEFAULT_MAX_MESSAGE_SIZE.toLong();
+	private int maxInFlightRequests = DEFAULT_MAX_IN_FLIGHT_REQUESTS;
+	private Predicate<Object> requestAuthorizer = $ -> true;
+	private boolean detailedErrorMessages;
 
 	private final Map<Class<?>, RpcRequestHandler<?, ?>> handlers = new LinkedHashMap<>();
 
@@ -242,6 +249,54 @@ public final class RpcServer extends AbstractReactiveServer {
 		}
 
 		/**
+		 * Sets the maximum size of a single RPC message.
+		 * Messages declaring a larger size are rejected and the connection is closed.
+		 * <p>
+		 * Defaults to {@link #DEFAULT_MAX_MESSAGE_SIZE}.
+		 */
+		public Builder withMaxMessageSize(MemSize maxMessageSize) {
+			checkNotBuilt(this);
+			checkArgument(maxMessageSize.toLong() <= Integer.MAX_VALUE, "Max message size cannot exceed Integer.MAX_VALUE: " + maxMessageSize);
+			RpcServer.this.maxMessageSize = (int) maxMessageSize.toLong();
+			return this;
+		}
+
+		/**
+		 * Sets the maximum number of concurrently processed requests per connection.
+		 * Connections exceeding this limit are closed.
+		 * <p>
+		 * Defaults to {@link #DEFAULT_MAX_IN_FLIGHT_REQUESTS}.
+		 */
+		public Builder withMaxInFlightRequests(int maxInFlightRequests) {
+			checkNotBuilt(this);
+			RpcServer.this.maxInFlightRequests = maxInFlightRequests;
+			return this;
+		}
+
+		/**
+		 * Sets a predicate that authorizes each incoming request.
+		 * Requests for which the predicate returns {@code false} are rejected.
+		 * <p>
+		 * By default all requests are authorized.
+		 */
+		public Builder withRequestAuthorizer(Predicate<Object> requestAuthorizer) {
+			checkNotBuilt(this);
+			RpcServer.this.requestAuthorizer = requestAuthorizer;
+			return this;
+		}
+
+		/**
+		 * If enabled, exception class names and messages of failed request handlers
+		 * are sent to clients. When disabled (the default), clients receive
+		 * a generic error message while full details are logged on the server.
+		 */
+		public Builder withDetailedErrorMessages(boolean detailedErrorMessages) {
+			checkNotBuilt(this);
+			RpcServer.this.detailedErrorMessages = detailedErrorMessages;
+			return this;
+		}
+
+		/**
 		 * Adds a handler for a specified request-response pair.
 		 *
 		 * @param requestClass a class of one of request types
@@ -266,10 +321,22 @@ public final class RpcServer extends AbstractReactiveServer {
 		}
 	}
 
+	int getMaxInFlightRequests() {
+		return maxInFlightRequests;
+	}
+
+	Predicate<Object> getRequestAuthorizer() {
+		return requestAuthorizer;
+	}
+
+	boolean isDetailedErrorMessages() {
+		return detailedErrorMessages;
+	}
+
 	@Override
 	protected void serve(ITcpSocket socket, InetAddress remoteAddress) {
 		RpcStream stream = new RpcStream(socket, requestSerializer, responseSerializer, initialBufferSize,
-			autoFlushInterval, frameFormat, true); // , statsSerializer, statsDeserializer, statsCompressor, statsDecompressor);
+			autoFlushInterval, frameFormat, maxMessageSize, true); // , statsSerializer, statsDeserializer, statsCompressor, statsDecompressor);
 		RpcServerConnection connection = new RpcServerConnection(reactor, this, remoteAddress, handlers, stream);
 		stream.setListener(connection);
 		add(connection);

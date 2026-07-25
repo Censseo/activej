@@ -161,7 +161,7 @@ public final class BinarySerializers {
 			array[pos + 5] = (byte) (low >>> 16);
 			array[pos + 6] = (byte) (low >>> 8);
 			array[pos + 7] = (byte) low;
-			return 8;
+			return pos + 8;
 		}
 
 		@Override
@@ -222,6 +222,9 @@ public final class BinarySerializers {
 		@Override
 		public byte[] decode(BinaryInput in) {
 			int size = in.readVarInt();
+			if (size < 0 || size > in.array().length - in.pos()) {
+				throw new CorruptedDataException("Insufficient data: size " + size + ", remaining " + (in.array().length - in.pos()));
+			}
 			byte[] bytes = new byte[size];
 			in.read(bytes);
 			return bytes;
@@ -357,7 +360,11 @@ public final class BinarySerializers {
 
 			@Override
 			public E decode(BinaryInput in) throws CorruptedDataException {
-				return enumConstants[in.readVarInt()];
+				int ordinal = in.readVarInt();
+				if (ordinal < 0 || ordinal >= enumConstants.length) {
+					throw new CorruptedDataException("Invalid enum ordinal: " + ordinal);
+				}
+				return enumConstants[ordinal];
 			}
 		};
 	}

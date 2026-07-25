@@ -21,7 +21,9 @@ import org.jetbrains.annotations.Nullable;
 
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Map;
@@ -221,19 +223,31 @@ public final class DefiningClassLoader extends ClassLoader implements DefiningCl
 		synchronized (getClassLoadingLock(className)) {
 			if (bytecodeStorage != null) {
 				byte[] bytecode = bytecodeStorage.loadBytecode(className).orElse(null);
-				if (bytecode != null) {
+				if (bytecode != null && !usesStaticConstants(bytecode)) {
 					return (Class<T>) defineClass(className, bytecode);
 				}
 			}
 
 			try (GeneratedBytecode generatedBytecode = bytecodeBuilder.apply(this, className)) {
 				Class<T> generatedClass = (Class<T>) generatedBytecode.generateClass(this);
-				if (bytecodeStorage != null) {
+				if (bytecodeStorage != null && !generatedBytecode.usesStaticConstants()) {
 					bytecodeStorage.saveBytecode(className, generatedBytecode.getBytecode());
 				}
 				return generatedClass;
 			}
 		}
+	}
+
+	private static boolean usesStaticConstants(byte[] bytecode) {
+		byte[] marker = "getStaticConstant".getBytes(StandardCharsets.ISO_8859_1);
+		outer:
+		for (int i = 0; i <= bytecode.length - marker.length; i++) {
+			for (int j = 0; j < marker.length; j++) {
+				if (bytecode[i + j] != marker[j]) continue outer;
+			}
+			return true;
+		}
+		return false;
 	}
 
 	/**
@@ -283,12 +297,42 @@ public final class DefiningClassLoader extends ClassLoader implements DefiningCl
 
 	static <T> T createInstance(Class<T> aClass, Object[] arguments) {
 		try {
-			return aClass
-				.getConstructor(Arrays.stream(arguments).map(Object::getClass).toArray(Class<?>[]::new))
-				.newInstance(arguments);
+			return findMatchingConstructor(aClass, arguments).newInstance(arguments);
 		} catch (InstantiationException | IllegalAccessException | NoSuchMethodException | InvocationTargetException e) {
 			throw new RuntimeException(e);
 		}
+	}
+
+	@SuppressWarnings("unchecked")
+	private static <T> Constructor<T> findMatchingConstructor(Class<T> aClass, Object[] arguments) throws NoSuchMethodException {
+		Class<?>[] argumentTypes = Arrays.stream(arguments).map(Object::getClass).toArray(Class<?>[]::new);
+		for (Constructor<?> constructor : aClass.getConstructors()) {
+			Class<?>[] parameterTypes = constructor.getParameterTypes();
+			if (parameterTypes.length != argumentTypes.length) continue;
+			boolean matches = true;
+			for (int i = 0; i < parameterTypes.length; i++) {
+				if (!wrap(parameterTypes[i]).isAssignableFrom(argumentTypes[i])) {
+					matches = false;
+					break;
+				}
+			}
+			if (matches) return (Constructor<T>) constructor;
+		}
+		throw new NoSuchMethodException(
+			aClass.getName() + "(" + Arrays.stream(argumentTypes).map(Class::getName).collect(java.util.stream.Collectors.joining(", ")) + ")");
+	}
+
+	private static Class<?> wrap(Class<?> type) {
+		if (!type.isPrimitive()) return type;
+		if (type == boolean.class) return Boolean.class;
+		if (type == byte.class) return Byte.class;
+		if (type == short.class) return Short.class;
+		if (type == char.class) return Character.class;
+		if (type == int.class) return Integer.class;
+		if (type == long.class) return Long.class;
+		if (type == float.class) return Float.class;
+		if (type == double.class) return Double.class;
+		return Void.class;
 	}
 
 	/**

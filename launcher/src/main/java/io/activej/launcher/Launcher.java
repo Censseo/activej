@@ -199,16 +199,30 @@ public abstract class Launcher {
 		} catch (Throwable e) {
 			applicationError = e;
 			logger.error("JVM Fatal Error", e);
-			System.exit(-1);
+			onCompleteFuture.completeExceptionally(e);
+			onFatalError(e);
+			if (e instanceof Error error) throw error;
+			throw new RuntimeException("JVM Fatal Error", e);
 		} finally {
 			instantOfComplete = Instant.now();
 			completeLatch.countDown();
 		}
 	}
 
+	/**
+	 * Called when a fatal {@link Throwable} escapes the normal launch flow.
+	 * Defaults to {@code System.exit(-1)} since non-daemon threads (such as event loops)
+	 * may otherwise keep the JVM running in a broken state.
+	 * Override to change this behavior, e.g. in tests or embedded environments.
+	 *
+	 * @param throwable the fatal error
+	 */
+	protected void onFatalError(Throwable throwable) {
+		System.exit(-1);
+	}
+
 	@SuppressWarnings("unchecked")
-	private Set<Key<?>> postInjectInstances(Injector injector) {
-		Set<InstanceInjector<?>> postInjectors = injector.getInstanceOr(INSTANCE_INJECTORS_KEY, Set.of());
+	private Set<Key<?>> postInjectInstances(Injector injector) {		Set<InstanceInjector<?>> postInjectors = injector.getInstanceOr(INSTANCE_INJECTORS_KEY, Set.of());
 		for (InstanceInjector<?> instanceInjector : postInjectors) {
 			Object instance = injector.peekInstance(instanceInjector.key());
 			if (instance != null) {
@@ -376,7 +390,11 @@ public abstract class Launcher {
 		if (shutdownLatch.getCount() != 1) {
 			return;
 		}
-		Runtime.getRuntime().addShutdownHook(shutdownHook);
+		try {
+			Runtime.getRuntime().addShutdownHook(shutdownHook);
+		} catch (IllegalStateException | IllegalArgumentException e) {
+			return;
+		}
 		shutdownLatch.await();
 	}
 
@@ -386,7 +404,10 @@ public abstract class Launcher {
 	 * @see Launcher#awaitShutdown()
 	 */
 	public final void shutdown() {
-		Runtime.getRuntime().removeShutdownHook(shutdownHook);
+		try {
+			Runtime.getRuntime().removeShutdownHook(shutdownHook);
+		} catch (IllegalStateException | IllegalArgumentException ignored) {
+		}
 		shutdownLatch.countDown();
 	}
 

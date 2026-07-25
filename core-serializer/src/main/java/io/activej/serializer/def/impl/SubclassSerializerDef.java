@@ -54,6 +54,15 @@ public final class SubclassSerializerDef extends AbstractSerializerDef implement
 		this.nullable = nullable;
 	}
 
+	private void checkIndicesFitInByte() {
+		int count = subclassSerializers.size();
+		int first = nullable && startIndex == 0 ? 1 : startIndex;
+		int last = first + count - 1;
+		if (nullable && first <= 0 && last >= 0) last++;
+		checkArgument(count == 0 || first >= Byte.MIN_VALUE && last <= Byte.MAX_VALUE,
+			format("Subclass indices %s..%s do not fit in a byte; reduce the number of subclasses or adjust the start index", first, last));
+	}
+
 	public static Builder builder(Class<?> parentType) {
 		return new SubclassSerializerDef(parentType, new LinkedHashMap<>(), false, 0).new Builder();
 	}
@@ -81,6 +90,7 @@ public final class SubclassSerializerDef extends AbstractSerializerDef implement
 
 		@Override
 		protected SubclassSerializerDef doBuild() {
+			checkIndicesFitInByte();
 			return SubclassSerializerDef.this;
 		}
 	}
@@ -90,7 +100,9 @@ public final class SubclassSerializerDef extends AbstractSerializerDef implement
 		if (compatibilityLevel.getLevel() < LEVEL_3.getLevel()) {
 			return SerializerDefs.ofNullable(this);
 		}
-		return new SubclassSerializerDef(parentType, subclassSerializers, true, startIndex);
+		SubclassSerializerDef nullableDef = new SubclassSerializerDef(parentType, subclassSerializers, true, startIndex);
+		nullableDef.checkIndicesFitInByte();
+		return nullableDef;
 	}
 
 	@Override

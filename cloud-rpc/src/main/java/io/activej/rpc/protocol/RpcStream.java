@@ -80,6 +80,14 @@ public final class RpcStream {
 		BinarySerializer<RpcMessage> inputSerializer, BinarySerializer<RpcMessage> outputSerializer,
 		MemSize initialBufferSize, Duration autoFlushInterval, @Nullable FrameFormat frameFormat, boolean server
 	) {
+		this(socket, inputSerializer, outputSerializer, initialBufferSize, autoFlushInterval, frameFormat, 0, server);
+	}
+
+	public RpcStream(
+		ITcpSocket socket,
+		BinarySerializer<RpcMessage> inputSerializer, BinarySerializer<RpcMessage> outputSerializer,
+		MemSize initialBufferSize, Duration autoFlushInterval, @Nullable FrameFormat frameFormat, int maxMessageSize, boolean server
+	) {
 		this.server = server;
 		this.socket = socket;
 
@@ -88,7 +96,9 @@ public final class RpcStream {
 			.withAutoFlushInterval(autoFlushInterval)
 			.withSerializationErrorHandler((message, e) -> listener.onSerializationError(message, e))
 			.build();
-		ChannelDeserializer<RpcMessage> deserializer = ChannelDeserializer.create(inputSerializer);
+		ChannelDeserializer<RpcMessage> deserializer = ChannelDeserializer.builder(inputSerializer)
+			.withMaxMessageSize(maxMessageSize)
+			.build();
 
 		if (frameFormat != null) {
 			ChannelFrameDecoder decompressor = ChannelFrameDecoder.create(frameFormat);

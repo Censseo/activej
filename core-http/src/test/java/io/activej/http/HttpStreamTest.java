@@ -212,7 +212,6 @@ public final class HttpStreamTest {
 		String chunkedRequest = """
 			POST / HTTP/1.1\r
 			Host: localhost\r
-			Content-Length: 13\r
 			Transfer-Encoding: chunked\r
 			\r
 			3""";

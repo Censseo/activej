@@ -200,6 +200,7 @@ public final class BlockingFileSystem implements IBlockingFileSystem, BlockingSe
 			channel = FileChannel.open(path, appendOptions);
 		}
 		if (channel.size() < offset) {
+			channel.close();
 			throw new IOException("Offset exceeds file size");
 		}
 		channel.position(offset);
@@ -229,9 +230,22 @@ public final class BlockingFileSystem implements IBlockingFileSystem, BlockingSe
 			throw new IOException("Offset exceeds file size");
 		}
 		FileInputStream fileInputStream = new FileInputStream(path.toFile());
-
-		//noinspection ResultOfMethodCallIgnored
-		fileInputStream.skip(offset);
+		try {
+			long skipped = 0;
+			while (skipped < offset) {
+				long n = fileInputStream.skip(offset - skipped);
+				if (n <= 0) {
+					if (fileInputStream.read() == -1) {
+						throw new IOException("Offset exceeds file size");
+					}
+					n = 1;
+				}
+				skipped += n;
+			}
+		} catch (IOException e) {
+			fileInputStream.close();
+			throw e;
+		}
 		return new LimitedInputStream(fileInputStream, limit);
 	}
 

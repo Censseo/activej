@@ -58,17 +58,21 @@ public final class GzipProcessorUtils {
 		processHeader(src);
 		ByteBuf dst = ByteBufPool.allocate(expectedSize);
 		Inflater decompressor = ensureDecompressor();
-		decompressor.setInput(src.array(), src.head(), src.readRemaining());
 		try {
-			readDecompressedData(decompressor, src, dst, maxMessageSize);
-		} catch (DataFormatException ignored) {
-			src.recycle();
-			dst.recycle();
-			throw new MalformedHttpException("Data format exception");
+			decompressor.setInput(src.array(), src.head(), src.readRemaining());
+			try {
+				readDecompressedData(decompressor, src, dst, maxMessageSize);
+			} catch (DataFormatException ignored) {
+				src.recycle();
+				dst.recycle();
+				throw new MalformedHttpException("Data format exception");
+			}
+			check(expectedSize == dst.readRemaining(), src, dst, () ->
+				new MalformedHttpException("Decompressed data size is not equal to input size from GZIP trailer"));
+			check(src.readRemaining() == GZIP_FOOTER_SIZE, src, dst, () -> new MalformedHttpException("Compressed data was not read fully"));
+		} finally {
+			decompressor.end();
 		}
-		check(expectedSize == dst.readRemaining(), src, dst, () ->
-			new MalformedHttpException("Decompressed data size is not equal to input size from GZIP trailer"));
-		check(src.readRemaining() == GZIP_FOOTER_SIZE, src, dst, () -> new MalformedHttpException("Compressed data was not read fully"));
 
 		src.recycle();
 		return dst;
@@ -78,16 +82,21 @@ public final class GzipProcessorUtils {
 		if (CHECKS) checkArgument(src.readRemaining() >= 0);
 
 		Deflater compressor = ensureCompressor();
-		compressor.setInput(src.array(), src.head(), src.readRemaining());
-		compressor.finish();
-		int dataSize = src.readRemaining();
-		int crc = getCrc(src, dataSize);
-		int maxDataSize = estimateMaxCompressedSize(dataSize);
-		ByteBuf dst = ByteBufPool.allocate(GZIP_HEADER_SIZE + maxDataSize + GZIP_FOOTER_SIZE + SPARE_BYTES_COUNT);
-		dst.put(GZIP_HEADER);
-		dst = writeCompressedData(compressor, src, dst);
-		dst.writeInt(Integer.reverseBytes(crc));
-		dst.writeInt(Integer.reverseBytes(dataSize));
+		ByteBuf dst;
+		try {
+			compressor.setInput(src.array(), src.head(), src.readRemaining());
+			compressor.finish();
+			int dataSize = src.readRemaining();
+			int crc = getCrc(src, dataSize);
+			int maxDataSize = estimateMaxCompressedSize(dataSize);
+			dst = ByteBufPool.allocate(GZIP_HEADER_SIZE + maxDataSize + GZIP_FOOTER_SIZE + SPARE_BYTES_COUNT);
+			dst.put(GZIP_HEADER);
+			dst = writeCompressedData(compressor, src, dst);
+			dst.writeInt(Integer.reverseBytes(crc));
+			dst.writeInt(Integer.reverseBytes(dataSize));
+		} finally {
+			compressor.end();
+		}
 
 		src.recycle();
 		return dst;
@@ -170,10 +179,9 @@ public final class GzipProcessorUtils {
 
 	private static void skipExtra(ByteBuf buf) throws MalformedHttpException {
 		check(buf.readRemaining() >= 2, buf, () -> new MalformedHttpException("Corrupted GZIP header"));
-		short subFieldDataSize = buf.readShort();
-		short reversedSubFieldDataSize = Short.reverseBytes(subFieldDataSize);
-		check(buf.readRemaining() >= reversedSubFieldDataSize, buf, () -> new MalformedHttpException("Corrupted GZIP header"));
-		buf.moveHead(reversedSubFieldDataSize);
+		int subFieldDataSize = Short.reverseBytes(buf.readShort()) & 0xFFFF;
+		check(buf.readRemaining() >= subFieldDataSize, buf, () -> new MalformedHttpException("Corrupted GZIP header"));
+		buf.moveHead(subFieldDataSize);
 	}
 
 	private static void skipToTerminatorByte(ByteBuf buf) throws MalformedHttpException {

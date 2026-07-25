@@ -51,8 +51,20 @@ public abstract class AbstractPromise<T> implements Promise<T> {
 
 	// instanceof NextPromise<? super T, ?>
 	// instanceof Callback<? super T>
-	// instanceof Object[]
+	// instanceof CallbackArray
 	protected @Nullable Object next;
+
+	protected static final class CallbackArray {
+		Object[] callbacks = new Object[2];
+		int size;
+
+		void add(Object callback) {
+			if (size == callbacks.length) {
+				callbacks = Arrays.copyOf(callbacks, callbacks.length * 2);
+			}
+			callbacks[size++] = callback;
+		}
+	}
 
 	public void reset() {
 		this.result = (T) PROMISE_NOT_SET;
@@ -114,9 +126,10 @@ public abstract class AbstractPromise<T> implements Promise<T> {
 			cb.acceptNext(value, null);
 		} else if (next instanceof Callback cb) {
 			cb.accept(value, null);
-		} else if (next instanceof Object[] list) {
-			for (int i = 0; i < list.length; i++) {
-				Object it = list[i];
+		} else if (next instanceof CallbackArray list) {
+			Object[] callbacks = list.callbacks;
+			for (int i = 0; i < list.size; i++) {
+				Object it = callbacks[i];
 				if (it instanceof NextPromise cb) {
 					cb.acceptNext(value, null);
 				} else {
@@ -139,9 +152,10 @@ public abstract class AbstractPromise<T> implements Promise<T> {
 			cb.acceptNext(null, exception);
 		} else if (next instanceof Callback cb) {
 			cb.accept(null, exception);
-		} else if (next instanceof Object[] list) {
-			for (int i = 0; i < list.length; i++) {
-				Object it = list[i];
+		} else if (next instanceof CallbackArray list) {
+			Object[] callbacks = list.callbacks;
+			for (int i = 0; i < list.size; i++) {
+				Object it = callbacks[i];
 				if (it instanceof NextPromise cb) {
 					cb.acceptNext(null, exception);
 				} else {
@@ -1259,14 +1273,12 @@ public abstract class AbstractPromise<T> implements Promise<T> {
 
 		if (next == null) {
 			next = callback;
-		} else if (next instanceof Object[] array) {
-			array = Arrays.copyOf(array, array.length + 1);
-			array[array.length - 1] = callback;
-			next = array;
+		} else if (next instanceof CallbackArray array) {
+			array.add(callback);
 		} else {
-			Object[] array = new Object[2];
-			array[0] = next;
-			array[1] = callback;
+			CallbackArray array = new CallbackArray();
+			array.add(next);
+			array.add(callback);
 			next = array;
 		}
 	}
@@ -1284,14 +1296,12 @@ public abstract class AbstractPromise<T> implements Promise<T> {
 		}
 		if (next == null) {
 			next = cb;
-		} else if (next instanceof Object[] array) {
-			array = Arrays.copyOf(array, array.length + 1);
-			array[array.length - 1] = cb;
-			next = array;
+		} else if (next instanceof CallbackArray array) {
+			array.add(cb);
 		} else {
-			Object[] array = new Object[2];
-			array[0] = next;
-			array[1] = cb;
+			CallbackArray array = new CallbackArray();
+			array.add(next);
+			array.add(cb);
 			next = array;
 		}
 		return this;
@@ -1335,10 +1345,9 @@ public abstract class AbstractPromise<T> implements Promise<T> {
 		if (callback == null) {
 			return;
 		}
-		if (callback instanceof Object[] nextCallbacks) {
-			for (Object nextCallback : nextCallbacks) {
-				appendChildren(sb, nextCallback, indent);
-				if (nextCallback == null) break;
+		if (callback instanceof CallbackArray nextCallbacks) {
+			for (int i = 0; i < nextCallbacks.size; i++) {
+				appendChildren(sb, nextCallbacks.callbacks[i], indent);
 			}
 		} else {
 			indent += "\t";

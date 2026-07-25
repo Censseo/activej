@@ -27,6 +27,7 @@ import io.activej.promise.Promise;
 import io.activej.reactor.AbstractReactive;
 import io.activej.reactor.Reactor;
 import io.activej.rpc.protocol.RpcControlMessage;
+import io.activej.rpc.protocol.RpcException;
 import io.activej.rpc.protocol.RpcMessage;
 import io.activej.rpc.protocol.RpcRemoteException;
 import io.activej.rpc.protocol.RpcStream;
@@ -73,6 +74,9 @@ public final class RpcServerConnection extends AbstractReactive implements RpcSt
 
 	@SuppressWarnings("unchecked")
 	private Promise<Object> serve(Object request) {
+		if (!rpcServer.getRequestAuthorizer().test(request)) {
+			return Promise.ofException(new RpcException("Request is not authorized"));
+		}
 		RpcRequestHandler<Object, Object> requestHandler = (RpcRequestHandler<Object, Object>) handlers.get(request.getClass());
 		if (requestHandler == null) {
 			return Promise.ofException(new MalformedDataException("Failed to process request " + request));
@@ -82,6 +86,12 @@ public final class RpcServerConnection extends AbstractReactive implements RpcSt
 
 	@Override
 	public void accept(RpcMessage message) {
+		if (activeRequests >= rpcServer.getMaxInFlightRequests()) {
+			logger.warn("Too many in-flight requests from {}, closing connection", remoteAddress);
+			doClose();
+			stream.closeEx(new RpcException("Too many in-flight requests"));
+			return;
+		}
 		activeRequests++;
 
 		int index = message.getIndex();
@@ -102,7 +112,9 @@ public final class RpcServerConnection extends AbstractReactive implements RpcSt
 					rpcServer.getSuccessfulRequests().recordEvent();
 				} else {
 					logger.warn("Exception while processing request ID {}", index, e);
-					Object data = new RpcRemoteException(e);
+					Object data = rpcServer.isDetailedErrorMessages() ?
+						new RpcRemoteException(e) :
+						new RpcRemoteException("Request processing failed on server");
 					RpcMessage errorMessage = new RpcMessage(index, data);
 					sendError(errorMessage, messageData, e);
 				}

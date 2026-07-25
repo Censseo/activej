@@ -77,7 +77,7 @@ public final class Injector implements ResourceLocator {
 
 	final AtomicReferenceArray[] scopeCaches;
 
-	private static Supplier<UnaryOperator<CompiledBinding<?>>> bytecodePostprocessorFactory = UnaryOperator::identity;
+	private static volatile Supplier<UnaryOperator<CompiledBinding<?>>> bytecodePostprocessorFactory = UnaryOperator::identity;
 
 	/**
 	 * Enables specialization of compiled bindings. <b>Depends on {@code ActiveJ-Specializer} module</b>
@@ -526,7 +526,11 @@ public final class Injector implements ResourceLocator {
 	 * Creates an injector that operates on a binding graph at a given prefix (scope) of the binding graph trie and this injector as its parent.
 	 */
 	public Injector enterScope(Scope scope) {
-		return new Injector(this, scopeDataTree.get(scope));
+		Trie<Scope, ScopeLocalData> subtrie = scopeDataTree.get(scope);
+		if (subtrie == null) {
+			throw new DIException("No bindings found for scope " + scope.getDisplayString());
+		}
+		return new Injector(this, subtrie);
 	}
 
 	public @Nullable Injector getParent() {

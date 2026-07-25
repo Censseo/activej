@@ -16,6 +16,7 @@ import static io.activej.common.collection.CollectionUtils.first;
  */
 @SuppressWarnings("unchecked")
 public class Recyclers {
+	private static final System.Logger LOGGER = System.getLogger(Recyclers.class.getName());
 	private static final Recycler<?> NO_RECYCLER = item -> {};
 
 	private static final Map<Class<?>, Recycler<?>> REGISTRY = new HashMap<>();
@@ -129,7 +130,8 @@ public class Recyclers {
 	private static void recycleCloseable(AutoCloseable closeable) {
 		try {
 			closeable.close();
-		} catch (Exception ignored) {
+		} catch (Exception e) {
+			LOGGER.log(System.Logger.Level.WARNING, "Failed to close a resource during recycling", e);
 		}
 	}
 

@@ -19,6 +19,7 @@ package io.activej.eventloop;
 import io.activej.async.callback.AsyncComputation;
 import io.activej.async.callback.Callback;
 import io.activej.async.exception.AsyncTimeoutException;
+import io.activej.common.ApplicationSettings;
 import io.activej.common.Checks;
 import io.activej.common.builder.AbstractBuilder;
 import io.activej.common.exception.FatalErrorHandler;
@@ -92,6 +93,19 @@ public final class Eventloop implements NioReactor, NioReactive, Runnable, React
 	public static final Duration DEFAULT_IDLE_INTERVAL = Duration.ofSeconds(1);
 
 	/**
+	 * Maximal number of connections accepted per single select tick.
+	 * Pending accepts are picked up on the next tick since the selector is level-triggered.
+	 */
+	public static final int MAX_ACCEPTS_PER_TICK = ApplicationSettings.getInt(Eventloop.class, "maxAcceptsPerTick", 1024);
+
+	/**
+	 * Maximal number of local tasks posted during a single {@link #executeLocalTasks()} drain
+	 * that are still executed within that drain. Bounds pathological self-reposting
+	 * task storms while leaving normal task cascades unaffected.
+	 */
+	public static final int LOCAL_TASKS_POST_BUDGET = ApplicationSettings.getInt(Eventloop.class, "localTasksPostBudget", 10_000);
+
+	/**
 	 * Collection of local tasks which were added from this thread.
 	 */
 	private final ArrayDeque<Runnable> localTasks = new ArrayDeque<>();
@@ -137,7 +151,7 @@ public final class Eventloop implements NioReactor, NioReactive, Runnable, React
 	 * The NIO selector which selects a set of keys whose
 	 * corresponding channels are ready for I/O operations.
 	 */
-	private @Nullable Selector selector;
+	private volatile @Nullable Selector selector;
 
 	private @Nullable SelectorProvider selectorProvider;
 
@@ -588,7 +602,8 @@ public final class Eventloop implements NioReactor, NioReactive, Runnable, React
 
 		Stopwatch sw = monitoring ? Stopwatch.createUnstarted() : null;
 
-		while (true) {
+		int tasksToExecute = this.localTasks.size() + LOCAL_TASKS_POST_BUDGET;
+		for (int i = 0; i < tasksToExecute; i++) {
 			Runnable runnable = this.localTasks.poll();
 			if (runnable == null) {
 				break;
@@ -725,7 +740,7 @@ public final class Eventloop implements NioReactor, NioReactive, Runnable, React
 
 		//noinspection unchecked
 		Consumer<SocketChannel> acceptCallback = (Consumer<SocketChannel>) key.attachment();
-		for (; ; ) {
+		for (int accepts = 0; accepts < MAX_ACCEPTS_PER_TICK; accepts++) {
 			SocketChannel channel;
 			try {
 				channel = serverSocketChannel.accept();

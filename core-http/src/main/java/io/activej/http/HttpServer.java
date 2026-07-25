@@ -46,11 +46,11 @@ import static java.nio.charset.StandardCharsets.ISO_8859_1;
  */
 @SuppressWarnings({"UnusedReturnValue", "WeakerAccess", "unused"})
 public final class HttpServer extends AbstractReactiveServer {
-	public static final Duration READ_WRITE_TIMEOUT = ApplicationSettings.getDuration(HttpServer.class, "readWriteTimeout", Duration.ZERO);
+	public static final Duration READ_WRITE_TIMEOUT = ApplicationSettings.getDuration(HttpServer.class, "readWriteTimeout", Duration.ofSeconds(60));
 	public static final Duration READ_WRITE_TIMEOUT_SHUTDOWN = ApplicationSettings.getDuration(HttpServer.class, "readWriteTimeout_Shutdown", Duration.ofSeconds(3));
 	public static final Duration SERVE_TIMEOUT_SHUTDOWN = ApplicationSettings.getDuration(HttpServer.class, "serveTimeout_Shutdown", Duration.ofSeconds(0));
 	public static final Duration KEEP_ALIVE_TIMEOUT = ApplicationSettings.getDuration(HttpServer.class, "keepAliveTimeout", Duration.ofSeconds(30));
-	public static final MemSize MAX_BODY_SIZE = ApplicationSettings.getMemSize(HttpServer.class, "maxBodySize", MemSize.ZERO);
+	public static final MemSize MAX_BODY_SIZE = ApplicationSettings.getMemSize(HttpServer.class, "maxBodySize", MemSize.megabytes(100));
 	public static final MemSize MAX_WEB_SOCKET_MESSAGE_SIZE = ApplicationSettings.getMemSize(HttpServer.class, "maxWebSocketMessageSize", MemSize.megabytes(1));
 	public static final int MAX_KEEP_ALIVE_REQUESTS = ApplicationSettings.getInt(HttpServer.class, "maxKeepAliveRequests", 0);
 

@@ -51,7 +51,7 @@ import static io.activej.common.Checks.checkState;
 public final class ApplicationSettings {
 	private static final Map<Class<?>, Map<String, Object>> customSettings = new HashMap<>();
 
-	private static Properties properties = System.getProperties();
+	private static volatile Properties properties = System.getProperties();
 	private static volatile boolean firstLookupDone = false;
 
 	/**
@@ -79,7 +79,9 @@ public final class ApplicationSettings {
 	 */
 	public static void set(Class<?> type, String name, Object value) {
 		ensureNotLookedUp();
-		customSettings.computeIfAbsent(type, $ -> new HashMap<>()).put(name, value);
+		synchronized (customSettings) {
+			customSettings.computeIfAbsent(type, $ -> new HashMap<>()).put(name, value);
+		}
 	}
 
 	/**
@@ -98,8 +100,11 @@ public final class ApplicationSettings {
 		checkState(!type.isAnonymousClass(), "Anonymous classes cannot be used for application settings");
 
 		firstLookupDone = true;
-		//noinspection unchecked
-		T customSetting = (T) customSettings.getOrDefault(type, Map.of()).get(name);
+		T customSetting;
+		synchronized (customSettings) {
+			//noinspection unchecked
+			customSetting = (T) customSettings.getOrDefault(type, Map.of()).get(name);
+		}
 		if (customSetting != null) {
 			return customSetting;
 		}

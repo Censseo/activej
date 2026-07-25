@@ -20,6 +20,7 @@ public class Types {
 	public static final Type[] NO_TYPES = new Type[0];
 	public static final WildcardType WILDCARD_TYPE_ANY = new WildcardTypeImpl(new Type[]{Object.class}, new Type[0]);
 	private static final Map<Type, Map<TypeVariable<?>, Type>> typeBindingsCache = new ConcurrentHashMap<>();
+	private static final int MAX_TYPE_BINDINGS_CACHE_SIZE = 10_000;
 
 	/**
 	 * Returns a raw {@link Class} for a given {@link Type}.
@@ -103,12 +104,15 @@ public class Types {
 	 * Includes type bindings from a whole class hierarchy
 	 */
 	public static Map<TypeVariable<?>, Type> getAllTypeBindings(Type type) {
-		return typeBindingsCache.computeIfAbsent(type,
-			t -> {
-				Map<TypeVariable<?>, Type> mapping = new HashMap<>();
-				getAllTypeBindingsImpl(t, mapping);
-				return mapping;
-			});
+		Map<TypeVariable<?>, Type> bindings = typeBindingsCache.get(type);
+		if (bindings != null) return bindings;
+		Map<TypeVariable<?>, Type> mapping = new HashMap<>();
+		getAllTypeBindingsImpl(type, mapping);
+		if (typeBindingsCache.size() >= MAX_TYPE_BINDINGS_CACHE_SIZE) {
+			typeBindingsCache.clear();
+		}
+		typeBindingsCache.putIfAbsent(type, mapping);
+		return mapping;
 	}
 
 	private static void getAllTypeBindingsImpl(Type type, Map<TypeVariable<?>, Type> mapping) {

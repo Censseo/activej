@@ -125,16 +125,17 @@ public final class ArraySerializerDef extends AbstractSerializerDef implements S
 		if (decodeType.getComponentType() == Byte.TYPE) {
 			return let(readVarInt(in),
 				len -> !nullable ?
-					let(arrayNew0(len),
+					checkLength(in, len, let(arrayNew0(len),
 						array -> sequence(
 							readBytes(in, array),
-							array)) :
+							array))) :
 					ifEq(len, value(0),
 						nullRef(decodeType),
-						let(arrayNew0(dec(len)),
-							array -> sequence(
-								readBytes(in, array, value(0), dec(len)),
-								array))));
+						let(dec(len),
+							len0 -> checkLength(in, len0, let(arrayNew0(len0),
+								array -> sequence(
+									readBytes(in, array, value(0), len0),
+									array))))));
 		}
 
 		return let(readVarInt(in),
@@ -148,12 +149,12 @@ public final class ArraySerializerDef extends AbstractSerializerDef implements S
 
 	private Expression doDecode(StaticDecoders staticDecoders, Expression in, int version, CompatibilityLevel compatibilityLevel, Expression size) {
 		Decoder decoder = valueSerializer.defineDecoder(staticDecoders, version, compatibilityLevel);
-		return let(arrayNew0(size),
+		return checkLength(in, size, let(arrayNew0(size),
 			array -> sequence(
 				iterate(value(0), size,
 					i -> arraySet(array, i,
 						cast(decoder.decode(in), decodeType.getComponentType()))),
-				array));
+				array)));
 	}
 
 	private Expression arrayNew0(Expression len) {
