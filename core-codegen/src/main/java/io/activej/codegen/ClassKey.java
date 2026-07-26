@@ -37,8 +37,12 @@ public final class ClassKey<T> {
 		return new ClassKey<>((Class) clazz, parameters != null ? parameters.clone() : null);
 	}
 
+	/**
+	 * Returns the parameters of this key. The returned array is shared -
+	 * it must not be mutated, as it participates in {@link #equals(Object)} and {@link #hashCode()}.
+	 */
 	public Object[] getParameters() {
-		return parameters != null ? parameters.clone() : null;
+		return parameters;
 	}
 
 	public Class<T> getKeyClass() {

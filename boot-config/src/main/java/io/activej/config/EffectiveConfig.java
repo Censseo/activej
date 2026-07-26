@@ -179,7 +179,7 @@ public final class EffectiveConfig implements Config {
 	}
 
 	private static final Pattern SENSITIVE_KEY =
-		Pattern.compile("(?i).*(password|secret|token|credential|api[-_.]?key|private[-_.]?key).*");
+		Pattern.compile("(?i).*(password|secret|credential|api[-_.]?key|private[-_.]?key|token(?!izer)).*");
 
 	static String redact(String key, String value) {
 		return SENSITIVE_KEY.matcher(key).matches() ? "******" : value;

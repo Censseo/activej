@@ -565,7 +565,13 @@ public interface Config {
 			throw new IllegalArgumentException("Duplicate values while combining configs");
 		}
 		Map<String, Config> children = new LinkedHashMap<>(getChildren());
-		other.getChildren().forEach((key, otherChild) -> children.merge(key, otherChild, Config::combineWith));
+		other.getChildren().forEach((key, otherChild) -> children.merge(key, otherChild, (thisChild, thatChild) -> {
+			try {
+				return thisChild.combineWith(thatChild);
+			} catch (IllegalArgumentException e) {
+				throw new IllegalArgumentException("Duplicate values while combining configs at key '" + key + "'", e);
+			}
+		}));
 		return Config.EMPTY
 			.overrideWith(thisValue != null ? Config.ofValue(thisValue) : Config.EMPTY)
 			.overrideWith(otherValue != null ? Config.ofValue(otherValue) : Config.EMPTY)

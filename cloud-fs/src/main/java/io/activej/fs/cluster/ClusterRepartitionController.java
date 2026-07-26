@@ -177,7 +177,7 @@ public final class ClusterRepartitionController extends AbstractReactive
 			.then(() -> Promises.repeat(
 				() -> recalculatePlanIfNeeded()
 					.then(() -> {
-						if (!repartitionPlan.hasNext()) return Promise.of(false);
+						if (stopRequested || !repartitionPlan.hasNext()) return Promise.of(false);
 						String name = repartitionPlan.next();
 						return fileSystem.info(name)
 							.then(meta -> {
@@ -315,8 +315,8 @@ public final class ClusterRepartitionController extends AbstractReactive
 					.min()
 					.getAsLong();
 
-			ChannelByteSplitter splitter = ChannelByteSplitter.create(1)
-				.withInput(ChannelSuppliers.ofPromise(fileSystem.download(name, offset, meta.getSize() - offset)));
+				ChannelByteSplitter splitter = ChannelByteSplitter.create(1)
+					.withInput(ChannelSuppliers.ofPromise(fileSystem.download(name, offset, meta.getSize() - offset)));
 
 				RefInt idx = new RefInt(0);
 				return Promises.toList(infoResults.remoteMetadata.stream() // upload file to target partitions

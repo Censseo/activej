@@ -48,6 +48,7 @@ public final class RpcServerConnection extends AbstractReactive implements RpcSt
 	private final Map<Class<?>, RpcRequestHandler<?, ?>> handlers;
 
 	private int activeRequests = 1;
+	private boolean closed = false;
 
 	// jmx
 	private final InetAddress remoteAddress;
@@ -86,6 +87,7 @@ public final class RpcServerConnection extends AbstractReactive implements RpcSt
 
 	@Override
 	public void accept(RpcMessage message) {
+		if (closed) return;
 		if (activeRequests >= rpcServer.getMaxInFlightRequests()) {
 			logger.warn("Too many in-flight requests from {}, closing connection", remoteAddress);
 			doClose();
@@ -118,7 +120,7 @@ public final class RpcServerConnection extends AbstractReactive implements RpcSt
 					RpcMessage errorMessage = new RpcMessage(index, data);
 					sendError(errorMessage, messageData, e);
 				}
-				if (--activeRequests == 0) {
+				if (--activeRequests == 0 && !closed) {
 					doClose();
 					stream.sendEndOfStream();
 				}
@@ -128,7 +130,7 @@ public final class RpcServerConnection extends AbstractReactive implements RpcSt
 	@Override
 	public void onReceiverEndOfStream() {
 		activeRequests--;
-		if (activeRequests == 0) {
+		if (activeRequests == 0 && !closed) {
 			doClose();
 			stream.sendEndOfStream();
 		}
@@ -178,6 +180,8 @@ public final class RpcServerConnection extends AbstractReactive implements RpcSt
 	}
 
 	private void doClose() {
+		if (closed) return;
+		closed = true;
 		rpcServer.remove(this);
 		downstreamDataAcceptor = $ -> {};
 	}

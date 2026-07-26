@@ -163,7 +163,7 @@ public final class Specializer {
 			return specializedInstance;
 		}
 
-		public Class<?> ensureClass() {
+		public synchronized Class<?> ensureClass() {
 			if (specializedClass != null) return specializedClass;
 			try {
 				byte[] bytecode = defineNewClass();
@@ -841,10 +841,12 @@ public final class Specializer {
 		if (predicate != null && !predicate.test(instance.getClass())) return instance;
 		ensureAccessibility(instance.getClass());
 		Specialization specialization = ensureSpecialization(instance);
+		List<Specialization> pending;
 		synchronized (specializations) {
-			for (Specialization s : specializations.values()) {
-				s.ensureClass();
-			}
+			pending = new ArrayList<>(specializations.values());
+		}
+		for (Specialization s : pending) {
+			s.ensureClass();
 		}
 		//noinspection unchecked
 		return (T) specialization.ensureInstance();

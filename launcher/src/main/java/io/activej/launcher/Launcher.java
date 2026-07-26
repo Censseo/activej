@@ -222,7 +222,8 @@ public abstract class Launcher {
 	}
 
 	@SuppressWarnings("unchecked")
-	private Set<Key<?>> postInjectInstances(Injector injector) {		Set<InstanceInjector<?>> postInjectors = injector.getInstanceOr(INSTANCE_INJECTORS_KEY, Set.of());
+	private Set<Key<?>> postInjectInstances(Injector injector) {
+		Set<InstanceInjector<?>> postInjectors = injector.getInstanceOr(INSTANCE_INJECTORS_KEY, Set.of());
 		for (InstanceInjector<?> instanceInjector : postInjectors) {
 			Object instance = injector.peekInstance(instanceInjector.key());
 			if (instance != null) {
@@ -392,7 +393,10 @@ public abstract class Launcher {
 		}
 		try {
 			Runtime.getRuntime().addShutdownHook(shutdownHook);
-		} catch (IllegalStateException | IllegalArgumentException e) {
+		} catch (IllegalArgumentException ignored) {
+			// hook is already registered, e.g. by a concurrent awaitShutdown() call
+		} catch (IllegalStateException e) {
+			// JVM is already shutting down
 			return;
 		}
 		shutdownLatch.await();

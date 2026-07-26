@@ -94,9 +94,22 @@ public final class ByteBufPool {
 	/**
 	 * Maximal number of ByteBufs retained per slab. Recycled ByteBufs beyond
 	 * this limit are not returned to the pool and are left for garbage collection.
-	 * A value of {@code 0} means no limit. Defaults to 1024.
+	 * A value of {@code 0} means no limit. When unset, the limit is derived
+	 * per slab from {@code maxRetainedBytesPerSlab} instead (see below).
 	 */
-	static final int MAX_ITEMS_PER_SLAB = ApplicationSettings.getInt(ByteBufPool.class, "maxItemsPerSlab", 1024);
+	static final int MAX_ITEMS_PER_SLAB = ApplicationSettings.getInt(ByteBufPool.class, "maxItemsPerSlab", -1);
+
+	/**
+	 * Byte budget used to derive the maximal number of retained ByteBufs of each slab
+	 * when {@code maxItemsPerSlab} is not set explicitly: a slab of size {@code 1 << i}
+	 * retains at most {@code maxRetainedBytesPerSlab / (1 << i)} items, bounded by
+	 * {@value #MIN_ITEMS_PER_SLAB} and {@value #MAX_DERIVED_ITEMS_PER_SLAB}.
+	 * Defaults to 32 MB per slab.
+	 */
+	static final long MAX_RETAINED_BYTES_PER_SLAB = ApplicationSettings.getMemSize(ByteBufPool.class, "maxRetainedBytesPerSlab", MemSize.megabytes(32)).toLong();
+	static final int MIN_ITEMS_PER_SLAB = 16;
+	static final int MAX_DERIVED_ITEMS_PER_SLAB = 1 << 20;
+	static final int[] SLAB_LIMITS = new int[NUMBER_OF_SLABS];
 	private static final double SMOOTHING_COEFF = 1.0 - Math.pow(0.5, (double) WATCHDOG_INTERVAL.toMillis() / WATCHDOG_SMOOTHING_WINDOW.toMillis());
 
 	/**
@@ -179,6 +192,9 @@ public final class ByteBufPool {
 			slabs[i] = new ObjectPool<>();
 			created[i] = new AtomicInteger();
 			reused[i] = new AtomicInteger();
+			SLAB_LIMITS[i] = MAX_ITEMS_PER_SLAB >= 0 ?
+				MAX_ITEMS_PER_SLAB :
+				(int) Math.min(MAX_DERIVED_ITEMS_PER_SLAB, Math.max(MIN_ITEMS_PER_SLAB, MAX_RETAINED_BYTES_PER_SLAB >> i));
 		}
 		if (USE_WATCHDOG) {
 			for (int i = 0; i < NUMBER_OF_SLABS; i++) {
@@ -323,7 +339,8 @@ public final class ByteBufPool {
 			recycleRegistry.put(buf, buildRegistryEntry(buf));
 			allocateRegistry.remove(buf);
 		}
-		if (MAX_ITEMS_PER_SLAB > 0 && pool.size() >= MAX_ITEMS_PER_SLAB) {
+		int slabLimit = SLAB_LIMITS[slab];
+		if (slabLimit > 0 && pool.size() >= slabLimit) {
 			if (REGISTRY) recycleRegistry.remove(buf);
 			if (STATS) created[slab].decrementAndGet();
 			return;

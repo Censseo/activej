@@ -858,27 +858,32 @@ public class ByteBuf implements Recyclable {
 	public int readVarInt() {
 		if (CHECK_RECYCLE && isRecycled()) throw ByteBufPool.onByteBufRecycled(this);
 		int result;
-		byte b = readByte();
+		byte b = readVarNumberByte();
 		if (b >= 0) {
 			return b;
 		}
 		result = b & 0x7f;
-		if ((b = readByte()) >= 0) {
+		if ((b = readVarNumberByte()) >= 0) {
 			return result | b << 7;
 		}
 		result |= (b & 0x7f) << 7;
-		if ((b = readByte()) >= 0) {
+		if ((b = readVarNumberByte()) >= 0) {
 			return result | b << 14;
 		}
 		result |= (b & 0x7f) << 14;
-		if ((b = readByte()) >= 0) {
+		if ((b = readVarNumberByte()) >= 0) {
 			return result | b << 21;
 		}
 		result |= (b & 0x7f) << 21;
-		if ((b = readByte()) >= 0) {
+		if ((b = readVarNumberByte()) >= 0) {
 			return result | b << 28;
 		}
 		throw new IllegalStateException("Read varint was too long");
+	}
+
+	private byte readVarNumberByte() {
+		checkReadRemaining(1);
+		return array[head++];
 	}
 
 	public long readLong() {
@@ -916,7 +921,7 @@ public class ByteBuf implements Recyclable {
 		if (CHECK_RECYCLE && isRecycled()) throw ByteBufPool.onByteBufRecycled(this);
 		long result = 0;
 		for (int offset = 0; offset < 64; offset += 7) {
-			byte b = readByte();
+			byte b = readVarNumberByte();
 			result |= (long) (b & 0x7F) << offset;
 			if ((b & 0x80) == 0)
 				return result;

@@ -701,6 +701,57 @@ public final class HttpServerTest {
 	}
 
 	@Test
+	public void testMalformedTransferEncoding() throws IOException, ExecutionException, InterruptedException {
+		JmxInspector inspector = new JmxInspector();
+		HttpServer server = HttpServer.builder(eventloop, $ -> {
+				throw new IllegalArgumentException("Should not be called");
+			})
+			.withListenPort(port)
+			.withInspector(inspector)
+			.build();
+		server.listen();
+		Thread thread = new Thread(eventloop);
+		thread.start();
+
+		// final transfer coding is not 'chunked'
+		String nonChunkedFinalCodingRequest = """
+			POST / HTTP/1.1\r
+			Host: localhost\r
+			Connection: keep-alive\r
+			Transfer-Encoding: chunked, gzip\r
+			\r
+			""";
+		doTestMalformedRequest(nonChunkedFinalCodingRequest);
+
+		// multiple Transfer-Encoding headers
+		String multipleTransferEncodingRequest = """
+			POST / HTTP/1.1\r
+			Host: localhost\r
+			Connection: keep-alive\r
+			Transfer-Encoding: chunked\r
+			Transfer-Encoding: gzip\r
+			\r
+			""";
+		doTestMalformedRequest(multipleTransferEncodingRequest);
+
+		// Transfer-Encoding combined with Content-Length
+		String transferEncodingWithContentLengthRequest = """
+			POST / HTTP/1.1\r
+			Host: localhost\r
+			Connection: keep-alive\r
+			Content-Length: 5\r
+			Transfer-Encoding: chunked\r
+			\r
+			""";
+		doTestMalformedRequest(transferEncodingWithContentLengthRequest);
+
+		assertEquals(3, inspector.getMalformedHttpExceptions().getTotal());
+
+		server.closeFuture().get();
+		thread.join();
+	}
+
+	@Test
 	public void testMalformedFirstRequestPipelined() throws IOException, ExecutionException, InterruptedException {
 		JmxInspector inspector = new JmxInspector();
 		HttpServer server = HttpServer.builder(eventloop, $ -> {

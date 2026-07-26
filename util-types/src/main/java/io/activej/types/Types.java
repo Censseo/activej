@@ -111,8 +111,8 @@ public class Types {
 		if (typeBindingsCache.size() >= MAX_TYPE_BINDINGS_CACHE_SIZE) {
 			typeBindingsCache.clear();
 		}
-		typeBindingsCache.putIfAbsent(type, mapping);
-		return mapping;
+		Map<TypeVariable<?>, Type> existing = typeBindingsCache.putIfAbsent(type, mapping);
+		return existing != null ? existing : mapping;
 	}
 
 	private static void getAllTypeBindingsImpl(Type type, Map<TypeVariable<?>, Type> mapping) {

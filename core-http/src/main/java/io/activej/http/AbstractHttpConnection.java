@@ -103,6 +103,7 @@ public abstract class AbstractHttpConnection extends AbstractReactive {
 
 	protected long contentLength;
 	private boolean contentLengthReceived;
+	private boolean transferEncodingReceived;
 
 	protected @Nullable Exception closeException;
 
@@ -255,6 +256,7 @@ public abstract class AbstractHttpConnection extends AbstractReactive {
 
 	protected final void readStartLine() throws MalformedHttpException {
 		contentLengthReceived = false;
+		transferEncodingReceived = false;
 		byte[] array = readBuf.array();
 		int head = readBuf.head();
 		int tail = readBuf.tail();
@@ -347,7 +349,15 @@ public abstract class AbstractHttpConnection extends AbstractReactive {
 		} else if (IWebSocket.ENABLED && header == HttpHeaders.UPGRADE) {
 			flags |= equalsLowerCaseAscii(UPGRADE_WEBSOCKET, array, pos, len) ? WEB_SOCKET : 0;
 		} else if (header == TRANSFER_ENCODING) {
-			flags |= isChunkedTransferEncoding(array, pos, len) ? CHUNKED : 0;
+			// RFC 7230, section 3.3.1: reject ambiguous or unsupported Transfer-Encoding
+			if (transferEncodingReceived) {
+				throw new MalformedHttpException("Multiple Transfer-Encoding headers");
+			}
+			transferEncodingReceived = true;
+			if (!isChunkedTransferEncoding(array, pos, len)) {
+				throw new MalformedHttpException("Transfer-Encoding with a final coding other than 'chunked' is not supported");
+			}
+			flags |= CHUNKED;
 		} else if (header == CONTENT_ENCODING) {
 			flags |= equalsLowerCaseAscii(CONTENT_ENCODING_GZIP, array, pos, len) ? GZIPPED : 0;
 		}
