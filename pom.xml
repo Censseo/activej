@@ -36,6 +36,7 @@
     <module>core-bytebuf</module>
     <module>core-codegen</module>
     <module>core-serializer</module>
+    <module>core-quic</module>
     <module>core-specializer</module>
     <module>core-promise</module>
     <module>core-csp</module>
