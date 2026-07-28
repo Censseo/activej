@@ -64,3 +64,12 @@ explicitly.
 - Codegen: `GeneratedBytecode.usesStaticConstants()` exposes whether bytecode
   storage must preserve static constants; `DefiningClassLoader` no longer
   rewrites the `.class` storage format.
+
+### Notable additions
+
+- **QUIC TLS 1.3 handshake engine.** A new `io.activej.quic.tls` package in
+  `core-quic` implements the TLS 1.3 handshake over the QUIC transport (RFC 8446
+  with RFC 9001 profile): `TlsClientEngine`/`TlsServerEngine`, message codec,
+  key schedule, certificate verification, ALPN and QUIC transport parameter
+  negotiation. The engine is synchronous (non-reactive) per the QUIC module
+  convention; thread confinement is the caller's contract.
