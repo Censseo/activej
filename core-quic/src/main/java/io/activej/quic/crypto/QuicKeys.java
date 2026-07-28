@@ -73,6 +73,16 @@ public final class QuicKeys {
 			deriveKeys(QuicCipherSuite.AES_128_GCM, serverSecret));
 	}
 
+	/**
+	 * Derives a key set from a TLS 1.3 traffic secret (RFC 9001 §5.1 labels applied to an
+	 * RFC 8446 §7.1 secret): the Handshake level's {@code client/server_handshake_traffic_secret}
+	 * and the 1-RTT level's {@code client/server_application_traffic_secret_0} feed the same
+	 * {@code quic key}/{@code quic iv}/{@code quic hp} derivation as the Initial level.
+	 */
+	public static QuicKeys fromTrafficSecret(QuicCipherSuite suite, byte[] trafficSecret) {
+		return deriveKeys(suite, trafficSecret);
+	}
+
 	private static QuicKeys deriveKeys(QuicCipherSuite suite, byte[] secret) {
 		String hash = suite.hkdfHash();
 		byte[] key = Hkdf.expandLabel(hash, secret, "quic key", new byte[0], suite.keyLength());
@@ -81,10 +91,12 @@ public final class QuicKeys {
 		return new QuicKeys(suite, key, iv, hp);
 	}
 
+	/** The cipher suite this key set's material and {@link Cipher} transforms belong to. */
 	public QuicCipherSuite suite() {
 		return suite;
 	}
 
+	/** The AEAD key as a {@link SecretKeySpec} for {@link #aeadCipher()} initialization. */
 	public SecretKeySpec aeadKey() {
 		return aeadKey;
 	}
