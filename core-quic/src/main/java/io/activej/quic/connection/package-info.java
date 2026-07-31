@@ -38,6 +38,41 @@
  * rule — a received {@link io.activej.bytebuf.ByteBuf} is owned and must be recycled on every
  * path, including failure paths.
  *
+ * <h2>Leniency: what is tolerated, dropped and rejected (SI-7, FR-031a)</h2>
+ *
+ * <p>Leniency is a decision here, not a default. Every input this layer meets falls into exactly one
+ * of three classes, and each class is stated once rather than being inferred from the code:
+ *
+ * <p><b>Tolerated and ignored</b> — accepted, acted on in no way, never an error:
+ * unknown transport parameters (RFC 9000 §18.1); {@code preferred_address} and
+ * {@code stateless_reset_token} (the features they configure are out of scope); ECN counts in a
+ * received ACK (RFC 9000 §13.4); NEW_CONNECTION_ID, RETIRE_CONNECTION_ID, NEW_TOKEN,
+ * PATH_CHALLENGE/PATH_RESPONSE and the flow-control credit frames — a conforming peer sends these
+ * unprompted, so rejecting them would break interoperability rather than enforce anything; 0-RTT
+ * packets; packets for a level whose keys were already discarded (a late retransmission, RFC 9000
+ * §12.3); and packets failing AEAD, which count only toward the RFC 9001 §6.6 integrity limit.
+ *
+ * <p><b>Silently dropped, creating no state</b> — never answered, never logged at a level a peer can
+ * flood (SI-3): a datagram whose envelope will not parse; an unknown destination connection ID that
+ * is not a long-header Initial; an Initial in a datagram under the RFC 9000 §14.1 1200-byte minimum;
+ * a Version Negotiation or Retry arriving after the handshake has made progress; a Retry whose
+ * integrity tag fails, or a second one (RFC 9000 §17.2.5).
+ *
+ * <p><b>Rejected as a connection error</b> — CONNECTION_CLOSE with the RFC 9000 §20 code named by
+ * {@link io.activej.quic.connection.QuicTransportErrors}: a frame type illegal at its encryption
+ * level, an empty payload, frames that will not parse past AEAD, an ACK for a packet number never
+ * sent, an out-of-range or self-inconsistent transport parameter, a CRYPTO stream that contradicts
+ * itself or exceeds its buffer bound, and an application frame arriving with no
+ * {@link io.activej.quic.connection.QuicFrameHandler} registered — the peer was told of zero streams
+ * and no DATAGRAM support, so it has exceeded a limit it was given.
+ *
+ * <p><b>Not classified, because it is not checked</b>: the <em>source address</em> of an inbound
+ * datagram. A datagram is routed by destination connection ID alone (RFC 9000 §5.2), so one bearing a
+ * live connection ID is processed whatever address it arrives from. This is not an amplification
+ * path — every reply goes to the address the connection was opened against, never to the sender —
+ * and AEAD is what actually rejects an off-path injection. Connection migration (RFC 9000 §9), which
+ * is what would make an address change meaningful, is out of scope for this feature.
+ *
  * @see <a href="https://www.rfc-editor.org/rfc/rfc9000">RFC 9000 — QUIC: A UDP-Based Multiplexed
  * and Secure Transport</a>
  * @see <a href="https://www.rfc-editor.org/rfc/rfc9001">RFC 9001 — Using TLS to Secure QUIC</a>

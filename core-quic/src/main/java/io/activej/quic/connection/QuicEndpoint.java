@@ -20,6 +20,7 @@ import io.activej.bytebuf.ByteBuf;
 import io.activej.bytebuf.ByteBufPool;
 import io.activej.common.ApplicationSettings;
 import io.activej.common.builder.AbstractBuilder;
+import io.activej.common.inspector.BaseInspector;
 import io.activej.net.socket.udp.IUdpSocket;
 import io.activej.net.socket.udp.UdpPacket;
 import io.activej.promise.Promise;
@@ -84,12 +85,47 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 	/** RFC 9000 §17.2.1: version 0 in a long header identifies a Version Negotiation packet. */
 	private static final long VERSION_NEGOTIATION = 0;
 
+	/**
+	 * The endpoint's half of the FR-036 statistics hook: the four dispatch-level events, which belong to
+	 * no single connection and so cannot be reported by {@link QuicConnection.Inspector}.
+	 * <p>
+	 * Carries no {@link ByteBuf} and nothing key-derived (SI-6). {@code from} is a peer address, which is
+	 * routing data rather than a secret — but note it is <b>unauthenticated</b> on every event here
+	 * except {@link #onConnectionCreated}, because dispatch happens before any packet is opened.
+	 * <p>
+	 * <b>Threading</b>: every callback runs on the endpoint's reactor thread, inside the receive loop.
+	 *
+	 * @see <a href="https://www.rfc-editor.org/rfc/rfc9000#section-5.2">RFC 9000 §5.2 — Matching Packets to Connections</a>
+	 */
+	public interface Inspector extends BaseInspector<Inspector> {
+		/** Every datagram off the socket, before it is routed and before anything in it is trusted. */
+		void onDatagramReceived(QuicEndpoint endpoint, InetSocketAddress from, int sizeInBytes);
+
+		/**
+		 * A datagram that resolved to no connection and did not qualify to create one — the counterpart
+		 * of {@link #datagramsDropped()}. Deliberately not logged by the endpoint: it is peer-triggered
+		 * and would otherwise be a log-flood channel (SI-3).
+		 */
+		void onDatagramDropped(QuicEndpoint endpoint, InetSocketAddress from, int sizeInBytes);
+
+		/** An inbound Initial admitted as a new server connection, before its handshake starts. */
+		void onConnectionCreated(QuicEndpoint endpoint, QuicConnection connection);
+
+		/**
+		 * An inbound connection attempt refused at {@link #MAX_CONNECTIONS} or
+		 * {@link #MAX_HANDSHAKING_CONNECTIONS}.
+		 */
+		void onConnectionRefused(QuicEndpoint endpoint, InetSocketAddress from);
+	}
+
 	private final IUdpSocket socket;
 	private final QuicConnectionSettings settings;
 	private final @Nullable TlsEngineFactory serverEngineFactory;
 	private final SecureRandom secureRandom;
 	private final int maxConnections;
 	private final int maxHandshakingConnections;
+	private final @Nullable Inspector inspector;
+	private final QuicConnection.@Nullable Inspector connectionInspector;
 
 	/**
 	 * Every connection ID that routes to a connection. A server connection is reachable under two: the
@@ -118,6 +154,8 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 		this.secureRandom = builder.secureRandom;
 		this.maxConnections = builder.maxConnections;
 		this.maxHandshakingConnections = builder.maxHandshakingConnections;
+		this.inspector = builder.inspector;
+		this.connectionInspector = builder.connectionInspector;
 	}
 
 	public static Builder builder(NioReactor reactor, IUdpSocket socket) {
@@ -133,6 +171,8 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 		private SecureRandom secureRandom = new SecureRandom();
 		private int maxConnections = MAX_CONNECTIONS;
 		private int maxHandshakingConnections = MAX_HANDSHAKING_CONNECTIONS;
+		private @Nullable Inspector inspector;
+		private QuicConnection.@Nullable Inspector connectionInspector;
 
 		private Builder(NioReactor reactor, IUdpSocket socket) {
 			this.reactor = reactor;
@@ -178,6 +218,30 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 					"maxHandshakingConnections must be at least 1: " + maxHandshakingConnections);
 			}
 			this.maxHandshakingConnections = maxHandshakingConnections;
+			return this;
+		}
+
+		/**
+		 * Registers the dispatch-level statistics hook of FR-036. It observes only what this endpoint
+		 * does; a connection's own events come from {@link QuicConnection.Builder#withInspector}.
+		 */
+		public Builder withInspector(Inspector inspector) {
+			checkNotBuilt(this);
+			this.inspector = inspector;
+			return this;
+		}
+
+		/**
+		 * Gives every connection this endpoint creates — accepted or dialled — the same
+		 * {@link QuicConnection.Inspector}.
+		 * <p>
+		 * This is the only way to inspect an <b>accepted</b> connection at all: a server connection is
+		 * built inside the dispatch, so there is no moment between its construction and its first packet
+		 * in which a caller could attach anything to it.
+		 */
+		public Builder withConnectionInspector(QuicConnection.Inspector connectionInspector) {
+			checkNotBuilt(this);
+			this.connectionInspector = connectionInspector;
 			return this;
 		}
 
@@ -279,10 +343,13 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 		ByteBuf datagram = packet.getBuf();
 		InetSocketAddress from = packet.getSocketAddress();
 		datagramsReceived++;
+		if (inspector != null) {
+			inspector.onDatagramReceived(this, from, datagram.readRemaining());
+		}
 
 		Envelope envelope = CoalescedPackets.peek(datagram, settings.connectionIdLength());
 		if (envelope == null) {
-			drop(datagram);
+			drop(from, datagram);
 			return;
 		}
 
@@ -296,7 +363,7 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 			// A short header with an unknown DCID: a late packet for a connection that is already gone,
 			// or someone probing. RFC 9000 §10.3's stateless reset would answer it; that is out of scope
 			// for this feature, so it is dropped in silence.
-			drop(datagram);
+			drop(from, datagram);
 			return;
 		}
 		acceptOrDrop(from, envelope, datagram);
@@ -307,7 +374,7 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 		if (serverEngineFactory == null) {
 			// Client-only endpoint. Answering here would make us a reflector for anyone who can spoof a
 			// source address.
-			drop(datagram);
+			drop(from, datagram);
 			return;
 		}
 		if (datagram.readRemaining() < PacketAssembler.MIN_INITIAL_DATAGRAM_SIZE) {
@@ -315,7 +382,7 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 			// here is what keeps the 3× anti-amplification budget from being computed off a tiny input —
 			// and it is checked before the Version Negotiation answer below, because that answer is the one
 			// place this endpoint replies to a datagram it has not authenticated at all.
-			drop(datagram);
+			drop(from, datagram);
 			return;
 		}
 		if (envelope.version() != QuicPackets.SUPPORTED_VERSION) {
@@ -324,32 +391,35 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 			if (envelope.version() != VERSION_NEGOTIATION) {
 				sendVersionNegotiation(from, envelope);
 			}
-			drop(datagram);
+			drop(from, datagram);
 			return;
 		}
 		if (!envelope.isInitial()) {
 			// RFC 9000 §7.2: only an Initial packet starts a connection. A Handshake or 0-RTT packet whose
 			// DCID matched nothing belongs to a connection that is already gone — building a TLS engine and
 			// a key schedule for it would fail on the first frame, having spent the cost an attacker wanted.
-			drop(datagram);
+			drop(from, datagram);
 			return;
 		}
 		QuicConnectionId clientScid = envelope.sourceConnectionId();
 		if (clientScid == null) {
-			drop(datagram);
+			drop(from, datagram);
 			return;
 		}
 		if (byConnectionId.containsKey(envelope.destinationConnectionId())) {
 			// The DCID of a client Initial is a value the client invented, so it can name a connection that
 			// already exists. Accepting would displace that connection's routing entry; see register.
-			drop(datagram);
+			drop(from, datagram);
 			return;
 		}
 		if (connections.size() >= maxConnections || handshaking.size() >= maxHandshakingConnections) {
 			// SI-3: at the bound we drop rather than queue. A queue of unvalidated peers is the resource
 			// an attacker was after in the first place.
 			connectionsRejected++;
-			drop(datagram);
+			if (inspector != null) {
+				inspector.onConnectionRefused(this, from);
+			}
+			drop(from, datagram);
 			return;
 		}
 
@@ -360,6 +430,9 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 			.withPeerConnectionId(clientScid)
 			.withOriginalDestinationConnectionId(envelope.destinationConnectionId())
 			.withOnClosed(() -> unregister(envelope.destinationConnectionId()))
+			.initialize(builder -> {
+				if (connectionInspector != null) builder.withInspector(connectionInspector);
+			})
 			.build();
 
 		// Reachable under both: the client keeps addressing the DCID it invented until it has seen our
@@ -371,12 +444,15 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 			// datagram. Unwinding is by connection, never by ID: an ID that collided names somebody else.
 			// The connection was never started, so it holds no timer and no buffer.
 			unregisterAll(connection);
-			drop(datagram);
+			drop(from, datagram);
 			return;
 		}
 		connections.add(connection);
 		handshaking.add(connection);
 		connectionsAccepted++;
+		if (inspector != null) {
+			inspector.onConnectionCreated(this, connection);
+		}
 
 		connection.start().whenComplete(($, e) -> handshaking.remove(connection));
 		connection.onDatagram(datagram);
@@ -457,8 +533,12 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 		handshaking.remove(connection);
 	}
 
-	private void drop(ByteBuf datagram) {
+	/** Takes ownership of {@code datagram}. The one place an unroutable datagram is accounted for. */
+	private void drop(InetSocketAddress from, ByteBuf datagram) {
 		datagramsDropped++;
+		if (inspector != null) {
+			inspector.onDatagramDropped(this, from, datagram.readRemaining());
+		}
 		datagram.recycle();
 	}
 
@@ -497,6 +577,9 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 			.withSettings(settings)
 			.withSecureRandom(secureRandom)
 			.withOnClosed(() -> unregister(localId[0]))
+			.initialize(builder -> {
+				if (connectionInspector != null) builder.withInspector(connectionInspector);
+			})
 			.build();
 		localId[0] = connection.localConnectionId();
 

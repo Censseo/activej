@@ -105,6 +105,8 @@ public final class QuicWirePair implements AutoCloseable {
 	private @Nullable QuicConnection server;
 	private @Nullable QuicFrameHandler clientFrameHandler;
 	private @Nullable QuicFrameHandler serverFrameHandler;
+	private QuicConnection.@Nullable Inspector clientInspector;
+	private QuicConnection.@Nullable Inspector serverInspector;
 
 	/** Registers the layer above the client. Must be called before {@link #startClient}. */
 	public QuicWirePair withClientFrameHandler(QuicFrameHandler handler) {
@@ -115,6 +117,18 @@ public final class QuicWirePair implements AutoCloseable {
 	/** Registers the layer above the server. Must be called before {@link #acceptServer}. */
 	public QuicWirePair withServerFrameHandler(QuicFrameHandler handler) {
 		this.serverFrameHandler = handler;
+		return this;
+	}
+
+	/** Attaches the FR-036 statistics hook to the client. Must be called before {@link #startClient}. */
+	public QuicWirePair withClientInspector(QuicConnection.Inspector inspector) {
+		this.clientInspector = inspector;
+		return this;
+	}
+
+	/** Attaches the FR-036 statistics hook to the server. Must be called before {@link #acceptServer}. */
+	public QuicWirePair withServerInspector(QuicConnection.Inspector inspector) {
+		this.serverInspector = inspector;
 		return this;
 	}
 
@@ -151,6 +165,7 @@ public final class QuicWirePair implements AutoCloseable {
 			.withSettings(settings)
 			.initialize(builder -> {
 				if (clientFrameHandler != null) builder.withFrameHandler(clientFrameHandler);
+				if (clientInspector != null) builder.withInspector(clientInspector);
 			})
 			.build();
 		return client.start();
@@ -187,6 +202,7 @@ public final class QuicWirePair implements AutoCloseable {
 			.withOriginalDestinationConnectionId(clientDcid)
 			.initialize(builder -> {
 				if (serverFrameHandler != null) builder.withFrameHandler(serverFrameHandler);
+				if (serverInspector != null) builder.withInspector(serverInspector);
 			})
 			.build();
 		Promise<QuicConnection> promise = server.start();

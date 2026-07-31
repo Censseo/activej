@@ -123,11 +123,18 @@ public final class QuicEndpointFixture implements AutoCloseable {
 
 	/** A client-only endpoint on a fresh synthetic address. It cannot accept, by construction. */
 	public QuicEndpoint client(QuicConnectionSettings settings) {
+		return client(settings, builder -> builder);
+	}
+
+	/** A client-only endpoint, with {@code customize} applied to its builder before {@code build()}. */
+	public QuicEndpoint client(
+		QuicConnectionSettings settings, java.util.function.UnaryOperator<QuicEndpoint.Builder> customize
+	) {
 		InetSocketAddress address = new InetSocketAddress("127.0.0.1", nextClientPort++);
 		LossyUdpSocket socket = new LossyUdpSocket(network, address);
 		sockets.add(socket);
-		QuicEndpoint endpoint = QuicEndpoint.builder(reactor(), socket)
-			.withSettings(settings)
+		QuicEndpoint endpoint = customize.apply(QuicEndpoint.builder(reactor(), socket)
+				.withSettings(settings))
 			.build();
 		endpoints.add(endpoint);
 		return endpoint;

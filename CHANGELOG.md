@@ -79,6 +79,20 @@ explicitly.
   reactor-facing surface in `core-quic`, and the module's first dependency on
   `activej-net`.
 
+  Diagnostics come in two forms, neither of which pulls in a JMX dependency:
+  plain counter accessors, and an optional `Inspector` hook on both
+  `QuicConnection` (packet sent/received/lost, RTT metrics, congestion-state
+  change, connection-state transition) and `QuicEndpoint` (datagram
+  received/dropped, connection created/refused), following the
+  `UdpSocket.Inspector` precedent in `core-net`. Both default to none;
+  `QuicEndpoint.Builder.withConnectionInspector` gives one to every connection
+  the endpoint creates, which is the only way to reach an accepted server
+  connection. The same events are logged at debug level under the qlog event
+  vocabulary (`transport:packet_sent`, `transport:packet_received`,
+  `recovery:packet_lost`, `recovery:metrics_updated`,
+  `recovery:congestion_state_updated`); no log line carries key material or
+  frame payloads.
+
   Every limit is an `ApplicationSettings` key resolved from
   `io.activej.quic.connection.QuicConnection.<setting>` (or
   `QuicConnection.<setting>`), except the two endpoint bounds, which resolve

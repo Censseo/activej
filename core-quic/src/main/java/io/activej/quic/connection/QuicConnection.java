@@ -20,6 +20,7 @@ import io.activej.bytebuf.ByteBuf;
 import io.activej.bytebuf.ByteBufPool;
 import io.activej.common.builder.AbstractBuilder;
 import io.activej.common.exception.MalformedDataException;
+import io.activej.common.inspector.BaseInspector;
 import io.activej.common.recycle.Recyclers;
 import io.activej.promise.Promise;
 import io.activej.promise.SettablePromise;
@@ -175,6 +176,64 @@ public final class QuicConnection extends AbstractReactive {
 	 */
 	public record PeerClose(boolean isApplication, long errorCode, long frameType, String reason) {}
 
+	/**
+	 * The optional statistics hook of FR-036, mirroring {@code UdpSocket.Inspector} in {@code core-net}:
+	 * an interface declared by the component, defaulting to none, that a later module implements to
+	 * publish JMX statistics without this module depending on {@code boot-jmx}.
+	 * <p>
+	 * It carries no {@link ByteBuf} and no key material by construction — every parameter is a number,
+	 * an encryption level or a state (SI-6). The same six events are logged at debug level under the
+	 * qlog event vocabulary, so a deployment gets the identical picture from either seam (FR-034).
+	 * <p>
+	 * <b>Threading</b>: every callback runs on the connection's reactor thread, inside the operation
+	 * that produced the event. An implementation that blocks blocks the reactor, and one that throws
+	 * fails the operation — accumulate, never act.
+	 *
+	 * @see <a href="https://www.rfc-editor.org/rfc/rfc9002#section-B">RFC 9002 §B — the variables these events report</a>
+	 */
+	public interface Inspector extends BaseInspector<Inspector> {
+		/**
+		 * qlog {@code transport:packet_sent}. Fired when the packet is committed to a datagram and
+		 * recorded as in flight — the point RFC 9002 §A.5 counts it from — which is just before the
+		 * datagram reaches {@link DatagramSink#send}.
+		 */
+		void onPacketSent(
+			QuicConnection connection, EncryptionLevel level, long packetNumber, int sizeInBytes,
+			boolean ackEliciting);
+
+		/**
+		 * qlog {@code transport:packet_received}. Fired only for a packet that authenticated and was
+		 * <i>new</i> — a duplicate, a packet failing AEAD and one for a discarded level are all invisible
+		 * here and visible in {@link #packetsDropped()}.
+		 */
+		void onPacketReceived(
+			QuicConnection connection, EncryptionLevel level, long packetNumber, int sizeInBytes);
+
+		/**
+		 * qlog {@code recovery:packet_lost}. Fired once per packet declared lost by RFC 9002 §6.1's
+		 * thresholds. A probe retransmission is <i>not</i> loss and is not reported here (RFC 9002 §6.2).
+		 */
+		void onPacketLost(
+			QuicConnection connection, EncryptionLevel level, long packetNumber, int sizeInBytes);
+
+		/**
+		 * qlog {@code recovery:metrics_updated}. Fired on each RFC 9002 §5 RTT sample; the estimator is
+		 * passed rather than its fields so a JMX implementation can record whichever it publishes.
+		 */
+		void onMetricsUpdated(QuicConnection connection, RttEstimator rtt);
+
+		/**
+		 * qlog {@code recovery:congestion_state_updated}. Fired only on an actual transition, never on a
+		 * window change within one state.
+		 */
+		void onCongestionStateUpdated(
+			QuicConnection connection, NewRenoCongestionController.State from,
+			NewRenoCongestionController.State to);
+
+		/** Fired on every {@link QuicConnectionState} transition, including the one into {@code CLOSED}. */
+		void onStateTransition(QuicConnection connection, QuicConnectionState from, QuicConnectionState to);
+	}
+
 	private final Role role;
 	private final DatagramSink sink;
 	private final InetSocketAddress remoteAddress;
@@ -208,6 +267,7 @@ public final class QuicConnection extends AbstractReactive {
 	private final SettablePromise<QuicConnection> establishPromise = new SettablePromise<>();
 	private final @Nullable Runnable onClosed;
 	private final @Nullable QuicFrameHandler frameHandler;
+	private final @Nullable Inspector inspector;
 	private QuicConnectionState state = QuicConnectionState.IDLE;
 	private @Nullable ScheduledRunnable handshakeDeadline;
 	private @Nullable QuicTransportParameters peerTransportParameters;
@@ -253,11 +313,15 @@ public final class QuicConnection extends AbstractReactive {
 	private long keepAlivesSent;
 	private long probeRetransmits;
 
+	/** The last state reported through {@link Inspector#onCongestionStateUpdated}, so only changes fire. */
+	private NewRenoCongestionController.State reportedCongestionState;
+
 	private QuicConnection(Builder builder) {
 		super(builder.reactor);
 		this.role = builder.role;
 		this.onClosed = builder.onClosed;
 		this.frameHandler = builder.frameHandler;
+		this.inspector = builder.inspector;
 		this.sink = builder.sink;
 		this.remoteAddress = builder.remoteAddress;
 		this.settings = builder.settings;
@@ -286,6 +350,7 @@ public final class QuicConnection extends AbstractReactive {
 
 		this.sendQueue = new SendQueue(settings.maxSendQueueBytes());
 		this.congestion = NewRenoCongestionController.of(settings);
+		this.reportedCongestionState = congestion.state();
 		this.amplification = role == Role.SERVER
 			? AmplificationBudget.forServer()
 			: AmplificationBudget.validated();
@@ -327,6 +392,7 @@ public final class QuicConnection extends AbstractReactive {
 		private @Nullable QuicConnectionId originalDestinationConnectionId;
 		private @Nullable Runnable onClosed;
 		private @Nullable QuicFrameHandler frameHandler;
+		private @Nullable Inspector inspector;
 
 		private Builder(
 			Reactor reactor, Role role, DatagramSink sink, InetSocketAddress remoteAddress,
@@ -393,6 +459,17 @@ public final class QuicConnection extends AbstractReactive {
 			return this;
 		}
 
+		/**
+		 * Registers the optional statistics hook of FR-036. Without one the connection still keeps every
+		 * counter and still logs every qlog event; the hook only adds a push seam for a module that
+		 * publishes them.
+		 */
+		public Builder withInspector(Inspector inspector) {
+			checkNotBuilt(this);
+			this.inspector = inspector;
+			return this;
+		}
+
 		@Override
 		protected QuicConnection doBuild() {
 			if (role == Role.SERVER) {
@@ -423,7 +500,7 @@ public final class QuicConnection extends AbstractReactive {
 		if (state != QuicConnectionState.IDLE) {
 			return establishPromise;
 		}
-		state = QuicConnectionState.HANDSHAKING;
+		transitionTo(QuicConnectionState.HANDSHAKING);
 		handshakeDeadline = reactor.delay(settings.handshakeTimeoutMillis(), () -> {
 			handshakeDeadline = null;
 			if (state == QuicConnectionState.HANDSHAKING) {
@@ -482,8 +559,13 @@ public final class QuicConnection extends AbstractReactive {
 	// ---------------------------------------------------------------- receive path (T028)
 
 	/**
-	 * Processes one received datagram. <b>Takes ownership</b> of {@code datagram} and recycles it on
-	 * every path.
+	 * Processes one received datagram: every packet coalesced into it, in order (RFC 9000 §12.2).
+	 * <p>
+	 * <b>Takes ownership</b> of {@code datagram} and recycles it on every path — including the paths
+	 * that discard it unread, which is what a draining or closing connection does (RFC 9000 §10.2).
+	 * <p>
+	 * A packet that cannot be authenticated ends only itself, never the datagram: see the package's
+	 * leniency classification for which inputs are tolerated, dropped and rejected.
 	 */
 	public void onDatagram(ByteBuf datagram) {
 		checkInReactorThread(this);
@@ -821,6 +903,9 @@ public final class QuicConnection extends AbstractReactive {
 	private void openAndHandle(EncryptionLevel level, LevelKeys levelKeys, ByteBuf bytes)
 		throws QuicTransportException {
 		PacketNumberSpace space = spaces.get(level);
+		// Captured before open(), which consumes the buffer: the protected size is what a qlog reader
+		// and a congestion controller both mean by a packet's size.
+		int sizeInBytes = bytes.readRemaining();
 		QuicPacketProtection.OpenResult opened;
 		try {
 			opened = QuicPacketProtection.open(
@@ -857,6 +942,7 @@ public final class QuicConnection extends AbstractReactive {
 			if (!space.onPacketReceived(opened.packetNumber, reactor.currentTimeMillis(), ackEliciting)) {
 				return;
 			}
+			onPacketReceivedEvent(level, opened.packetNumber, sizeInBytes);
 			if (level == EncryptionLevel.ONE_RTT && ackEliciting) {
 				armAckTimer(space);
 			}
@@ -1064,12 +1150,16 @@ public final class QuicConnection extends AbstractReactive {
 		if (largestPacket != null && largestPacket.ackEliciting) {
 			rtt.onRttSample(largestPacket.sentTime, now, peerAckDelayMillis(ack.ackDelay),
 				peerMaxAckDelayMillis(), handshakeConfirmed);
+			onMetricsUpdatedEvent();
 		}
 		if (ackedAckEliciting) {
 			// RFC 9002 §6.2.1: an acknowledgement of an ack-eliciting packet proves the path is working,
 			// so the exponential probe backoff starts over.
 			ptoCount = 0;
 		}
+		// The acknowledgements above are the one way out of RECOVERY, and detectAndRequeueLost reports
+		// its own transitions — so both clusters are covered, each at the point it can change the state.
+		reportCongestionState();
 		detectAndRequeueLost(level, now);
 	}
 
@@ -1115,6 +1205,7 @@ public final class QuicConnection extends AbstractReactive {
 		boolean anyInFlight = false;
 		for (SentPacket lost : detection.lost()) {
 			packetsLost++;
+			onPacketLostEvent(lost);
 			if (lost.inFlight) {
 				anyInFlight = true;
 				lostBytes += lost.sizeInBytes;
@@ -1132,6 +1223,7 @@ public final class QuicConnection extends AbstractReactive {
 		} else {
 			congestion.onCongestionEvent(newestLostSentTime, now);
 		}
+		reportCongestionState();
 	}
 
 	/**
@@ -1308,7 +1400,7 @@ public final class QuicConnection extends AbstractReactive {
 			sendQueue.enqueue(EncryptionLevel.ONE_RTT, HandshakeDoneFrame.INSTANCE, false);
 		}
 
-		state = QuicConnectionState.ESTABLISHED;
+		transitionTo(QuicConnectionState.ESTABLISHED);
 		cancelHandshakeDeadline();
 		// Both depend on the peer's parameters, so this is the earliest point either can be right.
 		armIdleTimer();
@@ -1503,6 +1595,7 @@ public final class QuicConnection extends AbstractReactive {
 			congestion.onPacketSent(sent.sizeInBytes);
 		}
 		space.onPacketSent(sent);
+		onPacketSentEvent(sent);
 	}
 
 	private static boolean containsHandshakeDone(List<QuicFrame> frames) {
@@ -1878,7 +1971,7 @@ public final class QuicConnection extends AbstractReactive {
 		QuicTransportException cause = new QuicTransportException(close.errorCode,
 			"Peer closed the connection with " + QuicTransportErrors.name(close.errorCode));
 
-		state = QuicConnectionState.DRAINING;
+		transitionTo(QuicConnectionState.DRAINING);
 		release();
 		armClosingTimer();
 		establishPromise.trySetException(cause);
@@ -1918,7 +2011,7 @@ public final class QuicConnection extends AbstractReactive {
 			return;
 		}
 		boolean wasOpen = state != QuicConnectionState.IDLE;
-		state = QuicConnectionState.CLOSING;
+		transitionTo(QuicConnectionState.CLOSING);
 		// Everything except the keys and the close frame goes now: nothing in flight can still be
 		// usefully acknowledged, and holding a send queue through the closing period would be a leak
 		// measured in a whole PTO.
@@ -2077,7 +2170,7 @@ public final class QuicConnection extends AbstractReactive {
 	/** The single transition into {@code CLOSED}, so the {@code onClosed} hook can only fire once. */
 	private void markClosed() {
 		if (state == QuicConnectionState.CLOSED) return;
-		state = QuicConnectionState.CLOSED;
+		transitionTo(QuicConnectionState.CLOSED);
 		if (frameHandler != null) {
 			// Already terminal, so notifyHandler's deferred close is a no-op — this only contains the throw.
 			notifyHandler("onClosed", () -> frameHandler.onClosed(this));
@@ -2219,6 +2312,91 @@ public final class QuicConnection extends AbstractReactive {
 	public boolean hasFrameHandler() {
 		checkInReactorThread(this);
 		return frameHandler != null;
+	}
+
+	// ---------------------------------------------------------------- diagnostics (T075, T076)
+
+	/*
+	 * One method per event, each doing exactly two things: a debug line named for the corresponding
+	 * qlog event, and the Inspector notification (FR-034, FR-036). Keeping both in one place is what
+	 * stops the two seams from drifting apart, and it is the only place that has to be audited for
+	 * SI-6 — no method here may be passed key material, a ByteBuf or a frame payload. The connection's
+	 * own identifier is deliberately absent from the log lines: `role` plus the logger's connection
+	 * context is what a reader needs, and a connection ID in a log is a routing token.
+	 */
+
+	/** qlog {@code transport:packet_sent} (RFC 9002 §A.5 — {@code OnPacketSent}). */
+	private void onPacketSentEvent(SentPacket sent) {
+		logger.debug("qlog transport:packet_sent {} level={} pn={} size={} ack_eliciting={} in_flight={}",
+			role, sent.level, sent.packetNumber, sent.sizeInBytes, sent.ackEliciting, sent.inFlight);
+		if (inspector != null) {
+			inspector.onPacketSent(this, sent.level, sent.packetNumber, sent.sizeInBytes, sent.ackEliciting);
+		}
+	}
+
+	/** qlog {@code transport:packet_received} — authenticated and not a duplicate. */
+	private void onPacketReceivedEvent(EncryptionLevel level, long packetNumber, int sizeInBytes) {
+		logger.debug("qlog transport:packet_received {} level={} pn={} size={}",
+			role, level, packetNumber, sizeInBytes);
+		if (inspector != null) {
+			inspector.onPacketReceived(this, level, packetNumber, sizeInBytes);
+		}
+	}
+
+	/** qlog {@code recovery:packet_lost} (RFC 9002 §6.1). */
+	private void onPacketLostEvent(SentPacket lost) {
+		logger.debug("qlog recovery:packet_lost {} level={} pn={} size={}",
+			role, lost.level, lost.packetNumber, lost.sizeInBytes);
+		if (inspector != null) {
+			inspector.onPacketLost(this, lost.level, lost.packetNumber, lost.sizeInBytes);
+		}
+	}
+
+	/** qlog {@code recovery:metrics_updated} (RFC 9002 §5). */
+	private void onMetricsUpdatedEvent() {
+		logger.debug("qlog recovery:metrics_updated {} latest_rtt={} smoothed_rtt={} rtt_variance={} " +
+					 "min_rtt={} pto_count={} congestion_window={} bytes_in_flight={}",
+			role, rtt.latestRtt(), rtt.smoothedRtt(), rtt.rttVar(), rtt.minRtt(), ptoCount,
+			congestion.congestionWindow(), congestion.bytesInFlight());
+		if (inspector != null) {
+			inspector.onMetricsUpdated(this, rtt);
+		}
+	}
+
+	/**
+	 * qlog {@code recovery:congestion_state_updated}, emitted only on an actual transition.
+	 * <p>
+	 * Called after every cluster of congestion-controller mutations rather than from inside the
+	 * controller: the controller is a pure RFC 9002 §7 algorithm with no logger and no reactor, and
+	 * comparing against the last reported value here means an event fires once per transition however
+	 * many times the state was recomputed on the way.
+	 */
+	private void reportCongestionState() {
+		NewRenoCongestionController.State current = congestion.state();
+		if (current == reportedCongestionState) return;
+		NewRenoCongestionController.State previous = reportedCongestionState;
+		reportedCongestionState = current;
+		logger.debug("qlog recovery:congestion_state_updated {} old={} new={} congestion_window={} " +
+					 "ssthresh={} bytes_in_flight={}",
+			role, previous, current, congestion.congestionWindow(), congestion.slowStartThreshold(),
+			congestion.bytesInFlight());
+		if (inspector != null) {
+			inspector.onCongestionStateUpdated(this, previous, current);
+		}
+	}
+
+	/**
+	 * The single writer of {@link #state} past construction, so no transition can escape the event.
+	 * A transition to the state already held is a no-op rather than a repeated event.
+	 */
+	private void transitionTo(QuicConnectionState next) {
+		if (state == next) return;
+		QuicConnectionState previous = state;
+		state = next;
+		logger.debug("{} connection state {} -> {}", role, previous, next);
+		if (inspector != null) {
+			inspector.onStateTransition(this, previous, next);
+		}
 	}
 
 	// ---------------------------------------------------------------- accessors
