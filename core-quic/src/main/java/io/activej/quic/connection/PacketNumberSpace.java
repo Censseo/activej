@@ -76,14 +76,32 @@ public final class PacketNumberSpace {
 		return nextPacketNumber++;
 	}
 
+	/**
+	 * Records a sent packet.
+	 * <p>
+	 * <b>Only ack-eliciting packets are tracked.</b> {@code largestSent} advances for every packet — an
+	 * ACK-only packet still consumed a number, and a peer acknowledging it must not be rejected — but the
+	 * record itself is kept only where something depends on it: an RTT sample (which RFC 9002 §5.1 takes
+	 * from ack-eliciting packets only), loss detection and retransmission (an ACK is never retransmitted;
+	 * a fresher one supersedes it), and congestion accounting (an ACK-only packet is not in flight).
+	 * <p>
+	 * This is also what bounds the map. Ack-eliciting packets are bounded by the congestion window, which
+	 * cannot grow without acknowledgements; ACK-only packets are not congestion-controlled, so tracking
+	 * them would let a peer that elicits ACKs and never acknowledges anything grow this map without limit
+	 * (SI-3). Their frames are recycled here, since nothing else will ever hold them.
+	 */
 	public void onPacketSent(SentPacket packet) {
-		sent.put(packet.packetNumber, packet);
 		if (packet.packetNumber > largestSent) {
 			largestSent = packet.packetNumber;
 		}
-		if (packet.ackEliciting) {
-			ackElicitingInFlight++;
+		if (!packet.ackEliciting) {
+			for (QuicFrame frame : packet.frames) {
+				Recyclers.recycle(frame);
+			}
+			return;
 		}
+		sent.put(packet.packetNumber, packet);
+		ackElicitingInFlight++;
 	}
 
 	/**

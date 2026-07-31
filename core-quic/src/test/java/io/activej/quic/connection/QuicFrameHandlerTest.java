@@ -62,6 +62,9 @@ public final class QuicFrameHandlerTest {
 		private int closed;
 		private @Nullable RuntimeException throwOnFrame;
 		private @Nullable QuicTransportException failOnFrame;
+		private @Nullable RuntimeException throwOnAcknowledged;
+		private @Nullable RuntimeException throwOnEstablished;
+		private @Nullable RuntimeException throwOnClosed;
 
 		@Override
 		public void onFrame(QuicConnection connection, EncryptionLevel level, QuicFrame frame)
@@ -75,6 +78,7 @@ public final class QuicFrameHandlerTest {
 		public void onFrameAcknowledged(QuicConnection connection, QuicFrame frame) {
 			acknowledged.add(frame.getClass().getSimpleName());
 			Recyclers.recycle(frame);
+			if (throwOnAcknowledged != null) throw throwOnAcknowledged;
 		}
 
 		@Override
@@ -86,11 +90,13 @@ public final class QuicFrameHandlerTest {
 		@Override
 		public void onEstablished(QuicConnection connection) {
 			established++;
+			if (throwOnEstablished != null) throw throwOnEstablished;
 		}
 
 		@Override
 		public void onClosed(QuicConnection connection) {
 			closed++;
+			if (throwOnClosed != null) throw throwOnClosed;
 		}
 	}
 
@@ -256,6 +262,64 @@ public final class QuicFrameHandlerTest {
 		// closing — and reporting the peer's code would blame the wrong party.
 		assertNotNull(wire.client().peerClose());
 		assertEquals(QuicTransportErrors.INTERNAL_ERROR, wire.client().peerClose().errorCode());
+	}
+
+	@Test
+	public void aHandlerThatThrowsFromOnEstablishedClosesOnlyThatConnection() throws Exception {
+		handler.throwOnEstablished = new IllegalStateException("handler bug");
+		handshakeWithHandler();
+		assertEquals(1, handler.established);
+
+		// onEstablished has no way to report a failure, and it runs from inside packet processing. An
+		// escaping RuntimeException would reach the eventloop's fatal error handler — which is
+		// process-wide, so one buggy handler would take down every other connection on the endpoint. It
+		// is contained, and only this connection closes; the close is deferred by one tick so it does not
+		// unwind the transport bookkeeping it was called from.
+		loop.tickUntilQuiet();
+		wire.pump();
+
+		assertTrue("expected the server to close, it is " + wire.server().state(),
+			wire.server().state().isTerminating());
+		assertNotNull(wire.client().peerClose());
+		assertEquals(QuicTransportErrors.INTERNAL_ERROR, wire.client().peerClose().errorCode());
+	}
+
+	@Test
+	public void aHandlerThatThrowsFromOnFrameAcknowledgedClosesOnlyThatConnection() throws Exception {
+		handshakeWithHandler();
+		handler.throwOnAcknowledged = new IllegalStateException("handler bug");
+		QuicConnection server = wire.server();
+
+		ByteBuf data = ByteBufPool.allocate(3);
+		data.put(new byte[]{9, 9, 9});
+		server.enqueueFrame(new StreamFrame(4, 0, true, data));
+		server.requestSend();
+		wire.pump();
+		loop.advance(QuicTransportParameters.DEFAULT_MAX_ACK_DELAY + 5);
+		wire.pump();
+
+		assertEquals(List.of("StreamFrame"), handler.acknowledged);
+		// The throw happened in the middle of the acknowledgement loop, which was still iterating packet
+		// records. Closing there would have freed what it was walking, hence the deferred close.
+		loop.tickUntilQuiet();
+		wire.pump();
+		assertTrue("expected the server to close, it is " + server.state(), server.state().isTerminating());
+		assertEquals(QuicTransportErrors.INTERNAL_ERROR, wire.client().peerClose().errorCode());
+	}
+
+	@Test
+	public void aHandlerThatThrowsFromOnClosedDoesNotEscape() throws Exception {
+		handshakeWithHandler();
+		handler.throwOnClosed = new IllegalStateException("handler bug");
+
+		// Nothing is left to close, so there is nothing to do but contain it: letting it out of closeNow
+		// would propagate into whatever was tearing the connection down — a timer callback, or an
+		// endpoint shutting down every other connection in a loop.
+		wire.server().closeNow();
+
+		assertEquals(1, handler.closed);
+		assertEquals(QuicConnectionState.CLOSED, wire.server().state());
+		loop.tickUntilQuiet();
 	}
 
 	// ---------------------------------------------------------------- lifecycle

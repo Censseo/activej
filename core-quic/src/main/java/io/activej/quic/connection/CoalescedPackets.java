@@ -86,13 +86,31 @@ public final class CoalescedPackets {
 	 * The routing fields of a datagram's first packet, as read by {@link #peek}.
 	 *
 	 * @param sourceConnectionId {@code null} for a short header, which carries none
+	 * @param longPacketType     the two Long Packet Type bits, or {@link #SHORT_HEADER}. Their meaning is
+	 *                           defined per version (RFC 8999), so it is only interpretable once the
+	 *                           version has been recognized
 	 */
 	public record Envelope(
 		boolean longHeader,
 		long version,
 		QuicConnectionId destinationConnectionId,
-		@Nullable QuicConnectionId sourceConnectionId
-	) {}
+		@Nullable QuicConnectionId sourceConnectionId,
+		int longPacketType
+	) {
+		/** RFC 9000 §17.2.2: the Long Packet Type of a QUIC v1 Initial packet. */
+		public static final int TYPE_INITIAL = 0x0;
+
+		/** {@link #longPacketType} for a short header, which has no such field. */
+		public static final int SHORT_HEADER = -1;
+
+		/**
+		 * Whether this is a QUIC v1 Initial packet — the only packet type that may create a connection.
+		 * The caller must have established that {@link #version} is the one it supports.
+		 */
+		public boolean isInitial() {
+			return longHeader && longPacketType == TYPE_INITIAL;
+		}
+	}
 
 	/**
 	 * Reads just enough of a datagram's first packet to route it: header form, version and the
@@ -121,7 +139,7 @@ public final class CoalescedPackets {
 			if (shortHeaderDcidLength < 0 || end - cursor < 1 + shortHeaderDcidLength) return null;
 			byte[] dcid = new byte[shortHeaderDcidLength];
 			System.arraycopy(array, cursor + 1, dcid, 0, shortHeaderDcidLength);
-			return new Envelope(false, 0, QuicConnectionId.of(dcid), null);
+			return new Envelope(false, 0, QuicConnectionId.of(dcid), null, Envelope.SHORT_HEADER);
 		}
 
 		cursor++;
@@ -135,7 +153,9 @@ public final class CoalescedPackets {
 		try {
 			QuicConnectionId dcid = readConnectionId(array, pos, end);
 			QuicConnectionId scid = readConnectionId(array, pos, end);
-			return new Envelope(true, version, dcid, scid);
+			// Bits 4-5 of the first byte. Not header-protected, and not interpreted here: what the value
+			// means depends on the version, which only the caller has decided whether it recognizes.
+			return new Envelope(true, version, dcid, scid, (firstByte >> 4) & 0x03);
 		} catch (MalformedDataException e) {
 			return null;
 		}

@@ -19,6 +19,7 @@ package io.activej.quic.connection;
 import io.activej.promise.Promise;
 import io.activej.quic.connection.testutil.ManualEventloop;
 import io.activej.quic.connection.testutil.QuicEndpointFixture;
+import io.activej.quic.connection.testutil.QuicWirePair;
 import io.activej.test.rules.ActivePromisesRule;
 import io.activej.test.rules.ByteBufRule;
 import io.activej.test.rules.EventloopRule;
@@ -212,6 +213,54 @@ public final class QuicLossRecoveryTest {
 			}
 		}
 		assertEquals(List.of(), violations);
+	}
+
+	/**
+	 * A probe timeout re-sends data; it must not also leak the bytes of what it re-sent.
+	 * <p>
+	 * {@code requeueOldestUnacknowledged} removes a packet from its space, so nothing will ever
+	 * acknowledge that record and nothing else can subtract its bytes. Skipping the subtraction leaves
+	 * {@code bytesInFlight} counting a packet that no longer exists, once per probe — after a black-holed
+	 * interval the window reads as permanently full, and the connection stays blocked even after the path
+	 * comes back. The other three removal paths already do this; this one is the outlier.
+	 */
+	@Test
+	public void probeTimeoutsDoNotAccumulateBytesInFlight() throws Exception {
+		try (ManualEventloop loop = new ManualEventloop();
+			 QuicWirePair wire = new QuicWirePair()) {
+			wire.startClient(QuicConnectionSettings.builder()
+				.withMaxIdleTimeout(Duration.ofMinutes(10))
+				.withHandshakeTimeout(Duration.ofMinutes(10))
+				.build());
+			QuicConnection client = wire.client();
+			NewRenoCongestionController cc = client.congestion();
+			int datagramSize = QuicConnectionSettings.create().maxDatagramSize();
+
+			// The path vanishes after the client's first Initial. That Initial stays in flight and is never
+			// acknowledged, which is exactly the state a probe timeout exists for.
+			wire.clientWire().drain();
+			wire.clientWire().blackhole(true);
+			long inFlightBefore = cc.bytesInFlight();
+			assertTrue("nothing was in flight to probe for", inFlightBefore > 0);
+
+			// The probe timeout doubles each time (RFC 9002 §6.2.1), so six of them span about a minute of
+			// fixture time — reached by arithmetic, not by waiting.
+			for (long elapsed = 0; elapsed < 300_000 && client.probesSent() < 6; elapsed += 500) {
+				loop.advance(500);
+			}
+			assertTrue("the client stopped probing after " + client.probesSent(), client.probesSent() >= 6);
+			assertEquals("every probe should have re-sent data rather than a bare PING",
+				client.probesSent(), client.probeRetransmits());
+
+			// Each probe removes one packet and sends one in its place, so the figure stays flat — one
+			// datagram of slack covers the PING a probe may add alongside. Left unsubtracted it climbs by a
+			// packet per probe and never comes down, because nothing will ever acknowledge a record that
+			// was removed.
+			assertTrue("bytes in flight grew to " + cc.bytesInFlight() + " over " + client.probesSent() +
+					" probes, from " + inFlightBefore,
+				cc.bytesInFlight() <= inFlightBefore + datagramSize);
+			client.closeNow();
+		}
 	}
 
 	@Test

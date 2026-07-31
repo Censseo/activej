@@ -124,6 +124,15 @@ public final class QuicConnection extends AbstractReactive {
 	public static final int MAX_SURFACED_REASON_BYTES = 256;
 
 	/**
+	 * The payload room a client Initial must still have after its Retry token, or the Retry is ignored.
+	 * <p>
+	 * Any positive allowance is enough for the handshake to <i>progress</i>, but an allowance of a few
+	 * bytes would spend a packet's worth of header per byte of ClientHello. This is the point below which
+	 * accepting the token is worse than declining it.
+	 */
+	private static final int MIN_INITIAL_PAYLOAD = 256;
+
+	/**
 	 * The ACK frame's Ack Delay field is in microseconds shifted right by the sender's
 	 * {@code ack_delay_exponent} (RFC 9000 §19.3). We advertise the default exponent of 3, so one unit
 	 * is 8 microseconds and a millisecond is 125 units.
@@ -696,7 +705,21 @@ public final class QuicConnection extends AbstractReactive {
 				packetsDropped++;
 				return;
 			}
-			restartAfterRetry(serverScid, retry.retryToken());
+			byte[] token = retry.retryToken();
+			if (settings.maxDatagramSize()
+				- initialPacketOverhead(token.length, serverScid.length(), 4) < MIN_INITIAL_PAYLOAD) {
+				// RFC 9000 §17.2.5 bounds neither the token nor the Retry packet, so a server — or anyone
+				// who can forge one, since the integrity tag is computed from a published key — can send a
+				// token that leaves no room for the ClientHello it is supposed to accompany. Every
+				// subsequent Initial would then be built with a non-positive allowance and never sent, and
+				// the handshake would stall until its deadline. Ignoring the Retry is explicitly permitted
+				// (§17.2.5.2) and leaves the client retransmitting its original Initial.
+				packetsDropped++;
+				logger.debug("Discarding a Retry whose {}-byte token leaves no room for an Initial packet",
+					token.length);
+				return;
+			}
+			restartAfterRetry(serverScid, token);
 		} finally {
 			bytes.recycle();
 		}
@@ -970,6 +993,32 @@ public final class QuicConnection extends AbstractReactive {
 		}
 	}
 
+	/**
+	 * Runs a handler callback that has no way to report failure — everything on {@link QuicFrameHandler}
+	 * except {@code onFrame}, which throws and is handled by {@link #routeToHandler}.
+	 * <p>
+	 * These are invoked from the middle of transport bookkeeping: acknowledgement processing, loss
+	 * detection, the establishment transition, the final teardown. A {@link RuntimeException} escaping
+	 * one of them would reach the eventloop's fatal error handler — which is process-wide, so a single
+	 * buggy handler would take down every other connection on the endpoint — and would abandon the loop
+	 * it escaped from with buffers half-transferred. It is contained here instead, and only the
+	 * connection whose handler misbehaved is closed.
+	 * <p>
+	 * The close is deferred to the next reactor tick, deliberately: closing from inside an
+	 * acknowledgement loop would free the very packet records that loop is iterating.
+	 */
+	private void notifyHandler(String callback, Runnable body) {
+		try {
+			body.run();
+		} catch (RuntimeException e) {
+			// The exception itself is logged, never surfaced: it is the handler's, and may name anything.
+			logger.warn("{} the frame handler threw from {}; closing this connection", role, callback, e);
+			if (state.isTerminating()) return;
+			reactor.post(() -> closeWith(QuicTransportErrors.INTERNAL_ERROR,
+				"The frame handler failed in " + callback));
+		}
+	}
+
 	private static boolean isAckEliciting(List<QuicFrame> frames) {
 		for (QuicFrame frame : frames) {
 			if (!(frame instanceof PaddingFrame) && !(frame instanceof AckFrame)) {
@@ -1041,7 +1090,7 @@ public final class QuicConnection extends AbstractReactive {
 			for (QuicFrame frame : sent.frames) {
 				if (frameHandler != null && !isTransportOwnedFrame(frame)) {
 					// Ownership passes to the handler, which is why this is not also recycled here.
-					frameHandler.onFrameAcknowledged(this, frame);
+					notifyHandler("onFrameAcknowledged", () -> frameHandler.onFrameAcknowledged(this, frame));
 				} else {
 					Recyclers.recycle(frame);
 				}
@@ -1116,7 +1165,7 @@ public final class QuicConnection extends AbstractReactive {
 			if (frameHandler != null && !isTransportOwnedFrame(frame)) {
 				// The transport cannot know whether the handler's data still matters, so the decision — and
 				// ownership of the frame — is the handler's (FR-038).
-				frameHandler.onFrameLost(this, frame);
+				notifyHandler("onFrameLost", () -> frameHandler.onFrameLost(this, frame));
 				continue;
 			}
 			boolean retransmittable = levelKeys.accepts()
@@ -1266,7 +1315,7 @@ public final class QuicConnection extends AbstractReactive {
 		armKeepAliveTimer();
 		logger.debug("{} handshake complete, ALPN {}", role, negotiatedAlpn);
 		if (frameHandler != null) {
-			frameHandler.onEstablished(this);
+			notifyHandler("onEstablished", () -> frameHandler.onEstablished(this));
 		}
 		establishPromise.trySet(this);
 	}
@@ -1483,12 +1532,28 @@ public final class QuicConnection extends AbstractReactive {
 		if (level == EncryptionLevel.ONE_RTT) {
 			return 1 + peerConnectionId.length() + pnLength + PacketAssembler.AEAD_TAG_LENGTH;
 		}
+		if (level == EncryptionLevel.INITIAL) {
+			return initialPacketOverhead(retryToken.length, peerConnectionId.length(), pnLength);
+		}
 		return 1                                                     // first byte
 			+ 4                                                      // version
 			+ 1 + peerConnectionId.length()                          // DCID length + DCID
 			+ 1 + localConnectionId.length()                         // SCID length + SCID
-			+ (level == EncryptionLevel.INITIAL                      // Token Length varint + token
-				? QuicVarInts.encodedLength(retryToken.length) + retryToken.length : 0)
+			+ 4                                                      // Length varint, widest encoding
+			+ pnLength
+			+ PacketAssembler.AEAD_TAG_LENGTH;
+	}
+
+	/**
+	 * The same, for an Initial whose token and destination connection ID are not (yet) this connection's —
+	 * which is what lets a Retry be measured before it is adopted.
+	 */
+	private int initialPacketOverhead(int tokenLength, int peerCidLength, int pnLength) {
+		return 1                                                     // first byte
+			+ 4                                                      // version
+			+ 1 + peerCidLength                                      // DCID length + DCID
+			+ 1 + localConnectionId.length()                         // SCID length + SCID
+			+ QuicVarInts.encodedLength(tokenLength) + tokenLength   // Token Length varint + token
 			+ 4                                                      // Length varint, widest encoding
 			+ pnLength
 			+ PacketAssembler.AEAD_TAG_LENGTH;
@@ -1621,11 +1686,16 @@ public final class QuicConnection extends AbstractReactive {
 	 * Moves the retransmittable content of {@code space}'s oldest unacknowledged ack-eliciting packet
 	 * back onto its send queue, for a probe to carry.
 	 * <p>
-	 * Deliberately <b>not</b> counted as a loss: a probe timeout is not evidence that anything was lost
-	 * (RFC 9002 §6.2), and counting it would misreport the path and — once Phase 7 lands — halve a
-	 * congestion window for a packet that may still be in flight. The packet is removed from the space
-	 * because ownership of its frames passes to the queue; a duplicate arriving later is harmless, since
-	 * the receiver de-duplicates CRYPTO by offset.
+	 * Deliberately <b>not</b> counted as a loss <i>event</i>: a probe timeout is not evidence that anything
+	 * was lost (RFC 9002 §6.2), so no congestion event is raised and the window is not halved for a packet
+	 * that may still be in flight. The packet is removed from the space because ownership of its frames
+	 * passes to the queue; a duplicate arriving later is harmless, since the receiver de-duplicates CRYPTO
+	 * by offset.
+	 * <p>
+	 * Its bytes must nevertheless leave {@code bytesInFlight}, exactly as on the three other paths that
+	 * remove a packet from a space. Nothing will ever acknowledge a record that no longer exists, so
+	 * skipping this leaks in-flight bytes on every probe: after a black-holed interval the window reads as
+	 * permanently full, and the connection stays blocked once the path recovers.
 	 *
 	 * @return whether anything was re-queued
 	 */
@@ -1643,6 +1713,10 @@ public final class QuicConnection extends AbstractReactive {
 		SentPacket oldest = space.onPacketLost(oldestNumber);
 		if (oldest == null) return false;
 		probeRetransmits++;
+		if (oldest.inFlight) {
+			// Bytes only — onPacketsLost subtracts from bytesInFlight without raising a congestion event.
+			congestion.onPacketsLost(oldest.sizeInBytes);
+		}
 		requeueLost(oldest);
 		return sendQueue.hasPending(space.level());
 	}
@@ -2005,10 +2079,17 @@ public final class QuicConnection extends AbstractReactive {
 		if (state == QuicConnectionState.CLOSED) return;
 		state = QuicConnectionState.CLOSED;
 		if (frameHandler != null) {
-			frameHandler.onClosed(this);
+			// Already terminal, so notifyHandler's deferred close is a no-op — this only contains the throw.
+			notifyHandler("onClosed", () -> frameHandler.onClosed(this));
 		}
 		if (onClosed != null) {
-			onClosed.run();
+			try {
+				onClosed.run();
+			} catch (RuntimeException e) {
+				// The endpoint's unregister hook. Same reasoning as notifyHandler: this runs from a timer
+				// callback, and letting it escape would kill the reactor rather than one connection.
+				logger.warn("{} the onClosed hook threw", role, e);
+			}
 		}
 	}
 
@@ -2041,8 +2122,16 @@ public final class QuicConnection extends AbstractReactive {
 		long exponent = peerTransportParameters == null
 			? QuicTransportParameters.DEFAULT_ACK_DELAY_EXPONENT
 			: peerTransportParameters.ackDelayExponent();
-		// The exponent is validated at or below 20 (TransportParameterValidation), so this cannot overflow.
-		return (ackDelayField << exponent) / 1000;
+		// The exponent is validated at or below 20, but the Ack Delay field is a varint the peer chooses
+		// freely, so the shift overflows above 2^43 and would come back negative. Saturating instead: an
+		// absurd delay is clamped to an absurd delay, which the RTT estimator already discards, whereas a
+		// negative one would inflate an RTT sample and shrink every timer that derives from it.
+		int shift = (int) exponent;
+		long shifted = ackDelayField << shift;
+		if (shift > 0 && (shifted >> shift) != ackDelayField) {
+			shifted = Long.MAX_VALUE;
+		}
+		return shifted / 1000;
 	}
 
 	private static void recycleAll(List<QuicFrame> frames) {

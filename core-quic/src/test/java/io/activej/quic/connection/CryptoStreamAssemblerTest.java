@@ -169,6 +169,58 @@ public class CryptoStreamAssemblerTest {
 	}
 
 	@Test
+	public void aDeliveryThatFullyCoversABufferedChunkPurgesIt() throws Exception {
+		CryptoStreamAssembler a = assembler();
+		// Buffered out of order, and strictly inside what the next delivery will cover.
+		assertNull(a.add(10, buf("k".repeat(10))));
+		assertEquals(10, a.bufferedBytes());
+
+		ByteBuf out = a.add(0, buf("k".repeat(100)));
+		assertNotNull(out);
+		assertEquals(100, out.readRemaining());
+		out.recycle();
+
+		// The covered chunk adds nothing to the output, which is exactly why it is easy to forget: it
+		// must still be purged, recycled and returned to the bound.
+		assertEquals(100, a.readOffset());
+		assertEquals(0, a.bufferedBytes());
+		a.close();
+	}
+
+	@Test
+	public void repeatedCoveringRetransmissionsDoNotConsumeTheBound() throws Exception {
+		// RFC 9002 §6.5 retransmits CRYPTO data with fresh segmentation, so "small out-of-order chunk,
+		// then a larger retransmission covering it" repeats for as long as the path drops packets. If a
+		// covered chunk were left behind each time, the budget would run out and the connection would be
+		// closed with CRYPTO_BUFFER_EXCEEDED — for a peer that did nothing wrong.
+		CryptoStreamAssembler a = new CryptoStreamAssembler(256);
+		long offset = 0;
+		for (int i = 0; i < 100; i++) {
+			assertNull(a.add(offset + 8, buf("j".repeat(8))));
+			ByteBuf out = a.add(offset, buf("j".repeat(32)));
+			assertNotNull(out);
+			out.recycle();
+			offset += 32;
+			assertEquals(0, a.bufferedBytes());
+		}
+		assertEquals(100 * 32, a.readOffset());
+		a.close();
+	}
+
+	@Test
+	public void aDeliveryCoveringSomeChunksAndExtendedByAnotherIsStillExact() throws Exception {
+		CryptoStreamAssembler a = assembler();
+		assertNull(a.add(2, buf("cd")));    // fully covered by the delivery below
+		assertNull(a.add(4, buf("efgh")));  // extends past it
+		assertEquals(6, a.bufferedBytes());
+
+		assertEquals("abcdefgh", consume(a.add(0, buf("abcdef"))));
+		assertEquals(8, a.readOffset());
+		assertEquals(0, a.bufferedBytes());
+		a.close();
+	}
+
+	@Test
 	public void bufferedBytesBoundRaisesCryptoBufferExceeded() throws Exception {
 		CryptoStreamAssembler a = new CryptoStreamAssembler(64);
 		// Non-contiguous chunks accumulate: offset 100 onwards, nothing ever becomes deliverable.

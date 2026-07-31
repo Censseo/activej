@@ -20,6 +20,7 @@ import io.activej.bytebuf.ByteBuf;
 import io.activej.bytebuf.ByteBufPool;
 import io.activej.promise.Promise;
 import io.activej.quic.QuicConnectionId;
+import io.activej.quic.codec.QuicPackets;
 import io.activej.quic.connection.QuicConnection.Role;
 import io.activej.quic.connection.testutil.QuicEndpointFixture;
 import io.activej.test.rules.ActivePromisesRule;
@@ -161,6 +162,112 @@ public final class QuicEndpointDispatchTest {
 		assertEquals(droppedBefore + 1, server.datagramsDropped());
 		assertEquals(QuicConnectionState.ESTABLISHED, clientSide.state());
 		assertEquals(1, server.connectionCount());
+	}
+
+	/** A long-header datagram of {@code packetType} at {@code version}, padded past the §14.1 minimum. */
+	private static ByteBuf longHeaderDatagram(int packetType, long version) {
+		ByteBuf out = ByteBufPool.allocate(1500);
+		out.writeByte((byte) (0x80 | 0x40 | (packetType << 4)));
+		out.writeInt((int) version);
+		out.writeByte((byte) 8);
+		out.put(new byte[]{11, 22, 33, 44, 55, 66, 77, 88});   // DCID
+		out.writeByte((byte) 8);
+		out.put(new byte[]{1, 2, 3, 4, 5, 6, 7, 8});           // SCID
+		out.put(new byte[1200]);
+		return out;
+	}
+
+	private void sendToServer(ByteBuf datagram) {
+		fixture.network().send(new java.net.InetSocketAddress("127.0.0.1", 40999),
+			QuicEndpointFixture.SERVER_ADDRESS, datagram);
+		fixture.pump();
+	}
+
+	@Test
+	public void aVersionNegotiationPacketIsNeverAnsweredWithAVersionNegotiationPacket() {
+		long sentBefore = server.versionNegotiationsSent();
+
+		// Version 0 in a long header *is* a Version Negotiation packet. RFC 9000 §6.1 forbids answering
+		// one with another: two endpoints that both answered would trade them until something gave up,
+		// and a spoofed source address turns that into an exchange between two innocent parties.
+		sendToServer(longHeaderDatagram(0, 0));
+
+		assertEquals(sentBefore, server.versionNegotiationsSent());
+		assertEquals(0, server.connectionCount());
+	}
+
+	@Test
+	public void anUnsupportedVersionIsStillAnsweredWithVersionNegotiation() {
+		long sentBefore = server.versionNegotiationsSent();
+
+		// The counterpart to the test above: refusing version 0 must not have disabled the answer that
+		// RFC 9000 §6.1 does require. 0x1a2a3a4a is from the §15 "force negotiation" reserved pattern.
+		sendToServer(longHeaderDatagram(0, 0x1a2a3a4aL));
+
+		assertEquals(sentBefore + 1, server.versionNegotiationsSent());
+		assertEquals(0, server.connectionCount());
+	}
+
+	@Test
+	public void onlyAnInitialPacketMayCreateAConnection() {
+		// RFC 9000 §7.2. A Handshake (type 2) or 0-RTT (type 1) packet whose DCID matched nothing belongs
+		// to a connection that no longer exists; building a TLS engine and a key schedule for it would
+		// fail on its first frame, having already spent what an attacker wanted us to spend.
+		for (int packetType : new int[]{1, 2, 3}) {
+			long droppedBefore = server.datagramsDropped();
+			sendToServer(longHeaderDatagram(packetType, QuicPackets.SUPPORTED_VERSION));
+
+			assertEquals("packet type " + packetType + " created a connection", 0, server.connectionCount());
+			assertEquals(droppedBefore + 1, server.datagramsDropped());
+		}
+		assertEquals(0, server.connectionsAccepted());
+	}
+
+	@Test
+	public void anInitialReusingALiveConnectionsIdIsRefusedRatherThanDisplacingIt() {
+		Promise<QuicConnection> connecting = connect();
+		fixture.pump();
+		QuicConnection clientSide = connecting.getResult();
+		QuicConnectionId liveId = clientSide.peerConnectionId();
+		QuicConnection serverSide = server.connectionOf(liveId);
+		assertNotNull(serverSide);
+		int entriesBefore = server.routingEntryCount();
+
+		// The DCID of a client Initial is a value the client invents, so anyone can name a connection that
+		// already exists. Overwriting the routing entry would make the live connection unreachable — a
+		// denial of service costing one datagram.
+		ByteBuf collision = ByteBufPool.allocate(1500);
+		collision.writeByte((byte) 0xC0);
+		collision.writeInt((int) QuicPackets.SUPPORTED_VERSION);
+		byte[] dcid = liveId.bytes();
+		collision.writeByte((byte) dcid.length);
+		collision.put(dcid);
+		collision.writeByte((byte) 8);
+		collision.put(new byte[]{9, 8, 7, 6, 5, 4, 3, 2});
+		collision.put(new byte[1200]);
+		sendToServer(collision);
+
+		assertSame(serverSide, server.connectionOf(liveId));
+		assertEquals(entriesBefore, server.routingEntryCount());
+		assertEquals(QuicConnectionState.ESTABLISHED, clientSide.state());
+	}
+
+	@Test
+	public void closingTheEndpointLetsEveryConnectionSayWhyItIsGoing() {
+		Promise<QuicConnection> connecting = connect();
+		fixture.pump();
+		QuicConnection clientSide = connecting.getResult();
+		assertEquals(QuicConnectionState.ESTABLISHED, clientSide.state());
+
+		server.close();
+		fixture.pump();
+
+		// The javadoc promises each connection "the chance to put a CONNECTION_CLOSE on the wire while the
+		// socket is still open". Marking the endpoint closed first would have made sendDatagram recycle
+		// every one of them in silence, and the client would have waited out a 30-second idle timeout to
+		// learn what it can be told in one datagram.
+		assertNotNull("the client was never told the server closed", clientSide.peerClose());
+		assertEquals(QuicConnectionState.DRAINING, clientSide.state());
 	}
 
 	@Test

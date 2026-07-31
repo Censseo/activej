@@ -167,24 +167,29 @@ public final class CryptoStreamAssembler {
 	private ByteBuf deliverFrom(long offset, ByteBuf data) {
 		long end = offset + data.readRemaining();
 
+		if (pending.isEmpty() || pending.firstKey() > end) {
+			// Fast path: in-order arrival with nothing buffered that this delivery touches. No allocation,
+			// no copy — the overwhelmingly common case. `data` is not in `pending`, so returning it is safe.
+			//
+			// The guard is on the *first* buffered offset, not on whether anything extends the run: a chunk
+			// entirely covered by this delivery adds no bytes to the output, but it must still be purged and
+			// its bytes returned to the bound. RFC 9002 §6.5 retransmits CRYPTO data with fresh segmentation,
+			// so "small out-of-order chunk, then a larger retransmission covering it" is a routine sequence —
+			// leaving those chunks behind would consume the buffer budget permanently and eventually close an
+			// innocent peer's connection with CRYPTO_BUFFER_EXCEEDED.
+			readOffset = end;
+			return data;
+		}
+
 		// Determine the full contiguous run so the output can be sized once.
 		long runEnd = end;
-		int extra = 0;
 		for (Map.Entry<Long, ByteBuf> entry : pending.entrySet()) {
 			long chunkOffset = entry.getKey();
 			if (chunkOffset > runEnd) break;
 			long chunkEnd = chunkOffset + entry.getValue().readRemaining();
 			if (chunkEnd > runEnd) {
-				extra += (int) (chunkEnd - runEnd);
 				runEnd = chunkEnd;
 			}
-		}
-
-		if (extra == 0) {
-			// Fast path: in-order arrival with nothing buffered to merge. No allocation, no copy —
-			// the overwhelmingly common case. `data` is not in `pending`, so returning it is safe.
-			readOffset = end;
-			return data;
 		}
 
 		ByteBuf out = ByteBufPool.allocate((int) (runEnd - offset));

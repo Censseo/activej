@@ -81,6 +81,9 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 	public static final int MAX_HANDSHAKING_CONNECTIONS =
 		ApplicationSettings.getInt(QuicEndpoint.class, "maxHandshakingConnections", 1_000);
 
+	/** RFC 9000 §17.2.1: version 0 in a long header identifies a Version Negotiation packet. */
+	private static final long VERSION_NEGOTIATION = 0;
+
 	private final IUdpSocket socket;
 	private final QuicConnectionSettings settings;
 	private final @Nullable TlsEngineFactory serverEngineFactory;
@@ -93,6 +96,8 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 	 * DCID the client invented (which the client keeps using until it sees our chosen one) and our own.
 	 */
 	private final Map<QuicConnectionId, QuicConnection> byConnectionId = new HashMap<>();
+	/** The reverse of {@code byConnectionId}, so unregistering a connection does not scan every entry. */
+	private final Map<QuicConnection, List<QuicConnectionId>> routedIds = new IdentityHashMap<>();
 	private final Set<QuicConnection> connections = new LinkedHashSet<>();
 	private final Set<QuicConnection> handshaking = new LinkedHashSet<>();
 
@@ -243,16 +248,22 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 	public void close() {
 		checkInReactorThread(this);
 		if (closed) return;
-		closed = true;
+		// `closed` is set *after* the loop, not before: sendDatagram drops everything once it is set, so
+		// setting it first would silently recycle the very CONNECTION_CLOSE frames this method exists to
+		// let out, and peers would learn of the shutdown only from their idle timeout. Re-entrancy is
+		// still guarded — closeNow cannot reach close(), and the flag is set before the socket goes.
+		//
 		// A copy: closing a connection fires its onClosed hook, which mutates these collections.
 		// closeNow rather than close: the socket is about to go, so no CONNECTION_CLOSE re-send could be
 		// delivered anyway, and a closing period would hold buffers past the endpoint's own lifetime.
 		for (QuicConnection connection : new ArrayList<>(connections)) {
 			connection.closeNow();
 		}
+		closed = true;
 		connections.clear();
 		handshaking.clear();
 		byConnectionId.clear();
+		routedIds.clear();
 		socket.close();
 	}
 
@@ -308,12 +319,29 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 			return;
 		}
 		if (envelope.version() != QuicPackets.SUPPORTED_VERSION) {
-			sendVersionNegotiation(from, envelope);
+			// RFC 9000 §6.1 MUST NOT: version 0 *is* a Version Negotiation packet, and answering one with
+			// another is how two endpoints turn a spoofed datagram into an unbounded exchange between them.
+			if (envelope.version() != VERSION_NEGOTIATION) {
+				sendVersionNegotiation(from, envelope);
+			}
+			drop(datagram);
+			return;
+		}
+		if (!envelope.isInitial()) {
+			// RFC 9000 §7.2: only an Initial packet starts a connection. A Handshake or 0-RTT packet whose
+			// DCID matched nothing belongs to a connection that is already gone — building a TLS engine and
+			// a key schedule for it would fail on the first frame, having spent the cost an attacker wanted.
 			drop(datagram);
 			return;
 		}
 		QuicConnectionId clientScid = envelope.sourceConnectionId();
 		if (clientScid == null) {
+			drop(datagram);
+			return;
+		}
+		if (byConnectionId.containsKey(envelope.destinationConnectionId())) {
+			// The DCID of a client Initial is a value the client invented, so it can name a connection that
+			// already exists. Accepting would displace that connection's routing entry; see register.
 			drop(datagram);
 			return;
 		}
@@ -336,8 +364,16 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 
 		// Reachable under both: the client keeps addressing the DCID it invented until it has seen our
 		// chosen connection ID (RFC 9000 §7.2), and its Initial retransmissions will still carry it.
-		register(envelope.destinationConnectionId(), connection);
-		register(connection.localConnectionId(), connection);
+		if (!register(envelope.destinationConnectionId(), connection)
+			|| !register(connection.localConnectionId(), connection)) {
+			// Only reachable if our own SecureRandom repeated an 8-byte ID; the client's DCID was checked
+			// above. Handled anyway, because a half-populated routing table is worse than a dropped
+			// datagram. Unwinding is by connection, never by ID: an ID that collided names somebody else.
+			// The connection was never started, so it holds no timer and no buffer.
+			unregisterAll(connection);
+			drop(datagram);
+			return;
+		}
 		connections.add(connection);
 		handshaking.add(connection);
 		connectionsAccepted++;
@@ -376,15 +412,47 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 		sendDatagram(to, out);
 	}
 
-	private void register(QuicConnectionId connectionId, QuicConnection connection) {
-		byConnectionId.put(connectionId, connection);
+	/**
+	 * Adds a routing entry, <b>refusing</b> to displace an existing one.
+	 * <p>
+	 * One of the two IDs a server connection answers to is the Destination Connection ID the client
+	 * invented, so it is entirely peer-controlled. Overwriting on collision would let anyone who can
+	 * guess or observe a live connection's ID make it unroutable by opening a new connection under it —
+	 * a denial of service costing one datagram. Refusing costs the colliding newcomer instead.
+	 *
+	 * @return {@code false} when the ID already routes elsewhere and nothing was registered
+	 */
+	private boolean register(QuicConnectionId connectionId, QuicConnection connection) {
+		QuicConnection existing = byConnectionId.putIfAbsent(connectionId, connection);
+		if (existing == connection) return true;
+		if (existing != null) {
+			logger.debug("Refusing to route a connection ID that is already in use");
+			return false;
+		}
+		routedIds.computeIfAbsent(connection, $ -> new ArrayList<>(2)).add(connectionId);
+		return true;
 	}
 
-	/** Removes every routing entry pointing at the connection registered under {@code anyOfItsIds}. */
+	/**
+	 * Removes every routing entry pointing at the connection registered under {@code anyOfItsIds}.
+	 * <p>
+	 * The IDs are looked up rather than found by scanning {@code byConnectionId}: a scan is O(all live
+	 * connections) per close, which turns shutting down a full endpoint into a quadratic sweep.
+	 */
 	private void unregister(QuicConnectionId anyOfItsIds) {
 		QuicConnection connection = byConnectionId.get(anyOfItsIds);
 		if (connection == null) return;
-		byConnectionId.values().removeIf(registered -> registered == connection);
+		unregisterAll(connection);
+	}
+
+	/** Removes {@code connection} and every routing entry it owns — and only the entries it owns. */
+	private void unregisterAll(QuicConnection connection) {
+		List<QuicConnectionId> ids = routedIds.remove(connection);
+		if (ids != null) {
+			for (QuicConnectionId id : ids) {
+				byConnectionId.remove(id);
+			}
+		}
 		connections.remove(connection);
 		handshaking.remove(connection);
 	}
@@ -483,13 +551,13 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 		return connectionsAccepted;
 	}
 
-	/** Inbound attempts refused at {@link #MAX_CONNECTIONS} or {@link #MAX_HANDSHAKING_CONNECTIONS}. */
 	/** Version Negotiation packets emitted for unsupported versions (RFC 9000 §6.1). */
 	public long versionNegotiationsSent() {
 		checkInReactorThread(this);
 		return versionNegotiationsSent;
 	}
 
+	/** Inbound attempts refused at {@link #MAX_CONNECTIONS} or {@link #MAX_HANDSHAKING_CONNECTIONS}. */
 	public long connectionsRejected() {
 		checkInReactorThread(this);
 		return connectionsRejected;

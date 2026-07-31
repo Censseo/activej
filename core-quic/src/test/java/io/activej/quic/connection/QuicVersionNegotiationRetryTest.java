@@ -261,6 +261,43 @@ public final class QuicVersionNegotiationRetryTest {
 	}
 
 	@Test
+	public void scenario4_aRetryWhoseTokenLeavesNoRoomForAnInitialIsDiscarded() {
+		QuicConnection client = clientAfterInitial();
+		QuicConnectionId serverScid = QuicConnectionId.of(new byte[]{5, 5, 5, 5, 5, 5, 5, 5});
+		QuicConnectionId before = client.peerConnectionId();
+		long droppedBefore = client.packetsDropped();
+		int sentBefore = wire.clientWire().datagramsAccepted();
+
+		// RFC 9000 §17.2.5 bounds neither the token nor the Retry packet. A token that fills the datagram
+		// leaves a non-positive payload allowance in every subsequent Initial, so the client would build
+		// no packet at all and stall silently until its handshake deadline. The tag verifies — this is a
+		// server, or anything on the path, that is merely being unreasonable rather than forging.
+		byte[] hugeToken = new byte[QuicConnectionSettings.create().maxDatagramSize()];
+		client.onDatagram(validRetry(client, serverScid, hugeToken));
+
+		assertEquals(before, client.peerConnectionId());
+		assertEquals(QuicConnectionState.HANDSHAKING, client.state());
+		assertTrue(client.packetsDropped() > droppedBefore);
+		assertEquals("a discarded Retry must not provoke a re-send", sentBefore,
+			wire.clientWire().datagramsAccepted());
+	}
+
+	@Test
+	public void aRetryWithATokenThatStillLeavesWorkingRoomIsAccepted() {
+		QuicConnection client = clientAfterInitial();
+		QuicConnectionId serverScid = QuicConnectionId.of(new byte[]{6, 6, 6, 6, 6, 6, 6, 6});
+
+		// The other side of the bound: real servers issue tokens of a few dozen to a couple of hundred
+		// bytes, and none of those may be refused.
+		client.onDatagram(validRetry(client, serverScid, new byte[128]));
+
+		assertEquals(serverScid, client.peerConnectionId());
+		ByteBuf resent = wire.clientWire().poll();
+		assertNotNull("the client did not re-send its Initial", resent);
+		resent.recycle();
+	}
+
+	@Test
 	public void aRetryArrivingAfterAServerInitialIsDiscarded() throws Exception {
 		// A Retry may only precede the server's first Initial (RFC 9000 §17.2.5.2). By the time a real
 		// server packet has been processed, a Retry can only be an attempt to reset a live handshake.

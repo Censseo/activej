@@ -191,6 +191,36 @@ public class PacketNumberSpaceTest {
 	}
 
 	@Test
+	public void ackOnlyPacketsAreNotTrackedButStillAdvanceLargestSent() {
+		PacketNumberSpace space = space();
+		SentPacket pureAck = sent(space, 100, false);
+		space.onPacketSent(pureAck);
+
+		// Not tracked: an ACK is never retransmitted, gives no usable RTT sample and is not in flight, so
+		// keeping the record would only let a peer that never acknowledges anything grow the map without
+		// bound — ACK-only packets being the part congestion control does not limit.
+		assertEquals(0, space.outstandingCount());
+		assertNull(space.sentPacket(pureAck.packetNumber));
+
+		// But the number was spent, and a peer acknowledging it is not lying.
+		assertEquals(pureAck.packetNumber, space.largestSent());
+	}
+
+	@Test
+	public void aPeerMayAcknowledgeAnAckOnlyPacketWeSent() throws Exception {
+		PacketNumberSpace space = space();
+		space.onPacketSent(sent(space, 100, false));
+		SentPacket data = sent(space, 100, true);
+		space.onPacketSent(data);
+
+		// Both numbers are covered. Neither may be rejected as "never sent", and the untracked one simply
+		// resolves to no record.
+		space.onAckReceived(data.packetNumber);
+		assertNull(space.onPacketAcked(data.packetNumber - 1));
+		assertNotNull(space.onPacketAcked(data.packetNumber));
+	}
+
+	@Test
 	public void duplicateAckOfTheSamePacketIsNotAnError() {
 		PacketNumberSpace space = space();
 		SentPacket a = sent(space, 100, true);
