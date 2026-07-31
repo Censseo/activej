@@ -67,6 +67,52 @@ explicitly.
 
 ### Notable additions
 
+- **QUIC connection layer.** A new `io.activej.quic.connection` package in
+  `core-quic` turns the wire codec and the TLS engines into a working transport:
+  `QuicConnection` (the reactor-confined state machine — handshake, ACK
+  scheduling, RFC 9002 loss detection and probe timeouts, NewReno congestion
+  control, RFC 9000 §10 termination, Version Negotiation and Retry) and
+  `QuicEndpoint` (many connections over one UDP socket, dispatched by
+  destination connection ID). `QuicFrameHandler` is the extension point for the
+  layer above; the transport keeps PADDING, PING, ACK, CRYPTO,
+  CONNECTION_CLOSE and HANDSHAKE_DONE for itself. This is the first
+  reactor-facing surface in `core-quic`, and the module's first dependency on
+  `activej-net`.
+
+  Diagnostics come in two forms, neither of which pulls in a JMX dependency:
+  plain counter accessors, and an optional `Inspector` hook on both
+  `QuicConnection` (packet sent/received/lost, RTT metrics, congestion-state
+  change, connection-state transition) and `QuicEndpoint` (datagram
+  received/dropped, connection created/refused), following the
+  `UdpSocket.Inspector` precedent in `core-net`. Both default to none;
+  `QuicEndpoint.Builder.withConnectionInspector` gives one to every connection
+  the endpoint creates, which is the only way to reach an accepted server
+  connection. The same events are logged at debug level under the qlog event
+  vocabulary (`transport:packet_sent`, `transport:packet_received`,
+  `recovery:packet_lost`, `recovery:metrics_updated`,
+  `recovery:congestion_state_updated`); no log line carries key material or
+  frame payloads.
+
+  Every limit is an `ApplicationSettings` key resolved from
+  `io.activej.quic.connection.QuicConnection.<setting>` (or
+  `QuicConnection.<setting>`), except the two endpoint bounds, which resolve
+  from `QuicEndpoint`:
+
+  | Setting | Default | What it bounds |
+  |---|---|---|
+  | `maxDatagramSize` | `1350` bytes | the largest UDP payload sent; must be 1200–65527 (RFC 9000 §14.1) |
+  | `maxIdleTimeout` | `30s` | silence before a connection is discarded; `0` disables, and the effective value is floored at 3 × PTO |
+  | `handshakeTimeout` | `10s` | time for the handshake to complete before the connection is abandoned |
+  | `maxAckRanges` | `32` | ACK ranges tracked per packet number space; the oldest are dropped past it |
+  | `maxCryptoBufferBytes` | `64kb` | out-of-order CRYPTO data held per level; exceeding it closes with `CRYPTO_BUFFER_EXCEEDED` |
+  | `maxSendQueueBytes` | `1mb` | queued outgoing frame bytes; exceeding it fails the enqueue with `INTERNAL_ERROR` |
+  | `initialCongestionWindow` | RFC 9002 §7.2 formula | the starting congestion window; must be at least 2 × `maxDatagramSize` |
+  | `maxBufferedDatagramsAwaitingKeys` | `4` | packets held for keys not yet installed; the oldest is dropped past it |
+  | `connectionIdLength` | `8` bytes | the length of connection IDs this endpoint issues |
+  | `keepAliveInterval` | unset | opt-in keep-alive PING; refused at `build()` above half `maxIdleTimeout` |
+  | `QuicEndpoint.maxConnections` | `10000` | live connections per endpoint; new inbound attempts are dropped past it |
+  | `QuicEndpoint.maxHandshakingConnections` | `1000` | connections still handshaking — a much smaller bound, because a half-open connection costs a TLS engine for an unvalidated peer |
+
 - **QUIC TLS 1.3 handshake engine.** A new `io.activej.quic.tls` package in
   `core-quic` implements the TLS 1.3 handshake over the QUIC transport (RFC 8446
   with RFC 9001 profile): `TlsClientEngine`/`TlsServerEngine`, message codec,
