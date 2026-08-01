@@ -123,6 +123,43 @@ explicitly.
 
 ### Notable additions
 
+- **HTTP/3 core, foundations.** A new leaf module `core-http3` (`activej-http3`,
+  package `io.activej.http3`) begins RFC 9114 HTTP/3 with static-table RFC 9204
+  QPACK, sitting above both `core-http` and `core-quic`. This entry covers the
+  module skeleton and the two additive `core-http` changes; the transport and
+  QPACK codec follow in subsequent entries as the feature completes.
+
+  Exactly two additive changes to `core-http`, and nothing else — no behaviour
+  change, no signature change to any existing method, no trailers API:
+  - `HttpVersion` gains `HTTP_3_0` (`HTTP_2_0` already existed and was never
+    produced, so the enum was already ahead of the implementation).
+  - A new `@ExposedInternals` `HttpMessages` (`io.activej.http.HttpMessages`)
+    lets an alternative HTTP transport construct an `HttpRequest`/`HttpResponse`
+    with an explicit `HttpVersion` — the existing version-carrying constructors
+    are package-private and every public factory hardcodes `HTTP_1_1`. Reaching
+    them from `HttpMessages` required loosening `HttpRequest.Builder()` and
+    `HttpResponse.Builder()` from `private` to package-private (an
+    accessibility change only — no parameter list changed on any method).
+
+  `Http3Settings` carries the feature's tunable limits, every field an
+  `ApplicationSettings` key resolved from
+  `io.activej.http3.Http3Settings.<setting>` (or `Http3Settings.<setting>`):
+
+  | Setting | Default | What it bounds |
+  |---|---|---|
+  | `maxFieldSectionSize` | `64kb` | RFC 9114 §4.2.2 accounted field-section size, checked on decoded output |
+  | `maxBodySize` | `100mb` | total DATA payload per message |
+  | `maxControlFrameSize` | `16kb` | SETTINGS / GOAWAY / control-stream frames |
+  | `maxConcurrentRequestStreams` | `100` | advertised as the QUIC bidirectional-stream transport parameter |
+  | `maxUniStreams` | `3` (fixed, not a builder field) | advertised `initial_max_streams_uni` — control + both QPACK streams, nothing more (FR-017) |
+  | `maxConnections` | `256` | `Http3Client` pool size; the least-recently-used idle connection is evicted past it |
+  | `maxQueuedRequests` | `100` | requests waiting for stream credit; overflow fails immediately, retryably |
+  | `requestTimeout` | `60s` | per request on both sides, queued time included |
+
+  `Http3Errors`/`Http3Exception` carry the RFC 9114 §8.1 and RFC 9204 §6
+  application error codes — a third axis alongside `HttpError` (status code)
+  and `QuicTransportException` (RFC 9000 §20 transport code).
+
 - **QUIC connection layer.** A new `io.activej.quic.connection` package in
   `core-quic` turns the wire codec and the TLS engines into a working transport:
   `QuicConnection` (the reactor-confined state machine — handshake, ACK
