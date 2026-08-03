@@ -25,7 +25,9 @@ import io.activej.http.HttpRequest;
 import io.activej.http.HttpResponse;
 import io.activej.http.HttpVersion;
 import io.activej.http.Protocol;
+import io.activej.http3.qpack.QpackField;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -69,6 +71,13 @@ public final class Http3Headers {
 	private static final String PATH = ":path";
 	private static final String STATUS = ":status";
 
+	/**
+	 * The RFC 9220 extended-CONNECT pseudo-header — what turns a CONNECT into a WebSocket handshake or
+	 * another tunnelled protocol. Out of scope (FR-040), and named here so that it can be refused as the
+	 * unsupported <i>capability</i> it is rather than falling through to "unknown pseudo-header".
+	 */
+	private static final String PROTOCOL = ":protocol";
+
 	private static final Set<String> REQUEST_PSEUDO_HEADERS = Set.of(METHOD, SCHEME, AUTHORITY, PATH);
 	private static final Set<String> RESPONSE_PSEUDO_HEADERS = Set.of(STATUS);
 
@@ -100,11 +109,16 @@ public final class Http3Headers {
 	 * onto a {@code Host} header, matching the shape a server-parsed HTTP/1.1 request already has
 	 * ({@code core-http}'s {@code HttpUtils.getFullUri} reads {@code Host} for exactly this case),
 	 * so an {@link io.activej.http.AsyncServlet} sees an equivalent request either way.
+	 * <p>
+	 * CONNECT, and any request carrying RFC 9220's {@code :protocol} pseudo-header, is refused here with
+	 * {@code H3_REQUEST_REJECTED} — see {@link #requestRejected} for why that code and not the usual one
+	 * (FR-040).
 	 *
 	 * @throws Http3Exception {@code H3_MESSAGE_ERROR} on any validation failure, a missing
 	 *                        required pseudo-header, an unknown {@code :method}, or a
 	 *                        {@code :scheme}/{@code :authority}/{@code :path} combination that
-	 *                        does not form a valid request target
+	 *                        does not form a valid request target; {@code H3_REQUEST_REJECTED} on a
+	 *                        CONNECT request or an {@code :protocol} pseudo-header
 	 */
 	public static HttpRequest.Builder toRequestBuilder(List<Field> fields) throws Http3Exception {
 		List<Field> regular = new ArrayList<>();
@@ -122,6 +136,11 @@ public final class Http3Headers {
 			method = HttpMethod.valueOf(methodValue);
 		} catch (IllegalArgumentException e) {
 			throw messageError("Unknown :method value");
+		}
+		if (method == HttpMethod.CONNECT) {
+			// FR-040: CONNECT is a tunnel, and this implementation has none to offer. Refused whole rather
+			// than partially handled, and refused as unsupported rather than as malformed.
+			throw requestRejected("The CONNECT method is not supported over HTTP/3");
 		}
 
 		String authority = pseudo.get(AUTHORITY);
@@ -171,10 +190,12 @@ public final class Http3Headers {
 		try {
 			code = Integer.parseInt(statusValue);
 		} catch (NumberFormatException e) {
-			throw messageError("Non-numeric :status value: " + statusValue);
+			// FR-063: the rule that was violated, never the value that violated it — a peer chose this
+			// string, and a caller logging the exception would publish it. Same shape as ":method" above.
+			throw messageError("Non-numeric :status value");
 		}
 		if (code < 100 || code >= 600) {
-			throw messageError("Out-of-range :status value: " + statusValue);
+			throw messageError("Out-of-range :status value");
 		}
 
 		HttpResponse.Builder builder = HttpMessages.responseBuilder(HttpVersion.HTTP_3_0, code);
@@ -184,6 +205,13 @@ public final class Http3Headers {
 		return builder;
 	}
 
+	/**
+	 * FR-063 note for everything that throws below: a field <b>name</b> is peer-supplied bytes on the
+	 * QPACK path just as a value is, so a reason never interpolates one either — except where the name
+	 * is provably a member of a closed set of compile-time constants by the time it is named
+	 * ({@link #CONNECTION_SPECIFIC_FIELDS}, and the already-matched pseudo-header of the duplicate
+	 * check), which carries no peer bytes at all.
+	 */
 	private static Map<String, String> collectAndValidate(List<Field> fields, Mode mode, List<Field> regularOut) throws Http3Exception {
 		Map<String, String> pseudo = new LinkedHashMap<>();
 		boolean seenRegular = false;
@@ -192,15 +220,22 @@ public final class Http3Headers {
 			validateFieldName(name);
 			if (!name.isEmpty() && name.charAt(0) == ':') {
 				if (mode == Mode.TRAILERS) {
-					throw messageError("Pseudo-header in a trailer section: " + name);
+					throw messageError("Pseudo-header in a trailer section");
 				}
 				if (seenRegular) {
-					throw messageError("Pseudo-header after a regular field: " + name);
+					throw messageError("Pseudo-header after a regular field");
+				}
+				if (mode == Mode.REQUEST && name.equals(PROTOCOL)) {
+					// FR-040, ahead of the unknown-pseudo-header rule below: the field list is well formed,
+					// and what it asks for is a capability this implementation does not have.
+					throw requestRejected("Extended CONNECT (the :protocol pseudo-header, RFC 9220) is not supported");
 				}
 				Set<String> allowed = mode == Mode.REQUEST ? REQUEST_PSEUDO_HEADERS : RESPONSE_PSEUDO_HEADERS;
 				if (!allowed.contains(name)) {
-					throw messageError("Unknown pseudo-header: " + name);
+					throw messageError("Unknown pseudo-header");
 				}
+				// Past the check above, `name` is one of REQUEST_PSEUDO_HEADERS/RESPONSE_PSEUDO_HEADERS —
+				// a constant of this class, not anything the peer chose, so naming it leaks nothing.
 				if (pseudo.containsKey(name)) {
 					throw messageError("Duplicated pseudo-header: " + name);
 				}
@@ -230,10 +265,13 @@ public final class Http3Headers {
 		for (int i = start; i < name.length(); i++) {
 			char c = name.charAt(i);
 			if (c >= 'A' && c <= 'Z') {
-				throw messageError("Uppercase octet in a field name: " + name);
+				throw messageError("Uppercase octet in a field name");
 			}
 			if (!isLowerTchar(c)) {
-				throw messageError("Illegal octet in a field name: " + name);
+				// FR-063, and the sharpest case of it in this file: an illegal octet is by definition
+				// outside the token set, so echoing the name here would put a control character (a
+				// newline, most of all) the peer chose straight into a log line.
+				throw messageError("Illegal octet in a field name");
 			}
 		}
 	}
@@ -250,6 +288,19 @@ public final class Http3Headers {
 
 	private static Http3Exception messageError(String detail) {
 		return new Http3Exception(Http3Errors.H3_MESSAGE_ERROR, detail);
+	}
+
+	/**
+	 * FR-040: a well-formed request asking for a capability this implementation does not have — CONNECT,
+	 * or RFC 9220's extended CONNECT.
+	 * <p>
+	 * {@code H3_REQUEST_REJECTED} rather than the {@code H3_MESSAGE_ERROR} every other rejection here
+	 * uses, and the difference is what the peer is being told: nothing is <i>wrong</i> with the message,
+	 * so it was not processed and re-issuing it against an endpoint that does support the capability is
+	 * safe. {@link Http3Exception} marks that code retryable of its own accord.
+	 */
+	private static Http3Exception requestRejected(String detail) {
+		return new Http3Exception(Http3Errors.H3_REQUEST_REJECTED, detail);
 	}
 
 	// endregion
@@ -296,6 +347,89 @@ public final class Http3Headers {
 			fields.add(new Field(name.toLowerCase(Locale.ROOT), entry.getValue().toString()));
 		}
 		return fields;
+	}
+
+	// endregion
+
+	// region QPACK adaptation
+
+	/**
+	 * Adapts what a {@link io.activej.http3.qpack.QpackDecoder} produces into the {@link Field} list
+	 * this class validates and maps. Field values are ISO-8859-1, the octet-per-character encoding
+	 * {@code core-http} already reads header bytes as, so the round trip is byte-exact.
+	 * <p>
+	 * <b>Field-name case is checked here, against what the peer actually sent, before anything
+	 * normalizes it</b> — RFC 9114 §4.1.1/FR-034, and a check run after normalization can never fire.
+	 * <p>
+	 * A {@link QpackField} carries an <i>interned</i> {@link HttpHeader}, and {@code core-http}'s
+	 * registry is case-insensitive: for a name it has <i>registered</i> it hands back its own
+	 * canonically-cased token — a {@code content-length} field line, however it was encoded, comes back
+	 * out of the decoder as {@code Content-Length} — while for every other name it builds a fresh token
+	 * holding the received bytes verbatim. {@link #isCanonicalizedByInterning} tells those two apart, so
+	 * the uppercase rule is enforced exactly where the received case survived: every literal name
+	 * outside that registry, pseudo-headers included.
+	 * <p>
+	 * <b>Residual gap, stated plainly</b>: an uppercase spelling of one of the names {@link HttpHeaders}
+	 * pre-registers is still normalized rather than rejected, because past interning it is genuinely not
+	 * observable. Closing that needs the raw name bytes, which only {@code QpackStaticDecoder} sees.
+	 *
+	 * @throws Http3Exception {@code H3_MESSAGE_ERROR} if a decoded field name is empty, carries an
+	 *                        uppercase octet the peer itself chose, or carries an octet outside RFC
+	 *                        9110's {@code tchar} set
+	 */
+	public static List<Field> fromQpack(List<QpackField> fields) throws Http3Exception {
+		List<Field> result = new ArrayList<>(fields.size());
+		for (QpackField field : fields) {
+			result.add(new Field(
+				decodedFieldName(field.name()),
+				new String(field.value(), StandardCharsets.ISO_8859_1)));
+		}
+		return result;
+	}
+
+	/**
+	 * The lowercase name of {@code header}, having enforced RFC 9114 §4.1.1 against whatever of the
+	 * peer's own spelling survived interning.
+	 */
+	private static String decodedFieldName(HttpHeader header) throws Http3Exception {
+		String name = header.toString();
+		if (!hasUppercase(name)) {
+			// Nothing was normalized away — these are the peer's octets, so the full check applies.
+			validateFieldName(name);
+			return name;
+		}
+		if (!isCanonicalizedByInterning(header)) {
+			throw messageError("Uppercase octet in a field name");
+		}
+		return name.toLowerCase(Locale.ROOT);
+	}
+
+	private static boolean hasUppercase(String name) {
+		for (int i = 0; i < name.length(); i++) {
+			char c = name.charAt(i);
+			if (c >= 'A' && c <= 'Z') return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Whether {@code header} is the token {@code core-http}'s registry holds for its name rather than one
+	 * built out of received bytes — i.e. whether interning replaced the peer's spelling with the
+	 * registry's own. {@link HttpHeaders#of(String)} returns the registered singleton for any
+	 * case-insensitive match and a fresh instance for everything else, so reference identity <i>is</i>
+	 * that question.
+	 */
+	private static boolean isCanonicalizedByInterning(HttpHeader header) {
+		return HttpHeaders.of(header.toString()) == header;
+	}
+
+	/** The inverse of {@link #fromQpack}, for a field list on its way to a HEADERS frame. */
+	public static List<QpackField> toQpack(List<Field> fields) {
+		List<QpackField> result = new ArrayList<>(fields.size());
+		for (Field field : fields) {
+			result.add(new QpackField(HttpHeaders.of(field.name()), field.value().getBytes(StandardCharsets.ISO_8859_1)));
+		}
+		return result;
 	}
 
 	// endregion

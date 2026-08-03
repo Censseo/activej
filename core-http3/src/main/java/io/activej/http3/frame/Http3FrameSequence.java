@@ -31,20 +31,39 @@ import java.util.Set;
  * This class decides only whether a frame <i>type</i> is legal in the current state. It has no
  * opinion on frame payload contents (that is {@code Http3Headers}) or on FIN timing (that is the
  * reactive layer, which is the only place a QUIC stream's end is visible).
+ *
+ * <h2>Why PUSH_PROMISE is not just another illegal type</h2>
+ * Every violation of this grammar is reported as {@code H3_FRAME_UNEXPECTED} — "a frame arrived where
+ * RFC 9114 §7.2's table does not permit it" — with exactly one exception. PUSH_PROMISE
+ * ({@code 0x05}) is {@code H3_ID_ERROR} instead, because RFC 9114 §7.2.5 judges it against the
+ * <i>push limit</i> rather than against the stream it arrived on: a client that has sent no
+ * MAX_PUSH_ID has granted no push id, so a promise names an identifier that was never issued. This
+ * implementation never sends MAX_PUSH_ID at all (FR-040, server push is permanently out of scope), so
+ * that condition holds on every connection, always. CANCEL_PUSH, SETTINGS, GOAWAY and MAX_PUSH_ID on a
+ * request stream stay {@code H3_FRAME_UNEXPECTED}: those are RFC 9114 §7.2.3/§7.2.4/§7.2.6/§7.2.7's own
+ * must-be-on-the-control-stream rules, which have nothing to do with push ids.
  */
 public final class Http3FrameSequence {
 	/**
+	 * PUSH_PROMISE (RFC 9114 §7.2.5). It has no dedicated {@link Http3Frame} subtype — push is refused
+	 * outright (FR-040), so nothing here ever builds or reads one — and is therefore named by its raw
+	 * type code. Deliberately <b>not</b> a member of {@link #ALWAYS_ILLEGAL_ON_REQUEST_STREAM}: it has
+	 * its own error code, for the reason set out in this class's Javadoc.
+	 */
+	private static final long PUSH_PROMISE_TYPE = 0x05L;
+
+	/**
 	 * Frame types RFC 9114 §7.2's table never permits on a request stream regardless of sequence
-	 * state — the control-only frames (CANCEL_PUSH, SETTINGS, PUSH_PROMISE, GOAWAY, MAX_PUSH_ID;
-	 * PUSH_PROMISE {@code 0x05} has no dedicated {@link Http3Frame} subtype since push is refused
-	 * outright by a later phase, so it is named here by its raw type code) plus the RFC 9114 §7.2.8
-	 * HTTP/2 frame types this implementation never accepts on any stream. Anything else — including
-	 * a genuinely unknown or GREASE type (RFC 9114 §9) — is tolerated here: FR-023 requires unknown,
-	 * non-reserved types be discarded without failing the connection, and FR-024's enumeration of
-	 * request-stream rejections lists only the control-only types below, not "unknown".
+	 * state — the control-only frames (CANCEL_PUSH, SETTINGS, GOAWAY, MAX_PUSH_ID) plus the RFC 9114
+	 * §7.2.8 HTTP/2 frame types this implementation never accepts on any stream. Anything else —
+	 * including a genuinely unknown or GREASE type (RFC 9114 §9) — is tolerated here: FR-023 requires
+	 * unknown, non-reserved types be discarded without failing the connection, and FR-024's enumeration
+	 * of request-stream rejections lists only the control-only types below, not "unknown".
+	 * <p>
+	 * {@link #PUSH_PROMISE_TYPE} is handled separately, with its own code.
 	 */
 	private static final Set<Long> ALWAYS_ILLEGAL_ON_REQUEST_STREAM = Set.of(
-		CancelPushFrame.TYPE, SettingsFrame.TYPE, 0x05L /* PUSH_PROMISE */, GoAwayFrame.TYPE, MaxPushIdFrame.TYPE,
+		CancelPushFrame.TYPE, SettingsFrame.TYPE, GoAwayFrame.TYPE, MaxPushIdFrame.TYPE,
 		0x02L, 0x06L, 0x08L, 0x09L /* reserved HTTP/2 types, RFC 9114 §7.2.8 */);
 
 	public enum State {
@@ -68,9 +87,10 @@ public final class Http3FrameSequence {
 	 * Advances the sequence on receipt (or send) of a frame of type {@code frameType}.
 	 *
 	 * @return the new state
-	 * @throws Http3Exception {@code H3_FRAME_UNEXPECTED} — always this code, since every violation
-	 *                        of this grammar is "a frame arrived where RFC 9114 §7.2's table does
-	 *                        not permit it"
+	 * @throws Http3Exception {@code H3_FRAME_UNEXPECTED} for every violation of this grammar — "a
+	 *                        frame arrived where RFC 9114 §7.2's table does not permit it" — except
+	 *                        PUSH_PROMISE, which is {@code H3_ID_ERROR} (RFC 9114 §7.2.5; see this
+	 *                        class's Javadoc)
 	 */
 	public State accept(long frameType) throws Http3Exception {
 		if (frameType == HeadersFrame.TYPE) {
@@ -88,6 +108,12 @@ public final class Http3FrameSequence {
 				case TRAILERS_DONE -> throw unexpected("DATA after the trailing HEADERS");
 			};
 			return state;
+		}
+		if (frameType == PUSH_PROMISE_TYPE) {
+			// RFC 9114 §7.2.5, and the one violation here that is not H3_FRAME_UNEXPECTED: a promise is
+			// judged against the push limit, which this implementation never raises above 0 (FR-040).
+			throw new Http3Exception(Http3Errors.H3_ID_ERROR,
+				"A PUSH_PROMISE frame against a push limit of 0 (RFC 9114 §7.2.5)");
 		}
 		if (ALWAYS_ILLEGAL_ON_REQUEST_STREAM.contains(frameType)) {
 			throw unexpected("frame type 0x" + Long.toHexString(frameType) + " is not permitted on a request stream");

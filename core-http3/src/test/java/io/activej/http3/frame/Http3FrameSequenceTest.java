@@ -77,10 +77,19 @@ public class Http3FrameSequenceTest {
 		assertEquals(Http3Errors.H3_FRAME_UNEXPECTED, e.errorCode());
 	}
 
+	/**
+	 * The control-only frame types, each of which RFC 9114 §7.2.3/§7.2.4/§7.2.6/§7.2.7 requires on the
+	 * control stream and nowhere else — a rule about <i>where</i> a frame may travel, hence
+	 * {@code H3_FRAME_UNEXPECTED}.
+	 * <p>
+	 * PUSH_PROMISE ({@code 0x05}) is deliberately <b>not</b> in this loop: RFC 9114 §7.2.5 judges it
+	 * against the push limit rather than against the stream it arrived on, so it carries
+	 * {@code H3_ID_ERROR} and has its own test below.
+	 */
 	@Test
-	public void controlAndPushFrameTypesAreNeverPermittedOnARequestStream() throws Http3Exception {
+	public void controlFrameTypesAreNeverPermittedOnARequestStream() throws Http3Exception {
 		for (long illegalType : new long[] {
-			SettingsFrame.TYPE, GoAwayFrame.TYPE, MaxPushIdFrame.TYPE, CancelPushFrame.TYPE, 0x05L /* PUSH_PROMISE */
+			SettingsFrame.TYPE, GoAwayFrame.TYPE, MaxPushIdFrame.TYPE, CancelPushFrame.TYPE
 		}) {
 			Http3FrameSequence idle = new Http3FrameSequence();
 			Http3Exception e = assertThrows(Http3Exception.class, () -> idle.accept(illegalType));
@@ -91,6 +100,35 @@ public class Http3FrameSequenceTest {
 			Http3Exception e2 = assertThrows(Http3Exception.class, () -> afterHeaders.accept(illegalType));
 			assertEquals(Http3Errors.H3_FRAME_UNEXPECTED, e2.errorCode());
 		}
+	}
+
+	/**
+	 * FR-040 / US8 §1: a PUSH_PROMISE is refused with {@code H3_ID_ERROR}, not with the
+	 * {@code H3_FRAME_UNEXPECTED} the control-only types above get.
+	 * <p>
+	 * RFC 9114 §7.2.5 makes a promise legal only against a push id the receiving client granted with a
+	 * MAX_PUSH_ID it sent, and this implementation never sends one — so its push limit is 0 on every
+	 * connection and every promise names an identifier that was never issued. That is an identifier
+	 * error, and a peer told "unexpected frame" instead would be told the wrong thing about why.
+	 */
+	@Test
+	public void pushPromiseIsAnIdErrorRatherThanAnUnexpectedFrame() throws Http3Exception {
+		long pushPromise = 0x05L;
+
+		Http3FrameSequence idle = new Http3FrameSequence();
+		Http3Exception e = assertThrows(Http3Exception.class, () -> idle.accept(pushPromise));
+		assertEquals(Http3Errors.H3_ID_ERROR, e.errorCode());
+
+		Http3FrameSequence afterHeaders = new Http3FrameSequence();
+		afterHeaders.accept(HeadersFrame.TYPE);
+		Http3Exception e2 = assertThrows(Http3Exception.class, () -> afterHeaders.accept(pushPromise));
+		assertEquals(Http3Errors.H3_ID_ERROR, e2.errorCode());
+
+		Http3FrameSequence afterData = new Http3FrameSequence();
+		afterData.accept(HeadersFrame.TYPE);
+		afterData.accept(DataFrame.TYPE);
+		Http3Exception e3 = assertThrows(Http3Exception.class, () -> afterData.accept(pushPromise));
+		assertEquals(Http3Errors.H3_ID_ERROR, e3.errorCode());
 	}
 
 	@Test

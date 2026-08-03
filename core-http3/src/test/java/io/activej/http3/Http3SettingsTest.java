@@ -22,6 +22,7 @@ import org.junit.Test;
 import java.time.Duration;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
 
 /**
  * Defaults asserted against data-model.md §5.1. {@code ApplicationSettings} resolution order
@@ -64,6 +65,34 @@ public class Http3SettingsTest {
 		assertEquals(Duration.ofSeconds(5).toMillis(), settings.requestTimeoutMillis());
 		// maxUniStreams is fixed at 3 (FR-017): not a builder field, no withMaxUniStreams(...) exists.
 		assertEquals(3, settings.maxUniStreams());
+	}
+
+	/**
+	 * T115: both of these become a request stream's {@code maxFrameSize}, and {@code Http3FrameReader}
+	 * allocates a validated declared length as an {@code int} — so a bound above 2^31-1 would let a length
+	 * through that wraps negative on the way to the allocator instead of being refused as excessive load.
+	 * The configuration is refused at {@code build()} rather than the wire length at read time.
+	 */
+	@Test
+	public void aBoundAboveIntegerMaxValueIsRefused() {
+		MemSize tooLarge = MemSize.bytes(Integer.MAX_VALUE + 1L);
+
+		assertThrows(IllegalArgumentException.class,
+			() -> Http3Settings.builder().withMaxFieldSectionSize(tooLarge).build());
+		assertThrows(IllegalArgumentException.class,
+			() -> Http3Settings.builder().withMaxBodySize(tooLarge).build());
+	}
+
+	/** The bound itself is not off by one: exactly {@link Integer#MAX_VALUE} is still a legal ceiling. */
+	@Test
+	public void theLargestBoundThatStillAllocatesIsAccepted() {
+		Http3Settings settings = Http3Settings.builder()
+			.withMaxFieldSectionSize(MemSize.bytes(Integer.MAX_VALUE))
+			.withMaxBodySize(MemSize.bytes(Integer.MAX_VALUE))
+			.build();
+
+		assertEquals(Integer.MAX_VALUE, settings.maxFieldSectionSize());
+		assertEquals(Integer.MAX_VALUE, settings.maxBodySize());
 	}
 
 	@Test

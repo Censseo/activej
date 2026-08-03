@@ -39,8 +39,17 @@ import java.util.Set;
 public final class SettingsFrame extends Http3Frame {
 	public static final long TYPE = 0x04;
 
+	/** {@code SETTINGS_QPACK_MAX_TABLE_CAPACITY} (RFC 9204 §5). */
+	public static final long QPACK_MAX_TABLE_CAPACITY = 0x01;
+
+	/** {@code SETTINGS_MAX_FIELD_SECTION_SIZE} (RFC 9114 §7.2.4.1). */
+	public static final long MAX_FIELD_SECTION_SIZE = 0x06;
+
+	/** {@code SETTINGS_QPACK_BLOCKED_STREAMS} (RFC 9204 §5). */
+	public static final long QPACK_BLOCKED_STREAMS = 0x07;
+
 	/** The RFC 9114 §7.2.4.1 HTTP/2 SETTINGS identifiers, reserved and rejected in HTTP/3. */
-	private static final Set<Long> RESERVED_IDENTIFIERS = Set.of(0x02L, 0x03L, 0x04L, 0x05L);
+	public static final Set<Long> RESERVED_IDENTIFIERS = Set.of(0x02L, 0x03L, 0x04L, 0x05L);
 
 	public final long[] identifiers;
 	public final long[] values;

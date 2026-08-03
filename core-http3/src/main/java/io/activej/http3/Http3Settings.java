@@ -55,6 +55,19 @@ public final class Http3Settings {
 		ApplicationSettings.getDuration(Http3Settings.class, "requestTimeout", Duration.ofSeconds(60));
 
 	/**
+	 * How long {@code Http3Server.close()} lets the exchanges it announced in its GOAWAY drain before it
+	 * closes the connections carrying them anyway (FR-019).
+	 * <p>
+	 * One second: long enough for a response already on its way to be acknowledged, short enough that
+	 * {@code close()} is a close rather than a wait on a peer that may never answer. It is a
+	 * <b>ceiling</b>, not a delay — the connections go the moment the last announced exchange finishes,
+	 * which is the ordinary case. A server whose requests routinely run longer raises it; {@code 0}
+	 * closes at once, announcing GOAWAY without waiting for anything.
+	 */
+	public static final Duration DEFAULT_SHUTDOWN_TIMEOUT =
+		ApplicationSettings.getDuration(Http3Settings.class, "shutdownTimeout", Duration.ofSeconds(1));
+
+	/**
 	 * The advertised {@code initial_max_streams_uni} transport parameter value: exactly the control
 	 * stream plus both QPACK streams a conforming peer may open (RFC 9114 §6.2). A stated constant
 	 * rather than a builder field — FR-017 requires it never be an open-ended "at least 3", since
@@ -78,10 +91,12 @@ public final class Http3Settings {
 	private final int maxConnections;
 	private final int maxQueuedRequests;
 	private final long requestTimeoutMillis;
+	private final long shutdownTimeoutMillis;
 
 	private Http3Settings(
 		long maxFieldSectionSize, long maxBodySize, long maxControlFrameSize,
-		int maxConcurrentRequestStreams, int maxConnections, int maxQueuedRequests, long requestTimeoutMillis
+		int maxConcurrentRequestStreams, int maxConnections, int maxQueuedRequests, long requestTimeoutMillis,
+		long shutdownTimeoutMillis
 	) {
 		this.maxFieldSectionSize = maxFieldSectionSize;
 		this.maxBodySize = maxBodySize;
@@ -90,6 +105,7 @@ public final class Http3Settings {
 		this.maxConnections = maxConnections;
 		this.maxQueuedRequests = maxQueuedRequests;
 		this.requestTimeoutMillis = requestTimeoutMillis;
+		this.shutdownTimeoutMillis = shutdownTimeoutMillis;
 	}
 
 	public static Http3Settings create() {
@@ -108,17 +124,24 @@ public final class Http3Settings {
 		private int maxConnections = DEFAULT_MAX_CONNECTIONS;
 		private int maxQueuedRequests = DEFAULT_MAX_QUEUED_REQUESTS;
 		private long requestTimeoutMillis = DEFAULT_REQUEST_TIMEOUT.toMillis();
+		private long shutdownTimeoutMillis = DEFAULT_SHUTDOWN_TIMEOUT.toMillis();
 
 		private Builder() {}
 
-		/** Bounds the RFC 9114 §4.2.2 accounted field-section size, checked on decoded output as produced. */
+		/**
+		 * Bounds the RFC 9114 §4.2.2 accounted field-section size, checked on decoded output as produced.
+		 * At least 1 byte and at most {@link Integer#MAX_VALUE}; {@link #build()} refuses anything else.
+		 */
 		public Builder withMaxFieldSectionSize(MemSize maxFieldSectionSize) {
 			checkNotBuilt(this);
 			this.maxFieldSectionSize = maxFieldSectionSize.toLong();
 			return this;
 		}
 
-		/** Bounds total DATA payload per message. */
+		/**
+		 * Bounds total DATA payload per message. At most {@link Integer#MAX_VALUE}, like
+		 * {@link #withMaxFieldSectionSize} and for the same reason; 0 accepts no body at all.
+		 */
 		public Builder withMaxBodySize(MemSize maxBodySize) {
 			checkNotBuilt(this);
 			this.maxBodySize = maxBodySize.toLong();
@@ -160,13 +183,31 @@ public final class Http3Settings {
 			return this;
 		}
 
+		/** The ceiling on the GOAWAY drain of {@code Http3Server.close()}; 0 closes at once (FR-019). */
+		public Builder withShutdownTimeout(Duration shutdownTimeout) {
+			checkNotBuilt(this);
+			this.shutdownTimeoutMillis = shutdownTimeout.toMillis();
+			return this;
+		}
+
 		@Override
 		protected Http3Settings doBuild() {
 			if (maxFieldSectionSize < 1) {
 				throw new IllegalArgumentException("maxFieldSectionSize (" + maxFieldSectionSize + ") must be at least 1");
 			}
+			// Both of these end up as a request stream's maxFrameSize, and Http3FrameReader allocates a
+			// validated declared length as an int: a bound above 2^31-1 would let a length through that
+			// wraps negative on the way to ByteBufPool.allocate, instead of being refused as excessive load.
+			if (maxFieldSectionSize > Integer.MAX_VALUE) {
+				throw new IllegalArgumentException(
+					"maxFieldSectionSize (" + maxFieldSectionSize + ") must not exceed " + Integer.MAX_VALUE);
+			}
 			if (maxBodySize < 0) {
 				throw new IllegalArgumentException("maxBodySize (" + maxBodySize + ") must not be negative");
+			}
+			if (maxBodySize > Integer.MAX_VALUE) {
+				throw new IllegalArgumentException(
+					"maxBodySize (" + maxBodySize + ") must not exceed " + Integer.MAX_VALUE);
 			}
 			if (maxControlFrameSize < 1) {
 				throw new IllegalArgumentException("maxControlFrameSize (" + maxControlFrameSize + ") must be at least 1");
@@ -185,9 +226,14 @@ public final class Http3Settings {
 				throw new IllegalArgumentException(
 					"requestTimeout (" + requestTimeoutMillis + " ms) must not be negative; 0 disables it");
 			}
+			if (shutdownTimeoutMillis < 0) {
+				throw new IllegalArgumentException(
+					"shutdownTimeout (" + shutdownTimeoutMillis + " ms) must not be negative; 0 closes at once");
+			}
 			return new Http3Settings(
 				maxFieldSectionSize, maxBodySize, maxControlFrameSize,
-				maxConcurrentRequestStreams, maxConnections, maxQueuedRequests, requestTimeoutMillis);
+				maxConcurrentRequestStreams, maxConnections, maxQueuedRequests, requestTimeoutMillis,
+				shutdownTimeoutMillis);
 		}
 	}
 
@@ -226,6 +272,14 @@ public final class Http3Settings {
 		return requestTimeoutMillis;
 	}
 
+	/**
+	 * The ceiling on how long a graceful shutdown waits for the exchanges it announced to finish; 0
+	 * closes at once (FR-019).
+	 */
+	public long shutdownTimeoutMillis() {
+		return shutdownTimeoutMillis;
+	}
+
 	/** Fixed at {@link #QPACK_MAX_TABLE_CAPACITY} — this feature never builds a QPACK dynamic table. */
 	public int qpackMaxTableCapacity() {
 		return QPACK_MAX_TABLE_CAPACITY;
@@ -247,6 +301,7 @@ public final class Http3Settings {
 			", maxConnections=" + maxConnections +
 			", maxQueuedRequests=" + maxQueuedRequests +
 			", requestTimeout=" + requestTimeoutMillis + "ms" +
+			", shutdownTimeout=" + shutdownTimeoutMillis + "ms" +
 			'}';
 	}
 }

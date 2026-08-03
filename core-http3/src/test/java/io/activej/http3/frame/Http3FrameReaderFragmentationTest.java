@@ -164,6 +164,49 @@ public class Http3FrameReaderFragmentationTest {
 		whole.recycle();
 	}
 
+	/**
+	 * T098 regression: a reader stopped part-way through a frame owns the payload buffer it had begun
+	 * filling, and {@link Http3FrameReader#recycle()} is the only thing that releases it. Before this
+	 * existed, every abort mid-DATA — a reset request stream, a control stream the peer cut, a FIN
+	 * inside a frame — leaked exactly that buffer. {@code ByteBufRule} is the assertion (DI-1).
+	 */
+	@Test
+	public void recyclingAReaderStoppedMidFrameReleasesItsPartialPayload() throws Http3Exception {
+		DataFrame frame = new DataFrame(randomPayload(64));
+		ByteBuf encoded = encode(frame);
+		frame.recycle();
+
+		Http3FrameReader reader = new Http3FrameReader(MAX_FRAME_SIZE);
+		// Everything but the last payload byte: the reader has allocated the whole 64-byte payload and
+		// filled 63 of it, and no further byte is ever coming.
+		ByteBuf allButTheLastByte = encoded.slice(encoded.readRemaining() - 1);
+		encoded.recycle();
+		assertNull(reader.feed(allButTheLastByte));
+		allButTheLastByte.recycle();
+
+		reader.recycle();
+		reader.recycle();
+	}
+
+	@Test
+	public void aRecycledReaderRefusesToResume() {
+		Http3FrameReader reader = new Http3FrameReader(MAX_FRAME_SIZE);
+		reader.recycle();
+
+		ByteBuf more = ByteBufPool.allocate(1);
+		more.put((byte) 0x00);
+		try {
+			reader.feed(more);
+			fail("a recycled reader cannot resume a frame whose first bytes it has released");
+		} catch (IllegalStateException e) {
+			assertTrue(e.getMessage(), e.getMessage().contains("recycled"));
+		} catch (Http3Exception e) {
+			throw new AssertionError("the wrong failure: this is a caller bug, not a wire error", e);
+		} finally {
+			more.recycle();
+		}
+	}
+
 	// ---- helpers ----
 
 	private Http3Frame decodeWhole(Http3Frame frame) throws Http3Exception {
