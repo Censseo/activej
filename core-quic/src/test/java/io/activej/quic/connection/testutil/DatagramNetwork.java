@@ -17,6 +17,7 @@
 package io.activej.quic.connection.testutil;
 
 import io.activej.bytebuf.ByteBuf;
+import io.activej.bytebuf.ByteBufPool;
 import io.activej.common.time.CurrentTimeProvider;
 import io.activej.net.socket.udp.UdpPacket;
 
@@ -49,7 +50,9 @@ import java.util.function.Consumer;
  * <p>
  * <b>Random draw order</b> is part of the reproducibility contract: exactly one draw per {@code send},
  * for the drop decision. Reordering uses a deterministic extra delay rather than a second draw, so
- * adding or removing a configuration knob does not shift every existing trace.
+ * adding or removing a configuration knob does not shift every existing trace. Duplication draws a
+ * second time, but <b>only</b> when {@link #withDuplicateRate} has been asked for — a fabric left at
+ * its defaults produces exactly the trace it always did.
  */
 public final class DatagramNetwork {
 	/** One datagram in flight. */
@@ -88,6 +91,7 @@ public final class DatagramNetwork {
 
 	private double dropRate;
 	private double reorderRate;
+	private double duplicateRate;
 	private long delayMillis;
 	private boolean recordTrace;
 	private long sequence;
@@ -95,6 +99,7 @@ public final class DatagramNetwork {
 
 	private int sentCount;
 	private int droppedCount;
+	private int duplicatedCount;
 	private int deliveredCount;
 
 	public DatagramNetwork(CurrentTimeProvider clock, long seed) {
@@ -111,6 +116,23 @@ public final class DatagramNetwork {
 	public DatagramNetwork withReorderRate(double reorderRate) {
 		if (reorderRate < 0 || reorderRate > 1) throw new IllegalArgumentException("reorderRate must be in [0, 1]");
 		this.reorderRate = reorderRate;
+		return this;
+	}
+
+	/**
+	 * The share of surviving datagrams that are delivered <b>twice</b>, the copy a millisecond behind the
+	 * original. A real path duplicates, and QUIC's answer is per-space packet-number de-duplication
+	 * (RFC 9000 §12.3) — a loss test that never exercises it would miss a receiver that mistook a
+	 * duplicate for new data and charged the peer's flow-control window twice for it.
+	 * <p>
+	 * The copy is a genuine copy rather than a slice, because header protection is removed in place: two
+	 * readers over one array would corrupt each other.
+	 */
+	public DatagramNetwork withDuplicateRate(double duplicateRate) {
+		if (duplicateRate < 0 || duplicateRate > 1) {
+			throw new IllegalArgumentException("duplicateRate must be in [0, 1]");
+		}
+		this.duplicateRate = duplicateRate;
 		return this;
 	}
 
@@ -159,7 +181,14 @@ public final class DatagramNetwork {
 			extra = delayMillis > 0 ? delayMillis : 1;
 		}
 
-		inFlight.add(new InFlight(clock.currentTimeMillis() + delayMillis + extra, sequence++, from, to, payload));
+		long deliveryTime = clock.currentTimeMillis() + delayMillis + extra;
+		if (duplicateRate > 0 && random.nextDouble() < duplicateRate) {
+			duplicatedCount++;
+			ByteBuf copy = ByteBufPool.allocate(Math.max(1, payload.readRemaining()));
+			copy.put(payload.getArray());
+			inFlight.add(new InFlight(deliveryTime + 1, sequence++, from, to, copy));
+		}
+		inFlight.add(new InFlight(deliveryTime, sequence++, from, to, payload));
 	}
 
 	/**
@@ -211,6 +240,11 @@ public final class DatagramNetwork {
 		return droppedCount;
 	}
 
+	/** Extra copies scheduled by {@link #withDuplicateRate}; each is also counted as delivered. */
+	public int duplicatedCount() {
+		return duplicatedCount;
+	}
+
 	public int deliveredCount() {
 		return deliveredCount;
 	}
@@ -238,9 +272,11 @@ public final class DatagramNetwork {
 		return "DatagramNetwork{" +
 			"dropRate=" + dropRate +
 			", reorderRate=" + reorderRate +
+			", duplicateRate=" + duplicateRate +
 			", delay=" + delayMillis + "ms" +
 			", sent=" + sentCount +
 			", dropped=" + droppedCount +
+			", duplicated=" + duplicatedCount +
 			", delivered=" + deliveredCount +
 			", inFlight=" + inFlight.size() +
 			'}';

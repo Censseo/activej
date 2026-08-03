@@ -167,16 +167,61 @@ public final class QuicFrameHandlerTest {
 	public void toleratedTransportFramesAreIgnoredRatherThanRouted() throws Exception {
 		handshakeWithHandler();
 
-		clientSends(new MaxDataFrame(1 << 20));
+		clientSends(new NewConnectionIdFrame(1, 0, io.activej.quic.QuicConnectionId.random(8), new byte[16]));
 
-		// Flow-control credit for a connection that never sends application data is information with
-		// nowhere to go. RFC 9000 §12.4 permits ignoring it, and real peers send these unprompted — so
-		// routing or rejecting them would break interoperability rather than enforce anything.
+		// Extra connection IDs are a facility this feature does not implement (no migration), but a
+		// conforming peer sends them unprompted. RFC 9000 §12.4 permits ignoring them — routing or
+		// rejecting them would break interoperability rather than enforce anything.
 		assertEquals(List.of(), handler.received);
 		assertEquals(QuicConnectionState.ESTABLISHED, wire.server().state());
 	}
 
+	@Test
+	public void flowControlAndStreamLimitFramesReachTheHandler() throws Exception {
+		handshakeWithHandler();
+
+		// Unlike NEW_CONNECTION_ID, these carry application-relevant credit once a stream layer (feature
+		// 04) is registered as the frame handler — so they must route rather than be silently tolerated.
+		clientSends(new MaxDataFrame(1 << 20));
+		clientSends(new MaxStreamDataFrame(0, 1 << 16));
+		clientSends(new MaxStreamsFrame(10, QuicStreamLimitType.BIDIRECTIONAL));
+		clientSends(new DataBlockedFrame(1 << 20));
+		clientSends(new StreamsBlockedFrame(10, QuicStreamLimitType.BIDIRECTIONAL));
+
+		assertEquals(
+			List.of("MaxDataFrame", "MaxStreamDataFrame", "MaxStreamsFrame", "DataBlockedFrame", "StreamsBlockedFrame"),
+			handler.received);
+		assertEquals(QuicConnectionState.ESTABLISHED, wire.server().state());
+	}
+
 	// ---------------------------------------------------------------- no handler registered
+
+	@Test
+	public void flowControlAndStreamLimitFramesWithNoHandlerAreIgnoredRatherThanRouted() throws Exception {
+		wire.handshake(QuicConnectionSettings.create());
+		QuicConnection server = wire.server();
+
+		// FR-039: the mirror image of flowControlAndStreamLimitFramesReachTheHandler. With no layer above
+		// to spend the credit these five carry, they are dropped exactly as they were before feature 04 —
+		// RFC 9000 §12.4 lets a conforming peer send them unprompted whether or not a stream is ever
+		// opened, so a connection that attaches no stream layer must not close on one.
+		clientSends(new MaxDataFrame(1 << 20));
+		assertEquals(QuicConnectionState.ESTABLISHED, server.state());
+
+		clientSends(new MaxStreamDataFrame(0, 1 << 16));
+		assertEquals(QuicConnectionState.ESTABLISHED, server.state());
+
+		clientSends(new MaxStreamsFrame(10, QuicStreamLimitType.BIDIRECTIONAL));
+		assertEquals(QuicConnectionState.ESTABLISHED, server.state());
+
+		clientSends(new DataBlockedFrame(1 << 20));
+		assertEquals(QuicConnectionState.ESTABLISHED, server.state());
+
+		clientSends(new StreamsBlockedFrame(10, QuicStreamLimitType.BIDIRECTIONAL));
+		assertEquals(QuicConnectionState.ESTABLISHED, server.state());
+
+		assertNull(wire.client().peerClose());
+	}
 
 	@Test
 	public void anApplicationFrameWithNoHandlerIsAProtocolViolation() throws Exception {
@@ -187,8 +232,10 @@ public final class QuicFrameHandlerTest {
 		data.put(new byte[]{7});
 		clientSends(new StreamFrame(0, 0, true, data));
 
-		// FR-037: this connection advertised zero streams, so a peer sending stream data exceeded a limit
-		// it was told about — silence would leave it waiting for a response that can never come.
+		// FR-037: the settings do advertise non-zero stream limits, but nothing here can act on a stream —
+		// no handler was registered, so there is no layer to hand the data to and no reader that could ever
+		// consume it. Silence would leave the peer waiting for a response that can never come. Contrast the
+		// five credit frames above, which carry nothing that needs answering.
 		assertTrue("expected the server to close, it is " + server.state(), server.state().isTerminating());
 		assertNotNull(wire.client().peerClose());
 		assertEquals(QuicTransportErrors.PROTOCOL_VIOLATION, wire.client().peerClose().errorCode());
