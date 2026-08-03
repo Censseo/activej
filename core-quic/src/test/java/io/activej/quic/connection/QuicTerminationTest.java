@@ -138,6 +138,79 @@ public final class QuicTerminationTest {
 		assertEquals(QuicTransportErrors.APPLICATION_ERROR, peerClose.errorCode());
 	}
 
+	// ---------------------------------------------------------------- application close (RFC 9000 §19.19)
+
+	/**
+	 * HTTP/3's {@code H3_STREAM_CREATION_ERROR} (RFC 9114 §8.1): a code drawn from RFC 9000 §20.2's
+	 * application space that falls inside the transport space's {@code CRYPTO_ERROR} range, so a peer
+	 * reading it out of a {@code 0x1c} frame would call it a TLS alert. It is the whole reason the
+	 * application form of CONNECTION_CLOSE exists.
+	 */
+	private static final long H3_STREAM_CREATION_ERROR = 0x0103;
+
+	@Test
+	public void anApplicationCloseReachesThePeerAsTheApplicationVariantCarryingItsOwnCode() throws Exception {
+		wire.handshake(settings());
+		QuicConnection client = wire.client();
+
+		client.closeWithApplicationError(H3_STREAM_CREATION_ERROR, "the peer opened a second control stream");
+		assertEquals(QuicConnectionState.CLOSING, client.state());
+		wire.pump();
+
+		QuicConnection server = wire.server();
+		PeerClose peerClose = server.peerClose();
+		assertNotNull("the server never saw the close", peerClose);
+		assertTrue("an application close (0x1d), not a transport one", peerClose.isApplication());
+		assertEquals(H3_STREAM_CREATION_ERROR, peerClose.errorCode());
+		// RFC 9000 §19.19: the application form carries no trigger frame type at all.
+		assertEquals(0, peerClose.frameType());
+
+		// The receiver drains, the sender holds its closing period, and both end at CLOSED with nothing
+		// left over — which is what ByteBufRule is here to prove.
+		assertEquals(QuicConnectionState.DRAINING, server.state());
+		loop.advance(Math.max(client.closingPeriodMillis(), server.closingPeriodMillis()) + 1);
+		assertEquals(QuicConnectionState.CLOSED, client.state());
+		assertEquals(QuicConnectionState.CLOSED, server.state());
+	}
+
+	@Test
+	public void aSecondApplicationCloseSendsNothingFurther() throws Exception {
+		wire.handshake(settings());
+		QuicConnection client = wire.client();
+		client.closeWithApplicationError(H3_STREAM_CREATION_ERROR, "first");
+		int afterFirst = wire.clientWire().datagramsAccepted();
+
+		client.closeWithApplicationError(0x0106, "second");
+		client.close();
+
+		assertEquals("closeWithApplicationError is not idempotent", afterFirst,
+			wire.clientWire().datagramsAccepted());
+		assertEquals(QuicConnectionState.CLOSING, client.state());
+		wire.pump();
+
+		PeerClose peerClose = wire.server().peerClose();
+		assertNotNull(peerClose);
+		assertEquals("the peer keeps the code of the close that actually went out",
+			H3_STREAM_CREATION_ERROR, peerClose.errorCode());
+	}
+
+	@Test
+	public void anApplicationCloseBeforeOneRttKeysDegradesToTheTransportSubstitute() throws Exception {
+		// RFC 9000 §10.2.3: a 0x1d frame may only travel under 1-RTT keys. The client has sent nothing
+		// but its Initial, so the only conforming way to say "the application gave up" is a transport
+		// close carrying APPLICATION_ERROR — which drops the application's own code by design, the peer
+		// having no application-layer state to apply it to yet.
+		wire.startClient(settings());
+		wire.client().closeWithApplicationError(H3_STREAM_CREATION_ERROR, "gave up mid-handshake");
+		wire.acceptServer(settings());
+		assertTrue("the close was never delivered", wire.deliverToServer());
+
+		PeerClose peerClose = wire.server().peerClose();
+		assertNotNull("the server never saw the close", peerClose);
+		assertFalse("a 0x1d frame is not permitted in an Initial packet", peerClose.isApplication());
+		assertEquals(QuicTransportErrors.APPLICATION_ERROR, peerClose.errorCode());
+	}
+
 	// ---------------------------------------------------------------- scenario 2: rate-limited re-send
 
 	@Test
