@@ -125,9 +125,19 @@ public final class TransportParameterValidation {
 	}
 
 	/**
-	 * The local parameters this feature advertises. Stream and flow-control limits are 0 — they become
-	 * meaningful in feature 04 (streams) — and active migration is disabled because migration is out of
-	 * scope.
+	 * The local parameters this endpoint advertises (RFC 9000 §18.2).
+	 * <p>
+	 * The connection-wide and per-stream receive credits ({@code initial_max_data},
+	 * {@code initial_max_stream_data_bidi_local}, {@code initial_max_stream_data_bidi_remote},
+	 * {@code initial_max_stream_data_uni}) and the stream counts the peer may open
+	 * ({@code initial_max_streams_bidi}, {@code initial_max_streams_uni}) all carry their configured
+	 * {@link QuicConnectionSettings} values, so a peer may open streams up to those bounds and send that
+	 * much data before waiting for a MAX_DATA or MAX_STREAM_DATA update. {@code QuicConnectionSettings}
+	 * guarantees at build time that no {@code initial_max_stream_data*} exceeds {@code initial_max_data},
+	 * so nothing advertised here promises credit the connection window cannot honour.
+	 * <p>
+	 * Active migration is disabled because migration is out of scope, and
+	 * {@code stateless_reset_token} / {@code preferred_address} are absent for the same reason.
 	 *
 	 * @param originalDestinationConnectionId set by a server to the DCID from the client's first
 	 *                                        Initial; {@code null} on a client
@@ -142,7 +152,12 @@ public final class TransportParameterValidation {
 			settings.maxIdleTimeoutMillis(),
 			null,                                        // stateless_reset_token: out of scope
 			settings.maxDatagramSize(),
-			0, 0, 0, 0, 0, 0,                            // flow control and stream limits: feature 04
+			settings.initialMaxData(),
+			settings.initialMaxStreamDataBidiLocal(),
+			settings.initialMaxStreamDataBidiRemote(),
+			settings.initialMaxStreamDataUni(),
+			settings.initialMaxStreamsBidi(),
+			settings.initialMaxStreamsUni(),
 			QuicTransportParameters.DEFAULT_ACK_DELAY_EXPONENT,
 			QuicTransportParameters.DEFAULT_MAX_ACK_DELAY,
 			true,                                        // disable_active_migration: migration out of scope

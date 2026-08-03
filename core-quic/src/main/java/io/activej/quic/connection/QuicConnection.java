@@ -48,6 +48,7 @@ import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 
 import static io.activej.reactor.Reactive.checkInReactorThread;
 
@@ -266,7 +267,12 @@ public final class QuicConnection extends AbstractReactive {
 
 	private final SettablePromise<QuicConnection> establishPromise = new SettablePromise<>();
 	private final @Nullable Runnable onClosed;
-	private final @Nullable QuicFrameHandler frameHandler;
+	/**
+	 * Not {@code final} only because {@link Builder#withFrameHandlerFactory} assigns it in
+	 * {@code doBuild()} — after the constructor has returned, so the factory sees a whole connection.
+	 * Written exactly once, before the connection is reachable by anything else; read-only thereafter.
+	 */
+	private @Nullable QuicFrameHandler frameHandler;
 	private final @Nullable Inspector inspector;
 	private QuicConnectionState state = QuicConnectionState.IDLE;
 	private @Nullable ScheduledRunnable handshakeDeadline;
@@ -392,6 +398,7 @@ public final class QuicConnection extends AbstractReactive {
 		private @Nullable QuicConnectionId originalDestinationConnectionId;
 		private @Nullable Runnable onClosed;
 		private @Nullable QuicFrameHandler frameHandler;
+		private @Nullable Function<QuicConnection, QuicFrameHandler> frameHandlerFactory;
 		private @Nullable Inspector inspector;
 
 		private Builder(
@@ -460,6 +467,29 @@ public final class QuicConnection extends AbstractReactive {
 		}
 
 		/**
+		 * Registers a frame handler built <i>from</i> the connection itself (FR-038), so the handler can
+		 * hold its connection in a final field instead of a mutable back-reference patched in afterwards.
+		 * <p>
+		 * The factory runs inside {@link #build()}, exactly once, after the constructor has returned and
+		 * before the connection is yielded — so every field the handler could touch is already assigned,
+		 * and the factory may call back into the connection it is given. Returning {@code null} is the
+		 * same as never registering a handler at all.
+		 * <p>
+		 * <b>Why this exists.</b> Every {@link QuicFrameHandler} method takes the connection as a
+		 * parameter, which is enough for a handler that only ever reacts to a frame. A layer that also
+		 * <i>originates</i> traffic — a stream manager calling {@link #enqueueFrame} from an application
+		 * write — needs its connection outside any callback, and cannot be constructed before it exists.
+		 * <p>
+		 * Mutually exclusive with {@link #withFrameHandler}: setting both is an {@link IllegalStateException}
+		 * at build time. A factory that throws propagates out of {@code build()} with nothing registered.
+		 */
+		public Builder withFrameHandlerFactory(Function<QuicConnection, QuicFrameHandler> frameHandlerFactory) {
+			checkNotBuilt(this);
+			this.frameHandlerFactory = frameHandlerFactory;
+			return this;
+		}
+
+		/**
 		 * Registers the optional statistics hook of FR-036. Without one the connection still keeps every
 		 * counter and still logs every qlog event; the hook only adds a push seam for a module that
 		 * publishes them.
@@ -472,6 +502,14 @@ public final class QuicConnection extends AbstractReactive {
 
 		@Override
 		protected QuicConnection doBuild() {
+			if (frameHandler != null && frameHandlerFactory != null) {
+				// Checked here rather than in whichever setter ran second: a builder is order-independent
+				// everywhere else in the platform, and silently letting one win would decide which handler a
+				// connection routes to by the order two lines happened to be written in.
+				throw new IllegalStateException(
+					"withFrameHandler(...) and withFrameHandlerFactory(...) are mutually exclusive: " +
+						"a connection has exactly one frame handler");
+			}
 			if (role == Role.SERVER) {
 				if (peerConnectionId == null) {
 					throw new IllegalStateException(
@@ -483,7 +521,14 @@ public final class QuicConnection extends AbstractReactive {
 							"Initial keys): withOriginalDestinationConnectionId(...)");
 				}
 			}
-			return new QuicConnection(this);
+			QuicConnection connection = new QuicConnection(this);
+			if (frameHandlerFactory != null) {
+				// After the constructor, never inside it: a `this` handed out mid-construction would let the
+				// factory read fields that are still null. A factory that throws leaves this connection
+				// unregistered and unreachable — it was never started, so it holds no timer and no buffer.
+				connection.frameHandler = frameHandlerFactory.apply(connection);
+			}
+			return connection;
 		}
 	}
 
@@ -1005,30 +1050,51 @@ public final class QuicConnection extends AbstractReactive {
 			return;
 		}
 		if (isToleratedTransportFrame(frame)) {
-			// Frames that concern paths and limits we do not use. RFC 9000 §12.4 permits ignoring them, and
-			// a real peer sends several of them unprompted — NEW_CONNECTION_ID in particular — so treating
-			// them as violations would break interoperability rather than enforce anything.
+			// Frames that concern paths and connection IDs we do not use. RFC 9000 §12.4 permits ignoring
+			// them, and a real peer sends several of them unprompted — NEW_CONNECTION_ID in particular — so
+			// treating them as violations would break interoperability rather than enforce anything.
+			return;
+		}
+		if (frameHandler == null && isStreamCreditFrame(frame)) {
+			// FR-039: with no layer above, this connection is exactly what it was before feature 04, and
+			// what it was before feature 04 is an endpoint that ignored these five. A conforming peer sends
+			// them unprompted (RFC 9000 §12.4) whether or not either side ever opens a stream, so closing on
+			// one would be a regression against a peer that did nothing wrong.
 			return;
 		}
 		routeToHandler(level, frame);
 	}
 
 	/**
-	 * Frames the transport neither acts on nor rejects.
+	 * Frames the transport neither acts on nor rejects, whatever is registered above it.
 	 * <p>
-	 * The distinction from the frames below matters: these concern facilities this feature does not
-	 * implement but a conforming peer still uses (extra connection IDs, path validation, flow-control
-	 * credit we never spend). The frames that fall through to the handler are the ones carrying
-	 * <i>application</i> data, which a peer may not send at all given the zero stream limits and absent
-	 * DATAGRAM support we advertise.
+	 * These concern facilities this feature does not implement but a conforming peer still uses (extra
+	 * connection IDs, path validation). Nothing above the transport can act on them either, so they are
+	 * dropped rather than routed.
+	 * <p>
+	 * See {@link #isStreamCreditFrame(QuicFrame)} for the five frames whose treatment instead
+	 * <i>depends</i> on whether a handler is registered.
 	 */
 	private static boolean isToleratedTransportFrame(QuicFrame frame) {
 		return frame instanceof NewConnectionIdFrame
 			|| frame instanceof RetireConnectionIdFrame
 			|| frame instanceof NewTokenFrame
 			|| frame instanceof PathChallengeFrame
-			|| frame instanceof PathResponseFrame
-			|| frame instanceof MaxDataFrame
+			|| frame instanceof PathResponseFrame;
+	}
+
+	/**
+	 * The flow-control and stream-limit frames, whose treatment is the one thing a registered
+	 * {@link QuicFrameHandler} changes about frame routing.
+	 * <p>
+	 * With a handler they are routed, because the credit they carry is only actionable there (feature 04's
+	 * stream layer is what spends it). With no handler they join {@link #isToleratedTransportFrame}'s list
+	 * and are dropped: nothing can spend the credit, and a peer that announced it has not violated
+	 * anything. That asymmetry is FR-039 — attaching no layer must leave the connection behaving exactly
+	 * as it did before this feature existed.
+	 */
+	private static boolean isStreamCreditFrame(QuicFrame frame) {
+		return frame instanceof MaxDataFrame
 			|| frame instanceof MaxStreamDataFrame
 			|| frame instanceof MaxStreamsFrame
 			|| frame instanceof DataBlockedFrame
@@ -2293,6 +2359,42 @@ public final class QuicConnection extends AbstractReactive {
 		sendQueue.enqueue(EncryptionLevel.ONE_RTT, frame, true);
 	}
 
+	/**
+	 * {@link #enqueueFrame}, except that the frame goes to the <b>front</b> of the 1-RTT queue: this is
+	 * the entry point for a handler <em>retransmitting</em> something it was told was lost.
+	 * <p>
+	 * The distinction is not cosmetic. A handler may have queued far more than a congestion window —
+	 * {@code QuicStreamManager} bounds itself by {@code maxOutstandingStreamBytes}, which is hundreds of
+	 * kilobytes — so an appended retransmission waits out the whole backlog, many round trips. Meanwhile
+	 * the receiver holds every byte that arrived after the gap and cannot deliver any of it, and each
+	 * further loss opens another gap: the receiver's reassembly bound, not the network, is what ends the
+	 * connection. Retransmitting ahead of new data (RFC 9002 §6.5) is what keeps a hole one round trip
+	 * wide instead of one backlog wide.
+	 * <p>
+	 * <b>Takes ownership</b> of {@code frame} on every path, exactly as {@link #enqueueFrame} does.
+	 * Frames re-queued by successive calls end up in reverse order relative to each other, which is
+	 * deliberate and harmless: what is re-queued here carries its own position (a {@code STREAM} frame
+	 * its offset), unlike the {@code CRYPTO} stream the transport re-queues as an ordered list.
+	 *
+	 * @throws QuicTransportException {@code INTERNAL_ERROR} when the send queue's byte bound would be
+	 *                                exceeded (FR-040)
+	 */
+	public void requeueFrame(QuicFrame frame) throws QuicTransportException {
+		checkInReactorThread(this);
+		if (frameHandler == null) {
+			Recyclers.recycle(frame);
+			throw new QuicTransportException(QuicTransportErrors.INTERNAL_ERROR,
+				"requeueFrame requires a frame handler registered at build time");
+		}
+		try {
+			FrameTypeRules.validateForSending(frame, EncryptionLevel.ONE_RTT);
+		} catch (QuicTransportException e) {
+			Recyclers.recycle(frame);
+			throw e;
+		}
+		sendQueue.requeue(EncryptionLevel.ONE_RTT, List.of(frame), true);
+	}
+
 	/** Flushes whatever is queued. Safe to call when nothing is queued, and safe to call repeatedly. */
 	public void requestSend() {
 		checkInReactorThread(this);
@@ -2409,6 +2511,22 @@ public final class QuicConnection extends AbstractReactive {
 	public Role role() {
 		checkInReactorThread(this);
 		return role;
+	}
+
+	/**
+	 * The immutable settings this connection was built with.
+	 * <p>
+	 * A {@link QuicFrameHandler} needs them: the six RFC 9000 §18.2 limits this endpoint
+	 * <i>advertised</i> are what its own receive windows must be sized from — the peer's parameters,
+	 * reachable through {@link #peerTransportParameters()}, only describe the send side — and the
+	 * three local-only stream bounds are not on the wire at all. Exposing the value the connection
+	 * already holds is what keeps a handler from being handed a second, possibly divergent, copy.
+	 * <p>
+	 * The returned object is immutable (its builder is one-shot), so this is a read-only view.
+	 */
+	public QuicConnectionSettings settings() {
+		checkInReactorThread(this);
+		return settings;
 	}
 
 	public InetSocketAddress remoteAddress() {

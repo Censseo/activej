@@ -291,10 +291,11 @@ public final class TransportParameterValidationTest {
 		assertNull(params.retrySourceConnectionId());
 		assertNull(params.statelessResetToken());
 		assertNull(params.preferredAddress());
-		// Flow control and stream limits are 0 until feature 04.
-		assertEquals(0, params.initialMaxData());
-		assertEquals(0, params.initialMaxStreamsBidi());
-		assertEquals(0, params.initialMaxStreamsUni());
+		// Feature 04 filled these in from the settings; TransportParameterAdvertisementTest owns the
+		// detail, this only pins that the local set is derived from the settings and not from constants.
+		assertEquals(settings.initialMaxData(), params.initialMaxData());
+		assertEquals(settings.initialMaxStreamsBidi(), params.initialMaxStreamsBidi());
+		assertEquals(settings.initialMaxStreamsUni(), params.initialMaxStreamsUni());
 	}
 
 	@Test

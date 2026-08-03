@@ -39,6 +39,7 @@ import org.slf4j.LoggerFactory;
 import java.net.InetSocketAddress;
 import java.security.SecureRandom;
 import java.util.*;
+import java.util.function.Function;
 
 import static io.activej.reactor.Reactive.checkInReactorThread;
 
@@ -126,6 +127,7 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 	private final int maxHandshakingConnections;
 	private final @Nullable Inspector inspector;
 	private final QuicConnection.@Nullable Inspector connectionInspector;
+	private final @Nullable Function<QuicConnection, QuicFrameHandler> frameHandlerFactory;
 
 	/**
 	 * Every connection ID that routes to a connection. A server connection is reachable under two: the
@@ -156,6 +158,7 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 		this.maxHandshakingConnections = builder.maxHandshakingConnections;
 		this.inspector = builder.inspector;
 		this.connectionInspector = builder.connectionInspector;
+		this.frameHandlerFactory = builder.frameHandlerFactory;
 	}
 
 	public static Builder builder(NioReactor reactor, IUdpSocket socket) {
@@ -173,6 +176,7 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 		private int maxHandshakingConnections = MAX_HANDSHAKING_CONNECTIONS;
 		private @Nullable Inspector inspector;
 		private QuicConnection.@Nullable Inspector connectionInspector;
+		private @Nullable Function<QuicConnection, QuicFrameHandler> frameHandlerFactory;
 
 		private Builder(NioReactor reactor, IUdpSocket socket) {
 			this.reactor = reactor;
@@ -242,6 +246,28 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 		public Builder withConnectionInspector(QuicConnection.Inspector connectionInspector) {
 			checkNotBuilt(this);
 			this.connectionInspector = connectionInspector;
+			return this;
+		}
+
+		/**
+		 * Supplies the layer above the transport — streams, HTTP/3, DATAGRAM — for every connection this
+		 * endpoint creates, both the ones it <b>accepts</b> and the ones {@link #connectTo} dials
+		 * (FR-039). The factory is invoked exactly once per connection, at construction, before any frame
+		 * is routed; see {@link QuicConnection.Builder#withFrameHandlerFactory} for what it may do with
+		 * the connection it is handed.
+		 * <p>
+		 * As with {@link #withConnectionInspector}, this is the only way to reach an <b>accepted</b>
+		 * connection at all: a server connection is built inside the dispatch, so there is no moment
+		 * between its construction and its first packet in which a caller could attach anything to it.
+		 * <p>
+		 * Without it the endpoint behaves exactly as it did before this method existed: no handler, zero
+		 * streams advertised, and an application frame is a {@code PROTOCOL_VIOLATION}. A factory that
+		 * throws while accepting refuses that connection exactly as an over-limit attempt is refused; one
+		 * that throws while dialling fails the {@link #connectTo} promise.
+		 */
+		public Builder withFrameHandlerFactory(Function<QuicConnection, QuicFrameHandler> frameHandlerFactory) {
+			checkNotBuilt(this);
+			this.frameHandlerFactory = frameHandlerFactory;
 			return this;
 		}
 
@@ -423,17 +449,11 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 			return;
 		}
 
-		QuicConnection connection = QuicConnection.builder(
-				reactor, Role.SERVER, this::sendDatagram, from, serverEngineFactory)
-			.withSettings(settings)
-			.withSecureRandom(secureRandom)
-			.withPeerConnectionId(clientScid)
-			.withOriginalDestinationConnectionId(envelope.destinationConnectionId())
-			.withOnClosed(() -> unregister(envelope.destinationConnectionId()))
-			.initialize(builder -> {
-				if (connectionInspector != null) builder.withInspector(connectionInspector);
-			})
-			.build();
+		QuicConnection connection = buildAcceptedOrRefuse(from, envelope, clientScid);
+		if (connection == null) {
+			drop(from, datagram);
+			return;
+		}
 
 		// Reachable under both: the client keeps addressing the DCID it invented until it has seen our
 		// chosen connection ID (RFC 9000 §7.2), and its Initial retransmissions will still carry it.
@@ -456,6 +476,52 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 
 		connection.start().whenComplete(($, e) -> handshaking.remove(connection));
 		connection.onDatagram(datagram);
+	}
+
+	/**
+	 * Builds the connection for an admitted client Initial, or {@code null} when it must be refused
+	 * instead — which today means only that the frame-handler factory of FR-039 threw.
+	 * <p>
+	 * The caller still owns the datagram either way; the refusal path here touches only the counters.
+	 * <p>
+	 * Only {@link io.activej.quic.connection.QuicConnection.Builder#build()} runs inside the
+	 * {@code try}, deliberately: it is the one call that invokes {@code frameHandlerFactory}, while
+	 * every {@code withXxx} above it is this endpoint's own static configuration, supplied the same way
+	 * for every accepted connection and never expected to throw. A bug in that configuration must
+	 * propagate rather than be relabelled as "the factory failed" and silently rejected — a server that
+	 * silently accepts nothing is the hardest failure there is to find.
+	 */
+	private @Nullable QuicConnection buildAcceptedOrRefuse(
+		InetSocketAddress from, Envelope envelope, QuicConnectionId clientScid
+	) {
+		QuicConnection.Builder builder = QuicConnection.builder(
+				reactor, Role.SERVER, this::sendDatagram, from, serverEngineFactory)
+			.withSettings(settings)
+			.withSecureRandom(secureRandom)
+			.withPeerConnectionId(clientScid)
+			.withOriginalDestinationConnectionId(envelope.destinationConnectionId())
+			.withOnClosed(() -> unregister(envelope.destinationConnectionId()));
+		if (connectionInspector != null) builder.withInspector(connectionInspector);
+		if (frameHandlerFactory != null) builder.withFrameHandlerFactory(frameHandlerFactory);
+
+		try {
+			return builder.build();
+		} catch (RuntimeException e) {
+			// The layer above refused to be built for this connection. Refusing is the answer an
+			// over-limit attempt gets, and for the same reason: a half-wired connection — one routing
+			// frames into a handler that never finished being built — is worse than none. Nothing is left
+			// to unwind, since the connection was never registered and never started.
+			//
+			// Logged, unlike a bound: a bound is peer-triggered and would be a log-flood channel, while a
+			// factory that throws is our own bug, and a server that silently accepts nothing is the
+			// hardest failure there is to find.
+			logger.warn("The frame handler factory failed; refusing this connection", e);
+			connectionsRejected++;
+			if (inspector != null) {
+				inspector.onConnectionRefused(this, from);
+			}
+			return null;
+		}
 	}
 
 	/**
@@ -572,15 +638,24 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 				"The QUIC endpoint is at its " + maxConnections + "-connection limit"));
 		}
 		QuicConnectionId[] localId = new QuicConnectionId[1];
-		QuicConnection connection = QuicConnection.builder(
-				reactor, Role.CLIENT, this::sendDatagram, address, clientEngineFactory)
-			.withSettings(settings)
-			.withSecureRandom(secureRandom)
-			.withOnClosed(() -> unregister(localId[0]))
-			.initialize(builder -> {
-				if (connectionInspector != null) builder.withInspector(connectionInspector);
-			})
-			.build();
+		QuicConnection connection;
+		try {
+			connection = QuicConnection.builder(
+					reactor, Role.CLIENT, this::sendDatagram, address, clientEngineFactory)
+				.withSettings(settings)
+				.withSecureRandom(secureRandom)
+				.withOnClosed(() -> unregister(localId[0]))
+				.initialize(builder -> {
+					if (connectionInspector != null) builder.withInspector(connectionInspector);
+					if (frameHandlerFactory != null) builder.withFrameHandlerFactory(frameHandlerFactory);
+				})
+				.build();
+		} catch (RuntimeException e) {
+			// A frame-handler factory that threw (FR-039). Reported through the promise, like every other
+			// way this method can refuse: a caller that already handles a refused dial should not need a
+			// second, synchronous failure path for the same outcome. Nothing was registered.
+			return Promise.ofException(e);
+		}
 		localId[0] = connection.localConnectionId();
 
 		// A client is addressed by the connection ID it advertised, which the server will use as the

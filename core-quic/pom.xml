@@ -34,6 +34,11 @@
       <artifactId>activej-net</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-csp</artifactId>
+      <version>${project.version}</version>
+    </dependency>
 
     <dependency>
       <groupId>org.slf4j</groupId>

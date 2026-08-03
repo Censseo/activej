@@ -37,6 +37,7 @@ import org.jetbrains.annotations.Nullable;
 import java.net.InetSocketAddress;
 import java.util.ArrayDeque;
 import java.util.List;
+import java.util.function.Function;
 
 /**
  * A client and a server {@link QuicConnection} joined by two hand-pumped queues, with no
@@ -105,6 +106,8 @@ public final class QuicWirePair implements AutoCloseable {
 	private @Nullable QuicConnection server;
 	private @Nullable QuicFrameHandler clientFrameHandler;
 	private @Nullable QuicFrameHandler serverFrameHandler;
+	private @Nullable Function<QuicConnection, QuicFrameHandler> clientFrameHandlerFactory;
+	private @Nullable Function<QuicConnection, QuicFrameHandler> serverFrameHandlerFactory;
 	private QuicConnection.@Nullable Inspector clientInspector;
 	private QuicConnection.@Nullable Inspector serverInspector;
 
@@ -117,6 +120,22 @@ public final class QuicWirePair implements AutoCloseable {
 	/** Registers the layer above the server. Must be called before {@link #acceptServer}. */
 	public QuicWirePair withServerFrameHandler(QuicFrameHandler handler) {
 		this.serverFrameHandler = handler;
+		return this;
+	}
+
+	/**
+	 * The factory form of {@link #withClientFrameHandler}, for a handler that must hold the connection
+	 * it serves — a {@code QuicStreamManager} does, because an application write originates traffic
+	 * from a path no frame triggered. Must be called before {@link #startClient}.
+	 */
+	public QuicWirePair withClientFrameHandlerFactory(Function<QuicConnection, QuicFrameHandler> factory) {
+		this.clientFrameHandlerFactory = factory;
+		return this;
+	}
+
+	/** The factory form of {@link #withServerFrameHandler}. Must be called before {@link #acceptServer}. */
+	public QuicWirePair withServerFrameHandlerFactory(Function<QuicConnection, QuicFrameHandler> factory) {
+		this.serverFrameHandlerFactory = factory;
 		return this;
 	}
 
@@ -165,6 +184,7 @@ public final class QuicWirePair implements AutoCloseable {
 			.withSettings(settings)
 			.initialize(builder -> {
 				if (clientFrameHandler != null) builder.withFrameHandler(clientFrameHandler);
+				if (clientFrameHandlerFactory != null) builder.withFrameHandlerFactory(clientFrameHandlerFactory);
 				if (clientInspector != null) builder.withInspector(clientInspector);
 			})
 			.build();
@@ -202,6 +222,7 @@ public final class QuicWirePair implements AutoCloseable {
 			.withOriginalDestinationConnectionId(clientDcid)
 			.initialize(builder -> {
 				if (serverFrameHandler != null) builder.withFrameHandler(serverFrameHandler);
+				if (serverFrameHandlerFactory != null) builder.withFrameHandlerFactory(serverFrameHandlerFactory);
 				if (serverInspector != null) builder.withInspector(serverInspector);
 			})
 			.build();

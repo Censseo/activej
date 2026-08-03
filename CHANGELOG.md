@@ -44,6 +44,62 @@ explicitly.
   rethrown unwrapped, and the JVM is terminated via the new overridable
   `Launcher.onFatalError(Throwable)` hook (`System.exit(-1)` by default).
   Override the hook in tests or embedded environments.
+- **QUIC stream limits are now advertised.** With the new
+  `io.activej.quic.stream` package, a `QuicConnection` advertises non-zero
+  RFC 9000 §18.2 stream transport parameters where it previously advertised
+  zero for all of them. **A peer that could open no stream at all can now open
+  one** — up to 100 bidirectional and 3 unidirectional streams, each with a
+  256 KiB receive window and 1 MiB across the connection — and this endpoint
+  will buffer that much of its data. Applications that relied on the
+  effectively stream-less transport of the previous release must set the values
+  back to `0` explicitly, either on `QuicConnectionSettings.builder()` or with
+  the corresponding system property.
+
+  All nine settings are `ApplicationSettings` keys under the namespace
+  `QuicConnection` already used by the connection layer, so both
+  `-Dio.activej.quic.connection.QuicConnection.initialMaxData=4mb` and
+  `-DQuicConnection.initialMaxData=4mb` work. The first six leave the process
+  as transport parameters; the last three are local bounds the peer never sees.
+
+  | Setting | Default | What it bounds | Behaviour at the bound |
+  |---|---|---|---|
+  | `initialMaxData` | `1mb` | bytes the peer may send across all streams before being granted more | peer over it → `FLOW_CONTROL_ERROR`; local sender at it → the write is withheld |
+  | `initialMaxStreamDataBidiLocal` | `256kb` | bytes the peer may send on a bidirectional stream **we** opened | as above |
+  | `initialMaxStreamDataBidiRemote` | `256kb` | bytes the peer may send on a bidirectional stream **it** opened | as above |
+  | `initialMaxStreamDataUni` | `256kb` | bytes the peer may send on a unidirectional stream it opened | as above |
+  | `initialMaxStreamsBidi` | `100` | bidirectional streams the peer may have open at once | peer over it → `STREAM_LIMIT_ERROR` |
+  | `initialMaxStreamsUni` | `3` | unidirectional streams the peer may have open at once | peer over it → `STREAM_LIMIT_ERROR` |
+  | `maxOutstandingStreamBytes` | `512kb` | stream bytes handed to the connection but neither acknowledged nor declared lost, summed over all streams | the writer's completion is withheld; never an error |
+  | `maxReceiveRangesPerStream` | `32` | **discontiguous buffered ranges** per receiving part | connection closed with `INTERNAL_ERROR` |
+  | `maxPendingStreamOpens` | `128` | local open requests withheld at once for want of peer stream credit | a further request fails with `QuicStreamLimitException` naming the key |
+
+  Two of these are refused at `build()` rather than merely warned about, because
+  each is a deadlock rather than a misconfiguration: `maxOutstandingStreamBytes`
+  must stay below `maxSendQueueBytes` (so a control frame always fits), and no
+  `initialMaxStreamData*` may exceed `initialMaxData` (so a per-stream window
+  never promises credit the connection window cannot honour).
+
+  **`maxReceiveRangesPerStream` does not bound memory.** It counts
+  *discontiguous* buffered ranges — gaps — exactly as the connection layer's
+  `maxAckRanges` counts separate runs of packet numbers, and **not** the number
+  of buffered `ByteBuf` pieces. A run of buffered pieces that touch end-to-end
+  is one range however many pieces it is made of, so an ordinary lossy path (one
+  lost frame followed by a window of in-order frames) is a single range. Buffered
+  *bytes* are bounded by flow control instead — by the stream receive window this
+  endpoint advertised — so raising this setting does not raise the memory a peer
+  can make a stream hold, and lowering it does not lower it.
+
+  What it *does* scale, as of this release, is a second and independent bound:
+  the number of buffered **pieces** per receiving part, at
+  `maxReceiveRangesPerStream × 64` (so **2048** by default), exceeding which
+  closes the connection with the same `INTERNAL_ERROR`. Flow control bounds the
+  payload, not the cost of tracking it: a peer that withholds the first byte of a
+  stream and sends every later byte as its own `STREAM` frame holds the range
+  count at one forever while every byte buys a map entry, a boxed key and a
+  buffer header. The multiplier is a documented constant rather than a tenth
+  setting — 64 pieces per permitted range sits an order of magnitude above the
+  ~220 pieces a full 256 KiB window of MTU-sized frames behind one gap produces,
+  so ordinary loss and reordering never approach it.
 
 ### Notable fixes
 
@@ -77,7 +133,12 @@ explicitly.
   layer above; the transport keeps PADDING, PING, ACK, CRYPTO,
   CONNECTION_CLOSE and HANDSHAKE_DONE for itself. This is the first
   reactor-facing surface in `core-quic`, and the module's first dependency on
-  `activej-net`.
+  `activej-net`. A handler contributes frames with
+  `QuicConnection.enqueueFrame` (appended) and retransmits with
+  `QuicConnection.requeueFrame` (ahead of everything queued, RFC 9002 §6.5) —
+  the distinction matters because a handler may have queued far more than a
+  congestion window, and an appended retransmission would wait out that whole
+  backlog while the receiver holds every byte past the gap it fills.
 
   Diagnostics come in two forms, neither of which pulls in a JMX dependency:
   plain counter accessors, and an optional `Inspector` hook on both

@@ -209,6 +209,8 @@ public final class QuicHostileInputTest {
 		QuicConnectionSettings settings = QuicConnectionSettings.builder()
 			.withMaxDatagramSize(MemSize.bytes(1200))
 			.withMaxSendQueueBytes(MemSize.kilobytes(4))
+			// Feature 04 requires maxOutstandingStreamBytes < maxSendQueueBytes, and the default is 512 kB.
+			.withMaxOutstandingStreamBytes(MemSize.kilobytes(2))
 			.build();
 		SendQueue queue = new SendQueue(settings.maxSendQueueBytes());
 		try {
