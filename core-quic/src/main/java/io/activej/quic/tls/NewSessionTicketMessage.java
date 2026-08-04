@@ -42,8 +42,9 @@ public final class NewSessionTicketMessage extends TlsHandshakeMessage {
 		if ((ticketLifetime & ~0xFFFFFFFFL) != 0 || (ticketAgeAdd & ~0xFFFFFFFFL) != 0) {
 			throw new IllegalArgumentException("ticket_lifetime and ticket_age_add are uint32 values");
 		}
-		if (ticketNonce.length == 0 || ticketNonce.length > 255) {
-			throw new IllegalArgumentException("ticket_nonce must be 1..255 bytes: " + ticketNonce.length);
+		// RFC 8446 §4.6.1: `opaque ticket_nonce<0..255>` — empty is legal here, unlike `ticket` below.
+		if (ticketNonce.length > 255) {
+			throw new IllegalArgumentException("ticket_nonce must be 0..255 bytes: " + ticketNonce.length);
 		}
 		if (ticket.length == 0 || ticket.length > 0xFFFF) {
 			throw new IllegalArgumentException("ticket must be 1..65535 bytes: " + ticket.length);

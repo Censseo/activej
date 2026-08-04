@@ -185,10 +185,10 @@ public final class TlsMessages {
 		requireRemaining(body, 4 + 4 + 1, "NewSessionTicket fixed fields");
 		long ticketLifetime = readUint32(body);
 		long ticketAgeAdd = readUint32(body);
+		// RFC 8446 §4.6.1 declares `opaque ticket_nonce<0..255>` — an **empty** nonce is legal, unlike the
+		// `ticket<1..2^16-1>` below, whose lower bound really is 1. quic-go sends an empty one, and
+		// rejecting it used to kill an established connection post-handshake.
 		int nonceLength = body.readByte() & 0xFF;
-		if (nonceLength == 0) {
-			throw new MalformedDataException("ticket_nonce must be at least 1 byte (RFC 8446 §4.6.1)");
-		}
 		if (nonceLength > body.readRemaining()) {
 			throw new TruncatedDataException(
 				"ticket_nonce declares " + nonceLength + " bytes with " + body.readRemaining() + " remaining");
