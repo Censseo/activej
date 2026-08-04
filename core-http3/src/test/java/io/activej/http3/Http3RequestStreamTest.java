@@ -242,6 +242,61 @@ public final class Http3RequestStreamTest {
 			List.of(), connectionErrors);
 	}
 
+	/**
+	 * RFC 9204 §3.1: an invalid <b>static</b> table index MUST be a connection error. QPACK is the one
+	 * place where the scope does not follow from the error code — every failure here is
+	 * {@code QPACK_DECOMPRESSION_FAILED} (0x0200) and the RFC assigns the scope per cause — so this
+	 * asserts the escalation end to end, not just the decoder's verdict.
+	 */
+	@Test
+	public void anInvalidStaticTableIndexIsReportedAsAConnectionError() {
+		connect();
+		QuicStream clientStream = openClientStream();
+		// prefix (RIC=0, S/DeltaBase=0), then Indexed Field Line "1 1 index(6+)" with index = 99, one past
+		// the last valid static entry: 6-bit prefix all ones (63) plus a continuation of 36.
+		clientStream.writer().accept(Http3TestBytes.frame(HeadersFrame.TYPE,
+			new byte[] {0x00, 0x00, (byte) 0xFF, 0x24}));
+
+		wire.driveUntil(() -> !serverStreams.isEmpty());
+		Http3RequestStream requestStream = serverStreams.get(0);
+		Promise<HttpRequest> received = requestStream.receiveRequest();
+		wire.driveUntil(received::isComplete);
+
+		assertTrue("an out-of-range static index is rejected: " + received, received.isException());
+		assertEquals(Http3Errors.QPACK_DECOMPRESSION_FAILED,
+			((Http3Exception) received.getException()).errorCode());
+		assertEquals(Http3RequestStream.State.RESET, requestStream.state());
+		assertEquals("a static-table disagreement was escalated: " + connectionErrors,
+			1, connectionErrors.size());
+		assertEquals(Http3Errors.QPACK_DECOMPRESSION_FAILED, connectionErrors.get(0).errorCode());
+	}
+
+	/**
+	 * The negative control, and the reason the scope cannot be read off the code: this failure carries
+	 * the <b>same</b> {@code QPACK_DECOMPRESSION_FAILED} as the test above and must stay stream-scoped.
+	 * RFC 9204 §7 keeps a local decode limit on the stream; the static table holds no cross-section
+	 * state that a truncated section could corrupt.
+	 */
+	@Test
+	public void aTruncatedFieldSectionIsNotReportedAsAConnectionError() {
+		connect();
+		QuicStream clientStream = openClientStream();
+		// A Required Insert Count marker (8-bit prefix all ones) demanding a continuation that never comes.
+		clientStream.writer().accept(Http3TestBytes.frame(HeadersFrame.TYPE, new byte[] {(byte) 0xFF}));
+
+		wire.driveUntil(() -> !serverStreams.isEmpty());
+		Http3RequestStream requestStream = serverStreams.get(0);
+		Promise<HttpRequest> received = requestStream.receiveRequest();
+		wire.driveUntil(received::isComplete);
+
+		assertTrue("a truncated field section is rejected: " + received, received.isException());
+		assertEquals(Http3Errors.QPACK_DECOMPRESSION_FAILED,
+			((Http3Exception) received.getException()).errorCode());
+		assertEquals(Http3RequestStream.State.RESET, requestStream.state());
+		assertEquals("a truncated section never reaches the connection: " + connectionErrors,
+			List.of(), connectionErrors);
+	}
+
 	@Test
 	public void aContentLengthThatDisagreesWithTheBodyIsAMessageError() {
 		connect();
