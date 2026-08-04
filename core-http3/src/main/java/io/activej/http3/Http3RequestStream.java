@@ -1,0 +1,935 @@
+/*
+ * Copyright (C) 2020 ActiveJ LLC.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.activej.http3;
+
+import io.activej.bytebuf.ByteBuf;
+import io.activej.bytebuf.ByteBufPool;
+import io.activej.common.builder.AbstractBuilder;
+import io.activej.common.recycle.Recyclers;
+import io.activej.csp.consumer.AbstractChannelConsumer;
+import io.activej.csp.consumer.ChannelConsumer;
+import io.activej.csp.consumer.ChannelConsumers;
+import io.activej.csp.supplier.AbstractChannelSupplier;
+import io.activej.csp.supplier.ChannelSupplier;
+import io.activej.http.HttpHeaders;
+import io.activej.http.HttpMessage;
+import io.activej.http.HttpRequest;
+import io.activej.http.HttpResponse;
+import io.activej.http3.Http3Headers.Field;
+import io.activej.http3.frame.DataFrame;
+import io.activej.http3.frame.HeadersFrame;
+import io.activej.http3.frame.Http3Frame;
+import io.activej.http3.frame.Http3FrameReader;
+import io.activej.http3.frame.Http3FrameSequence;
+import io.activej.http3.frame.Http3Frames;
+import io.activej.http3.frame.UnknownFrame;
+import io.activej.http3.qpack.QpackDecoder;
+import io.activej.http3.qpack.QpackEncoder;
+import io.activej.http3.qpack.QpackException;
+import io.activej.http3.qpack.QpackStaticDecoder;
+import io.activej.http3.qpack.QpackStaticEncoder;
+import io.activej.promise.Promise;
+import io.activej.promise.SettablePromise;
+import io.activej.quic.codec.QuicVarInts;
+import io.activej.quic.stream.QuicStream;
+import io.activej.quic.stream.QuicStreamException;
+import io.activej.reactor.AbstractReactive;
+import io.activej.reactor.Reactor;
+import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+import java.util.function.Consumer;
+
+import static io.activej.common.Utils.nullify;
+import static io.activej.reactor.Reactive.checkInReactorThread;
+
+/**
+ * The HTTP/3 layer of one bidirectional QUIC stream (RFC 9114 §4.1): one request, one response, and the
+ * frame sequence both must obey.
+ *
+ * <h2>Two roles, one state machine</h2>
+ * A request stream is symmetric, and so is this class: a server calls {@link #receiveRequest()} then
+ * {@link #sendResponse}, a client calls {@link #sendRequest} then {@link #receiveResponse()}. The
+ * halves share every mechanism — the frame sequence, the QPACK codecs, the body channels, the abort
+ * path — and differ only in which direction carries which message. Two parallel classes would have been
+ * two copies of that machinery, drifting.
+ *
+ * <h2>What it owns</h2>
+ * <ul>
+ *   <li>the RFC 9114 §4.1 sequence, one {@link Http3FrameSequence} per direction — this class does not
+ *       re-decide which frame may follow which, it drives that validator;</li>
+ *   <li>the inbound body as an {@link AbstractChannelSupplier} that de-frames DATA off
+ *       {@link QuicStream#reader()}, and the outbound body as an {@link AbstractChannelConsumer} that
+ *       frames DATA onto {@link QuicStream#writer()} (FR-053, WI-3);</li>
+ *   <li>the message it decodes from the peer's HEADERS and the message it is handed to send — both are
+ *       released here when the exchange completes, is aborted, or the connection ends, <b>unless</b>
+ *       their body was taken, in which case ownership went with it (FR-057a). The one message that
+ *       leaves this ownership is the {@link HttpResponse} {@link #receiveResponse()} delivers: a client
+ *       hands it to its caller, and the caller owns it from that moment.</li>
+ * </ul>
+ *
+ * <h2>State</h2>
+ * <pre>{@code
+ * IDLE ──HEADERS──► HEADERS_DONE ──DATA──► BODY        (repeatable; a zero-length DATA is legal)
+ * HEADERS_DONE | BODY ──trailing HEADERS──► TRAILERS_DONE
+ * any ──FIN──► COMPLETE
+ * any ──RESET_STREAM / STOP_SENDING / local H3 error──► RESET
+ * }</pre>
+ * The state tracks the <b>receive</b> direction plus the two terminal states, because that is the
+ * direction a peer drives and therefore the one worth reporting.
+ *
+ * <h2>Failures</h2>
+ * A violation of the <i>message</i> aborts <i>this stream</i> with its RFC 9114 §8.1 code and leaves the
+ * connection alone (FR-037): a malformed message is one client's problem, not the connection's. A
+ * violation of the <i>framing</i> is not — a PUSH_PROMISE against a push limit of 0
+ * ({@code H3_ID_ERROR}) and every frame RFC 9114 §7.2's table does not permit on a request stream
+ * ({@code H3_FRAME_UNEXPECTED}) are reported to the
+ * {@linkplain Builder#withConnectionErrorListener connection-error listener} as well, and close the
+ * connection (FR-024, FR-025); see {@link #isConnectionError}. A
+ * failure the stream layer reports — {@code QuicStreamResetException},
+ * {@code QuicStreamStopSendingException} — reaches the caller <b>unwrapped</b>, carrying the peer's own
+ * application error code (FR-058c); wrapping it would hide exactly the code the peer chose to send.
+ *
+ * <h2>Buffer ownership</h2>
+ * Every buffer taken from {@link QuicStream#reader()} is recycled here or handed to the body supplier's
+ * consumer, which then owns it. Every buffer given to {@link QuicStream#writer()} is owned by the
+ * writer on every path, failures included. Nothing is buffered between HTTP and QUIC: the response body
+ * consumer propagates the writer's own promise, so backpressure is QUIC's stream flow control (FR-056).
+ *
+ * @see <a href="https://www.rfc-editor.org/rfc/rfc9114#section-4.1">RFC 9114 §4.1 — HTTP Message Framing</a>
+ */
+public final class Http3RequestStream extends AbstractReactive {
+	private static final Logger logger = LoggerFactory.getLogger(Http3RequestStream.class);
+
+	/** {@link #declaredContentLength} when the message declared none. */
+	private static final long NO_CONTENT_LENGTH = -1;
+
+	public enum State {
+		/** Nothing has been received on this stream yet. */
+		IDLE,
+		/** The leading HEADERS frame has been decoded into a message. */
+		HEADERS_DONE,
+		/** At least one DATA frame has been received since the leading HEADERS. */
+		BODY,
+		/** The optional trailing HEADERS frame has been received. */
+		TRAILERS_DONE,
+		/** The peer FINed the stream and everything it sent has been accounted for. Terminal. */
+		COMPLETE,
+		/** Aborted, by the peer or locally. Terminal. */
+		RESET,
+	}
+
+	private final QuicStream stream;
+
+	private Http3Settings settings = Http3Settings.create();
+	private QpackEncoder qpackEncoder = new QpackStaticEncoder();
+	private @Nullable QpackDecoder qpackDecoder;
+	private Consumer<Http3Exception> connectionErrorListener = e -> {};
+	private Http3EventListener eventListener = Http3EventListener.NONE;
+
+	private final Http3FrameSequence inbound = new Http3FrameSequence();
+	private final Http3FrameSequence outbound = new Http3FrameSequence();
+	private @Nullable Http3FrameReader frameReader;
+	private @Nullable ChannelSupplier<ByteBuf> reader;
+
+	private State state = State.IDLE;
+	private boolean inboundRequested;
+	private boolean outboundSent;
+
+	/** Whatever of the last read remains undecoded; owned here and recycled on every terminal path. */
+	private @Nullable ByteBuf pendingInput;
+
+	/** Whether the frame reader stopped inside a frame — what makes an end of input a truncation. */
+	private boolean midFrame;
+	private boolean endOfInput;
+
+	private long bodyBytesReceived;
+	private long bodyBytesSent;
+	private long declaredContentLength = NO_CONTENT_LENGTH;
+
+	/** Informational (1xx) responses consumed on this exchange, against {@code maxInterimResponses}. */
+	private int interimResponsesReceived;
+
+	/** Whatever this stream decoded from the peer's HEADERS; kept for its trailers even once handed over. */
+	private @Nullable HttpMessage inboundMessage;
+
+	/**
+	 * True once {@link #receiveResponse()} delivered the inbound message to a caller who now owns it, so
+	 * this stream no longer releases it — the one place ownership leaves here (FR-057a).
+	 */
+	private boolean inboundHandedOver;
+
+	/**
+	 * True once the inbound body supplier has been asked for a chunk — what tells a message somebody is
+	 * reading from one nobody ever touched. See {@link #isReceivingBody()}.
+	 */
+	private boolean bodyRequested;
+
+	/** {@link #whenReceiveComplete()}'s promise; allocated only if somebody asks for it. */
+	private @Nullable SettablePromise<Void> receiveComplete;
+
+	private @Nullable InboundBodySupplier bodySupplier;
+	private @Nullable Exception terminalException;
+
+	private Http3RequestStream(Reactor reactor, QuicStream stream) {
+		super(reactor);
+		this.stream = stream;
+	}
+
+	public static Builder builder(Reactor reactor, QuicStream stream) {
+		return new Http3RequestStream(reactor, stream).new Builder();
+	}
+
+	public static Http3RequestStream create(Reactor reactor, QuicStream stream) {
+		return builder(reactor, stream).build();
+	}
+
+	public final class Builder extends AbstractBuilder<Builder, Http3RequestStream> {
+		private Builder() {}
+
+		public Builder withSettings(Http3Settings settings) {
+			checkNotBuilt(this);
+			Http3RequestStream.this.settings = settings;
+			return this;
+		}
+
+		/** The connection's encoder — QPACK state is per connection, never per stream (RFC 9204 §4.2). */
+		public Builder withQpackEncoder(QpackEncoder qpackEncoder) {
+			checkNotBuilt(this);
+			Http3RequestStream.this.qpackEncoder = qpackEncoder;
+			return this;
+		}
+
+		/** The connection's decoder; one bounded by {@code settings} is built if none is supplied. */
+		public Builder withQpackDecoder(QpackDecoder qpackDecoder) {
+			checkNotBuilt(this);
+			Http3RequestStream.this.qpackDecoder = qpackDecoder;
+			return this;
+		}
+
+		/**
+		 * Where a violation this stream observes but the <b>connection</b> owns is reported — see
+		 * {@link #isConnectionError}. The listener is invoked after the stream has been aborted with the
+		 * same code, so an owner that closes the connection finds nothing half-done.
+		 */
+		public Builder withConnectionErrorListener(Consumer<Http3Exception> listener) {
+			checkNotBuilt(this);
+			Http3RequestStream.this.connectionErrorListener = listener;
+			return this;
+		}
+
+		/**
+		 * The connection's observability seam, so a reset or a discarded frame on this stream reaches the
+		 * {@link Http3Server.Inspector} or {@link Http3Client.Inspector} above it (FR-062). Package-private
+		 * for the reason {@link Http3EventListener} gives.
+		 */
+		Builder withEventListener(Http3EventListener eventListener) {
+			checkNotBuilt(this);
+			Http3RequestStream.this.eventListener = eventListener;
+			return this;
+		}
+
+		@Override
+		protected Http3RequestStream doBuild() {
+			if (qpackDecoder == null) {
+				qpackDecoder = new QpackStaticDecoder(settings.maxFieldSectionSize());
+			}
+			// Each frame type is bounded by what this endpoint accepts of that type, at the moment its
+			// declared length parses and before a byte of its payload is allocated — the field section to
+			// maxFieldSectionSize, the body to maxBodySize. One bound covering both would have to be the
+			// wider of them, and a HEADERS frame is buffered whole: a peer would buy a body's worth of
+			// allocation per stream with a frame header it never follows through on (T116).
+			frameReader = new Http3FrameReader(
+				settings.maxFieldSectionSize(), settings.maxBodySize(), Http3Errors.H3_EXCESSIVE_LOAD);
+			return Http3RequestStream.this;
+		}
+	}
+
+	// ---------------------------------------------------------------- accessors
+
+	public long id() {
+		checkInReactorThread(this);
+		return stream.id();
+	}
+
+	public State state() {
+		checkInReactorThread(this);
+		return state;
+	}
+
+	/** The stream this exchange runs on, for the connection that owns both. */
+	public QuicStream quicStream() {
+		checkInReactorThread(this);
+		return stream;
+	}
+
+	/** Whether this exchange has reached {@link State#COMPLETE} or {@link State#RESET}. */
+	public boolean isTerminated() {
+		checkInReactorThread(this);
+		return state == State.RESET || state == State.COMPLETE;
+	}
+
+	/**
+	 * Whether a consumer is still reading the message this stream received: its body supplier has been
+	 * asked for at least one chunk, and the receive direction has neither finished nor been aborted.
+	 * <p>
+	 * This is the distinction {@link Http3Client}'s pool needs (FR-049): an exchange ends at the response
+	 * <b>head</b>, so a connection with no exchange left on it may still be streaming a body into a
+	 * caller's hands, and evicting it would sever exactly that. A message nobody ever began reading is
+	 * deliberately <b>not</b> reported here — nothing of it is in transfer, and it produces no completion
+	 * event of its own either, since only a read can reach the end of the stream.
+	 */
+	public boolean isReceivingBody() {
+		checkInReactorThread(this);
+		return bodyRequested && state != State.COMPLETE && state != State.RESET;
+	}
+
+	/**
+	 * Completes once this stream stops receiving — the peer FINed it and everything it sent was accounted
+	 * for, or either side aborted it. It never fails: what it reports is that nothing more will arrive
+	 * here, not whether what arrived was whole, which is {@link #terminalException()}'s answer.
+	 * <p>
+	 * A message a consumer never reads reaches neither of those, so this is not the whole of "is this
+	 * stream still busy"; {@link #isReceivingBody()} is the other half of it.
+	 */
+	public Promise<Void> whenReceiveComplete() {
+		checkInReactorThread(this);
+		if (state == State.COMPLETE || state == State.RESET) return Promise.complete();
+		if (receiveComplete == null) receiveComplete = new SettablePromise<>();
+		return receiveComplete;
+	}
+
+	/** Why this exchange was aborted, or {@code null} if it was not. */
+	public @Nullable Exception terminalException() {
+		checkInReactorThread(this);
+		return terminalException;
+	}
+
+	/** DATA-frame payload bytes taken off this stream so far — body bytes only, framing excluded. */
+	public long bodyBytesReceived() {
+		checkInReactorThread(this);
+		return bodyBytesReceived;
+	}
+
+	/** DATA-frame payload bytes handed to this stream's writer so far — body bytes only, framing excluded. */
+	public long bodyBytesSent() {
+		checkInReactorThread(this);
+		return bodyBytesSent;
+	}
+
+	// ---------------------------------------------------------------- receiving a message
+
+	/**
+	 * Reads the leading HEADERS frame and maps it to an {@link HttpRequest} whose body streams the DATA
+	 * frames that follow — the server half. May be called once.
+	 * <p>
+	 * The returned message is owned by this stream (FR-057a): it is released by {@link #sendResponse} or
+	 * by {@link #abort}, so a servlet that never touches the body leaks nothing.
+	 *
+	 * @return a promise failing with {@link Http3Exception} on an H3 protocol violation — the stream is
+	 * aborted with its code first — or, unwrapped, with whatever the stream layer reported (FR-058c)
+	 */
+	public Promise<HttpRequest> receiveRequest() {
+		checkInReactorThread(this);
+		beginReceive("request");
+		if (terminalException != null) return Promise.ofException(terminalException);
+		// RFC 9114 §4.1: a stream that ends before a complete request is an incomplete request, not a
+		// malformed one — the difference is whether the peer sent something wrong.
+		return readHeaders(this::buildRequest, Http3Errors.H3_REQUEST_INCOMPLETE);
+	}
+
+	/**
+	 * Reads the leading HEADERS frame and maps it to an {@link HttpResponse} whose body streams the DATA
+	 * frames that follow — the client half of {@link #receiveRequest()}. May be called once.
+	 * <p>
+	 * <b>Ownership</b>: unlike the request a server receives, the response this delivers <b>leaves</b>
+	 * this stream's ownership the moment the promise resolves — a client hands it to its caller, who then
+	 * owns the message and whatever {@code loadBody()} produces from it. Until then, and on every failure
+	 * path, it is released here like any other message this stream built.
+	 *
+	 * @return a promise failing as {@link #receiveRequest()} does
+	 */
+	public Promise<HttpResponse> receiveResponse() {
+		checkInReactorThread(this);
+		beginReceive("response");
+		if (terminalException != null) return Promise.ofException(terminalException);
+		// RFC 9114 §4.1.2: a response that is not fully formed is a malformed message, and every malformed
+		// message is a stream error of type H3_MESSAGE_ERROR. H3_REQUEST_INCOMPLETE names a *client's*
+		// stream and would misreport the direction.
+		return readHeaders(this::buildResponse, Http3Errors.H3_MESSAGE_ERROR)
+			.whenResult($ -> inboundHandedOver = true);
+	}
+
+	private void beginReceive(String what) {
+		if (inboundRequested) {
+			throw new IllegalStateException(
+				"The " + what + " of stream " + stream.id() + " has already been requested");
+		}
+		inboundRequested = true;
+	}
+
+	/**
+	 * Builds the inbound message from the leading HEADERS frame, taking ownership of it on every path.
+	 * <p>
+	 * Returns {@code null} for a field section that is <b>not</b> the message — an informational
+	 * ({@code 1xx}) response, the one case RFC 9114 §4.1 has a HEADERS frame open nothing — which tells
+	 * {@link #readHeaders} to consume it and keep reading.
+	 */
+	@FunctionalInterface
+	private interface InboundMessage<T extends HttpMessage> {
+		@Nullable T build(HeadersFrame headers) throws Http3Exception;
+	}
+
+	private <T extends HttpMessage> Promise<T> readHeaders(InboundMessage<T> message, long incompleteErrorCode) {
+		return nextFrame().then(frame -> {
+			if (frame == null) {
+				return Promise.ofException(abortWith(new Http3Exception(incompleteErrorCode,
+					"The stream ended before its HEADERS frame")));
+			}
+			if (!(frame instanceof HeadersFrame headers)) {
+				// Unreachable rather than tolerated: an unknown or GREASE type never leaves nextFrame()
+				// (RFC 9114 §9, see its Javadoc), and DATA in IDLE is already H3_FRAME_UNEXPECTED from the
+				// sequence validator. Stated as a failure rather than a skip so this can never become a
+				// loop driven by what a peer sends.
+				Recyclers.recycle(frame);
+				return Promise.ofException(abortWith(new Http3Exception(Http3Errors.H3_FRAME_UNEXPECTED,
+					"A frame other than HEADERS opened the message")));
+			}
+			T built;
+			try {
+				built = message.build(headers);
+			} catch (Http3Exception e) {
+				return Promise.ofException(abortWith(e));
+			}
+			if (built == null) {
+				// An informational response: consumed, and the message it precedes is still ahead. Bounded
+				// recursion — buildResponse refuses more than settings.maxInterimResponses() of them, which
+				// is what stops a server from making its 1xx count this thread's stack depth.
+				return readHeaders(message, incompleteErrorCode);
+			}
+			return Promise.of(built);
+		});
+	}
+
+	/** Takes ownership of {@code headers} on every path. */
+	private HttpRequest buildRequest(HeadersFrame headers) throws Http3Exception {
+		List<Field> fields = decodeFieldSection(headers);
+		HttpRequest.Builder builder = Http3Headers.toRequestBuilder(fields);
+
+		bodySupplier = new InboundBodySupplier();
+		builder.withBodyStream(bodySupplier);
+		builder.withMaxBodySize((int) Math.min(Integer.MAX_VALUE, settings.maxBodySize()));
+		// Assigned before the last validation step, so that a rejection releases the message through the
+		// one path that owns it rather than through a second, parallel one.
+		HttpRequest request = builder.build();
+		inboundMessage = request;
+		readDeclaredContentLength(request);
+		state = State.HEADERS_DONE;
+		return request;
+	}
+
+	/**
+	 * Takes ownership of {@code headers} on every path.
+	 *
+	 * @return {@code null} for an informational ({@code 1xx}) response, which RFC 9114 §4.1 has the
+	 * client consume before reading on for the final one — see {@link InboundMessage#build}
+	 */
+	private @Nullable HttpResponse buildResponse(HeadersFrame headers) throws Http3Exception {
+		List<Field> fields = decodeFieldSection(headers);
+		if (Http3Headers.isInformationalStatus(fields)) {
+			Http3Headers.validateInterimResponse(fields);
+			if (++interimResponsesReceived > settings.maxInterimResponses()) {
+				throw new Http3Exception(Http3Errors.H3_EXCESSIVE_LOAD,
+					"More than " + settings.maxInterimResponses() + " informational responses on one exchange");
+			}
+			// The grammar has to be told, because it only ever sees a frame type: this HEADERS opened
+			// nothing, and the next one is the message rather than its trailer section.
+			inbound.withdrawInformationalHeaders();
+			return null;
+		}
+		HttpResponse.Builder builder = Http3Headers.toResponseBuilder(fields);
+
+		bodySupplier = new InboundBodySupplier();
+		builder.withBodyStream(bodySupplier);
+		builder.withMaxBodySize((int) Math.min(Integer.MAX_VALUE, settings.maxBodySize()));
+		HttpResponse response = builder.build();
+		inboundMessage = response;
+		readDeclaredContentLength(response);
+		state = State.HEADERS_DONE;
+		return response;
+	}
+
+	/** FR-039: what the message says its body will weigh, reconciled against the DATA at end of input. */
+	private void readDeclaredContentLength(HttpMessage message) throws Http3Exception {
+		String contentLength = message.getHeader(HttpHeaders.CONTENT_LENGTH);
+		if (contentLength == null) return;
+		try {
+			declaredContentLength = Long.parseLong(contentLength.trim());
+		} catch (NumberFormatException e) {
+			throw new Http3Exception(Http3Errors.H3_MESSAGE_ERROR, "Content-Length is not a number");
+		}
+		if (declaredContentLength < 0) {
+			throw new Http3Exception(Http3Errors.H3_MESSAGE_ERROR, "Content-Length is negative");
+		}
+	}
+
+	/**
+	 * Bounds the encoded field section before decoding it (FR-030), then hands the payload to the QPACK
+	 * decoder, <b>which owns and recycles it on every path</b>.
+	 */
+	private List<Field> decodeFieldSection(HeadersFrame headers) throws Http3Exception {
+		int encodedLength = headers.fieldSection.readRemaining();
+		if (encodedLength > settings.maxFieldSectionSize()) {
+			headers.recycle();
+			throw new Http3Exception(Http3Errors.H3_EXCESSIVE_LOAD,
+				"A field section of " + encodedLength + " bytes exceeds the " +
+				settings.maxFieldSectionSize() + "-byte bound");
+		}
+		try {
+			return Http3Headers.fromQpack(qpackDecoder.decode(headers.fieldSection));
+		} catch (QpackException e) {
+			// The QPACK codes are a space of their own (RFC 9204 §6); the code it chose is the code the
+			// stream is aborted with.
+			throw new Http3Exception(e.errorCode(), e.getMessage());
+		}
+	}
+
+	// ---------------------------------------------------------------- sending a message
+
+	/**
+	 * Writes {@code response} as a HEADERS frame, its body as DATA frames, and FIN after the last of
+	 * them (FR-043) — the server half.
+	 * <p>
+	 * Takes ownership of {@code response} — and releases the {@link HttpRequest} this stream built, the
+	 * moment the servlet's answer is in hand, exactly as {@code HttpServerConnection} does. On an
+	 * already-aborted stream the response is released and the promise fails with the abort's own
+	 * exception, so a servlet that answers a request nobody is waiting for still leaks nothing.
+	 */
+	public Promise<Void> sendResponse(HttpResponse response) {
+		checkInReactorThread(this);
+		beginSend(response, "response");
+		// The servlet's answer is in hand, so nothing more will be asked of the request it answers.
+		releaseInbound();
+		return sendMessage(response, Http3Headers.fromResponse(response));
+	}
+
+	/**
+	 * Writes {@code request} as a HEADERS frame, its body as DATA frames, and FIN after the last of them
+	 * — the client half of {@link #sendResponse}. May be called once.
+	 * <p>
+	 * Takes ownership of {@code request} on every path, an already-aborted stream included, so a caller
+	 * that races a reset never has to work out which of them owed the body a release.
+	 */
+	public Promise<Void> sendRequest(HttpRequest request) {
+		checkInReactorThread(this);
+		beginSend(request, "request");
+		return sendMessage(request, Http3Headers.fromRequest(request));
+	}
+
+	private void beginSend(HttpMessage message, String what) {
+		if (outboundSent) {
+			releaseMessage(message);
+			throw new IllegalStateException("A " + what + " has already been sent on stream " + stream.id());
+		}
+		outboundSent = true;
+	}
+
+	/** Takes ownership of {@code message} on every path; {@code fields} is its already-mapped field list. */
+	private Promise<Void> sendMessage(HttpMessage message, List<Field> fields) {
+		if (terminalException != null) {
+			releaseMessage(message);
+			return Promise.ofException(terminalException);
+		}
+
+		if (message.hasBody() && !message.hasHeader(HttpHeaders.CONTENT_LENGTH)) {
+			// The length is known exactly here, and stating it keeps an HTTP/3 message the same message an
+			// HTTP/1.1 one would have been (SC-013). A streamed body has no length to state.
+			fields.add(new Field("content-length", Integer.toString(message.getBody().readRemaining())));
+		}
+		ChannelSupplier<ByteBuf> body = takeBodyOrNull(message);
+
+		ByteBuf headersFrame;
+		try {
+			outbound.accept(HeadersFrame.TYPE);
+			headersFrame = encodeHeadersFrame(fields);
+		} catch (Http3Exception e) {
+			if (body != null) body.streamTo(ChannelConsumers.recycling());
+			return Promise.ofException(abortWith(e));
+		}
+
+		ChannelConsumer<ByteBuf> writer = stream.writer();
+		return writer.accept(headersFrame)
+			.then(
+				$ -> body == null ?
+					writer.accept(null) :
+					body.streamTo(new OutboundBodyConsumer(writer)),
+				// The body never reached a consumer that would own it, so this is the path that owes it a
+				// release — the one every abort of a stream mid-message takes.
+				e -> {
+					if (body != null) body.streamTo(ChannelConsumers.recycling());
+					return Promise.ofException(e);
+				})
+			.whenException(this::onWriteFailure);
+	}
+
+	/**
+	 * Aborts this exchange with an RFC 9114 §8.1 code: both halves of the stream are aborted, every
+	 * buffer this stream owns is recycled and every pending promise fails. Idempotent.
+	 */
+	public void abort(long errorCode, String reason) {
+		checkInReactorThread(this);
+		abortWith(new Http3Exception(errorCode, reason));
+	}
+
+	// ---------------------------------------------------------------- reading frames
+
+	/**
+	 * The next frame the peer sent <b>that this layer has semantics for</b>, or {@code null} once the
+	 * stream is FINed. The caller owns the frame.
+	 * <p>
+	 * Loops synchronously while input is already in hand — a buffer routinely carries several frames, and
+	 * recursing per frame would grow the stack with the peer's chunk size. An unknown or GREASE frame
+	 * (RFC 9114 §9, FR-062) is discarded <b>inside that loop</b> rather than handed up for a caller to
+	 * skip and ask again: a completed {@link Promise} runs its continuation synchronously, so a caller
+	 * that recursed per skipped frame would take one stack frame per GREASE frame the peer chose to send
+	 * — and a 2-byte frame type with a zero length means one maximum-size datagram is tens of thousands
+	 * of them. The control stream drains the same way ({@code Http3Connection.feedControlStream}).
+	 * <p>
+	 * A long DATA frame arrives as several {@link DataFrame} instalments (see {@link Http3FrameReader}),
+	 * so a frame in hand no longer means the reader is between frames — {@code isMidFrame()} is what says
+	 * that, and it is the reader's own state rather than anything inferred from what it consumed.
+	 */
+	private Promise<Http3Frame> nextFrame() {
+		while (true) {
+			if (pendingInput != null) {
+				Http3Frame frame;
+				try {
+					frame = frameReader.feed(pendingInput);
+					midFrame = frameReader.isMidFrame();
+				} catch (Http3Exception e) {
+					return Promise.ofException(abortWith(e));
+				}
+				if (!pendingInput.canRead()) {
+					pendingInput = nullify(pendingInput, ByteBuf::recycle);
+				}
+				if (frame == null) continue;
+				try {
+					inbound.accept(frame.type());
+				} catch (Http3Exception e) {
+					Recyclers.recycle(frame);
+					return Promise.ofException(abortWith(e));
+				}
+				if (frame instanceof UnknownFrame) {
+					// RFC 9114 §9: it carries no payload this layer holds, and the sequence validator has
+					// already refused everything that is not tolerable here. Skipped without unwinding, so
+					// the peer's GREASE frame count is not this thread's stack depth.
+					discarded(frame);
+					continue;
+				}
+				return Promise.of(frame);
+			}
+			if (endOfInput) return Promise.of(null);
+
+			Promise<ByteBuf> next = reader().get();
+			if (next.isResult()) {
+				ByteBuf buf = next.getResult();
+				if (buf == null) return onEndOfInput();
+				pendingInput = buf;
+				continue;
+			}
+			if (next.isException()) return Promise.ofException(onReadFailure(next.getException()));
+			return next.then(
+				buf -> {
+					if (buf == null) return onEndOfInput();
+					pendingInput = buf;
+					return nextFrame();
+				},
+				e -> Promise.ofException(onReadFailure(e)));
+		}
+	}
+
+	private Promise<Http3Frame> onEndOfInput() {
+		endOfInput = true;
+		if (midFrame) {
+			// RFC 9114 §7.1: a stream that ends in the middle of a frame ended in the middle of a message.
+			return Promise.ofException(abortWith(new Http3Exception(Http3Errors.H3_FRAME_ERROR,
+				"The stream ended in the middle of a frame")));
+		}
+		if (declaredContentLength != NO_CONTENT_LENGTH) {
+			try {
+				Http3Headers.checkContentLength(declaredContentLength, bodyBytesReceived);
+			} catch (Http3Exception e) {
+				return Promise.ofException(abortWith(e));
+			}
+		}
+		if (state != State.RESET) state = State.COMPLETE;
+		receiveFinished();
+		return Promise.of(null);
+	}
+
+	/** Announces that nothing more will be received here; every path into COMPLETE or RESET passes through. */
+	private void receiveFinished() {
+		receiveComplete = nullify(receiveComplete, promise -> promise.trySet(null));
+	}
+
+	private ChannelSupplier<ByteBuf> reader() {
+		if (reader == null) reader = stream.reader();
+		return reader;
+	}
+
+	// ---------------------------------------------------------------- the inbound body
+
+	/**
+	 * De-frames DATA off {@link QuicStream#reader()}: each payload slice is handed straight to the
+	 * consumer, which then owns it. A trailing HEADERS section is decoded and attached to the message
+	 * (FR-038) rather than surfacing as body bytes.
+	 */
+	private Promise<ByteBuf> readBody() {
+		return nextFrame().then(frame -> {
+			if (frame == null) return Promise.of(null);
+			if (frame instanceof DataFrame data) {
+				bodyBytesReceived += data.data.readRemaining();
+				if (bodyBytesReceived > settings.maxBodySize()) {
+					data.recycle();
+					return Promise.ofException(abortWith(new Http3Exception(Http3Errors.H3_EXCESSIVE_LOAD,
+						"A message body of over " + settings.maxBodySize() + " bytes")));
+				}
+				state = State.BODY;
+				return Promise.of(data.data);
+			}
+			if (frame instanceof HeadersFrame trailers) {
+				try {
+					List<Field> fields = decodeFieldSection(trailers);
+					Http3Headers.validateTrailers(fields);
+					if (inboundMessage != null) Http3Trailers.set(inboundMessage, fields);
+				} catch (Http3Exception e) {
+					return Promise.ofException(abortWith(e));
+				}
+				state = State.TRAILERS_DONE;
+				// Depth 1, not a peer-driven loop: the sequence validator refuses a third HEADERS, so the
+				// next frame this reads can only be DATA (refused after trailers) or end of input.
+				return readBody();
+			}
+			// Unreachable: nextFrame() discards unknown and GREASE types itself, and the sequence validator
+			// refuses every other type on a request stream. Stated rather than skipped, for the reason
+			// readHeaders states.
+			Recyclers.recycle(frame);
+			return Promise.ofException(abortWith(new Http3Exception(Http3Errors.H3_FRAME_UNEXPECTED,
+				"A frame this layer has no semantics for reached the body reader")));
+		});
+	}
+
+	/** Recycles a frame this layer ignores and reports it, per RFC 9114 §9's GREASE rule (FR-062). */
+	private void discarded(Http3Frame frame) {
+		long declaredLength = frame instanceof UnknownFrame unknown ? unknown.declaredLength : 0;
+		Recyclers.recycle(frame);
+		eventListener.onFrameDiscarded(frame.type(), declaredLength);
+	}
+
+	private final class InboundBodySupplier extends AbstractChannelSupplier<ByteBuf> {
+		@Override
+		protected Promise<ByteBuf> doGet() {
+			// The first ask is what makes this a message somebody is reading; see isReceivingBody().
+			bodyRequested = true;
+			return readBody();
+		}
+
+		@Override
+		protected void onClosed(Exception e) {
+			// FR-057: a consumer that walks away from a body still owes the peer an answer, and the only
+			// honest one is an abort — the bytes it did not read are still arriving.
+			if (state == State.COMPLETE || state == State.RESET) return;
+			abortWith(e instanceof Http3Exception || e instanceof QuicStreamException ?
+				e :
+				new Http3Exception(Http3Errors.H3_REQUEST_CANCELLED, "The message body was abandoned by its consumer"));
+		}
+	}
+
+	// ---------------------------------------------------------------- the outbound body
+
+	/**
+	 * Frames each chunk as a DATA frame and propagates {@link QuicStream#writer()}'s own promise
+	 * untouched — the whole of this layer's backpressure (FR-056). The payload is written as its own
+	 * buffer rather than copied behind the frame header, so a body is never duplicated in memory.
+	 */
+	private final class OutboundBodyConsumer extends AbstractChannelConsumer<ByteBuf> {
+		private final ChannelConsumer<ByteBuf> writer;
+
+		OutboundBodyConsumer(ChannelConsumer<ByteBuf> writer) {
+			this.writer = writer;
+		}
+
+		@Override
+		protected Promise<Void> doAccept(@Nullable ByteBuf value) {
+			if (value == null) return writer.accept(null);
+			if (!value.canRead()) {
+				// A zero-length DATA frame is legal but says nothing; RFC 9114 §7.2.1 gives it no meaning.
+				value.recycle();
+				return Promise.complete();
+			}
+			int payloadLength = value.readRemaining();
+			ByteBuf header = dataFrameHeader(payloadLength);
+			bodyBytesSent += payloadLength;
+			return writer.accept(header)
+				.whenException(e -> value.recycle())
+				.then(() -> writer.accept(value));
+		}
+	}
+
+	private static ByteBuf dataFrameHeader(int payloadLength) {
+		ByteBuf buf = ByteBufPool.allocate(
+			QuicVarInts.encodedLength(DataFrame.TYPE) + QuicVarInts.encodedLength(payloadLength));
+		QuicVarInts.write(buf, DataFrame.TYPE);
+		QuicVarInts.write(buf, payloadLength);
+		return buf;
+	}
+
+	private ByteBuf encodeHeadersFrame(List<Field> fields) {
+		HeadersFrame frame = new HeadersFrame(qpackEncoder.encode(Http3Headers.toQpack(fields)));
+		try {
+			ByteBuf buf = ByteBufPool.allocate(Http3Frames.encodedLength(frame));
+			Http3Frames.write(buf, frame);
+			return buf;
+		} finally {
+			frame.recycle();
+		}
+	}
+
+	// ---------------------------------------------------------------- failure paths
+
+	/**
+	 * Aborts both halves with {@code e}'s code and returns {@code e}, so a caller can
+	 * {@code return Promise.ofException(abortWith(e))} without the abort and the report drifting apart.
+	 */
+	private Exception abortWith(Exception e) {
+		if (state == State.RESET) return terminalException != null ? terminalException : e;
+		state = State.RESET;
+		terminalException = e;
+		pendingInput = nullify(pendingInput, ByteBuf::recycle);
+		// A stream aborted part-way through a frame leaves its reader holding the payload it had begun
+		// filling; nothing will ever finish that frame, so this is the path that owes it a release (DI-1).
+		frameReader.recycle();
+
+		long errorCode = e instanceof Http3Exception h3 ? h3.errorCode() : Http3Errors.H3_REQUEST_CANCELLED;
+		// Both verbs are idempotent, and a stream aborted by its peer is already terminal on that side.
+		// They also fail whatever read or write was in flight, which is what cancels a servlet waiting on
+		// a body that will never arrive (FR-046a).
+		if (stream.hasSendPart()) stream.reset(errorCode);
+		if (stream.hasReceivePart()) stream.stopSending(errorCode);
+		eventListener.onStreamReset(stream.id(), errorCode);
+		// Closed before the message is released, so the release cannot start a drain of a stream that has
+		// just been told to stop.
+		bodySupplier = nullify(bodySupplier, supplier -> supplier.closeEx(e));
+		releaseInbound();
+		logger.trace("HTTP/3 request stream {} aborted: {}", stream.id(), e.toString());
+		// Nothing more will arrive here, whatever the reason it stopped: a client's connection pool frees
+		// the slot this exchange held on the strength of this, so it fires on the abort path as it does on
+		// the clean one (T112).
+		receiveFinished();
+		// Last, and after this stream is wholly terminal: the listener routinely closes the connection,
+		// which aborts every stream it owns — this one included, whose second abort must find nothing left
+		// to do.
+		if (e instanceof Http3Exception h3 && isConnectionError(h3.errorCode())) {
+			connectionErrorListener.accept(h3);
+		}
+		return e;
+	}
+
+	/**
+	 * Whether a violation observed on a request stream is nonetheless a <b>connection</b> error.
+	 * <p>
+	 * Exactly two codes are, and neither is about the message this stream carries:
+	 * <ul>
+	 *   <li>{@code H3_ID_ERROR} — RFC 9114 §7.2.5's PUSH_PROMISE, which {@link Http3FrameSequence}
+	 *       refuses because it is judged against the connection-wide push limit rather than against this
+	 *       stream: a peer that promised a push against a limit of 0 has misread the connection, not the
+	 *       exchange (FR-040);</li>
+	 *   <li>{@code H3_FRAME_UNEXPECTED} — a frame RFC 9114 §7.2's table does not permit here at all: a
+	 *       reserved HTTP/2 type ({@code 0x02}, {@code 0x06}, {@code 0x08}, {@code 0x09}, refused by
+	 *       {@link io.activej.http3.frame.Http3FrameReader}), a control-only frame on a request stream,
+	 *       or a §4.1 sequence the grammar does not admit — DATA before HEADERS, a third HEADERS.
+	 *       FR-024 and FR-025 make every one of those a connection error: a peer that frames the
+	 *       protocol wrongly is not framing <i>this</i> exchange wrongly, and the bytes that follow on
+	 *       every other stream are no more trustworthy than these.</li>
+	 * </ul>
+	 * The two are the whole of it, and both are raised by the frame layer rather than here. Everything a
+	 * request stream refuses about the <i>message</i> — a missing or duplicated pseudo-header, a
+	 * connection-specific field, a {@code Content-Length} that disagrees with the body, an oversized
+	 * field section, a broken frame, an abandoned body — is a stream error and leaves the connection
+	 * alone (FR-037).
+	 */
+	private static boolean isConnectionError(long errorCode) {
+		return errorCode == Http3Errors.H3_ID_ERROR || errorCode == Http3Errors.H3_FRAME_UNEXPECTED;
+	}
+
+	/**
+	 * FR-058c: the stream layer's own failures reach the caller unwrapped, carrying the peer's
+	 * application error code. Anything else is a local failure of ours, reported as one.
+	 */
+	private Exception onReadFailure(Exception e) {
+		if (e instanceof QuicStreamException) {
+			return abortWith(e);
+		}
+		return abortWith(new Http3Exception(Http3Errors.H3_INTERNAL_ERROR, "Reading the request stream failed: " + e));
+	}
+
+	private void onWriteFailure(Exception e) {
+		if (state == State.RESET) return;
+		abortWith(e instanceof QuicStreamException ?
+			e :
+			new Http3Exception(Http3Errors.H3_INTERNAL_ERROR, "Writing the message failed: " + e));
+	}
+
+	// ---------------------------------------------------------------- message ownership (FR-057a)
+
+	/**
+	 * Releases the message this stream decoded from the peer's HEADERS, unless
+	 * {@link #receiveResponse()} already handed it — and with it its body — to a caller who now owns it.
+	 */
+	private void releaseInbound() {
+		HttpMessage owned = inboundMessage;
+		inboundMessage = null;
+		if (owned != null && !inboundHandedOver) releaseMessage(owned);
+	}
+
+	/**
+	 * Releases whatever pooled bytes {@code message} still owns. A message whose body was taken owns
+	 * nothing, and the single-take contract is the only way to ask: {@code takeBodyStream()} throws once
+	 * somebody else holds it, which is precisely the answer "there is nothing here to release".
+	 */
+	static void releaseMessage(HttpMessage message) {
+		ChannelSupplier<ByteBuf> body = takeBodyOrNull(message);
+		if (body != null) body.streamTo(ChannelConsumers.recycling());
+	}
+
+	private static @Nullable ChannelSupplier<ByteBuf> takeBodyOrNull(HttpMessage message) {
+		try {
+			return message.takeBodyStream();
+		} catch (IllegalStateException e) {
+			// "Body stream is missing or already consumed" — either way it is not ours to release.
+			return null;
+		}
+	}
+
+	@Override
+	public String toString() {
+		return "Http3RequestStream{" + stream.id() + ", " + state +
+			(terminalException == null ? "" : ", " + terminalException) + '}';
+	}
+}

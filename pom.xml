@@ -43,6 +43,7 @@
     <module>core-net</module>
     <module>core-datastream</module>
     <module>core-http</module>
+    <module>core-http3</module>
     <module>core-inject</module>
     <module>cloud-rpc</module>
     <module>cloud-fs</module>

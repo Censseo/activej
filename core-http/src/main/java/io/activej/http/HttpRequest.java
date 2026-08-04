@@ -92,7 +92,7 @@ public final class HttpRequest extends HttpMessage implements ToPromise<HttpRequ
 	}
 
 	public final class Builder extends HttpMessage.Builder<Builder, HttpRequest> {
-		private Builder() {}
+		Builder() {}
 
 		@Override
 		protected void addCookies(List<HttpCookie> cookies) {

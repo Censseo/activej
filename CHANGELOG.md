@@ -123,6 +123,179 @@ explicitly.
 
 ### Notable additions
 
+- **HTTP/3 core, foundations.** A new leaf module `core-http3` (`activej-http3`,
+  package `io.activej.http3`) begins RFC 9114 HTTP/3 with static-table RFC 9204
+  QPACK, sitting above both `core-http` and `core-quic`. This entry covers the
+  module skeleton and the two additive `core-http` changes; the transport and
+  QPACK codec follow in subsequent entries as the feature completes.
+
+  Exactly two additive changes to `core-http`, and nothing else — no behaviour
+  change, no signature change to any existing method, no trailers API:
+  - `HttpVersion` gains `HTTP_3_0` (`HTTP_2_0` already existed and was never
+    produced, so the enum was already ahead of the implementation).
+  - A new `@ExposedInternals` `HttpMessages` (`io.activej.http.HttpMessages`)
+    lets an alternative HTTP transport construct an `HttpRequest`/`HttpResponse`
+    with an explicit `HttpVersion` — the existing version-carrying constructors
+    are package-private and every public factory hardcodes `HTTP_1_1`. Reaching
+    them from `HttpMessages` required loosening `HttpRequest.Builder()` and
+    `HttpResponse.Builder()` from `private` to package-private (an
+    accessibility change only — no parameter list changed on any method).
+
+  `Http3Settings` carries the feature's tunable limits, every field an
+  `ApplicationSettings` key resolved from
+  `io.activej.http3.Http3Settings.<setting>` (or `Http3Settings.<setting>`):
+
+  | Setting | Default | What it bounds |
+  |---|---|---|
+  | `maxFieldSectionSize` | `64kb` | RFC 9114 §4.2.2 accounted field-section size, checked on decoded output |
+  | `maxBodySize` | `100mb` | total DATA payload per message |
+  | `maxControlFrameSize` | `16kb` | SETTINGS / GOAWAY / control-stream frames |
+  | `maxConcurrentRequestStreams` | `100` | advertised as the QUIC bidirectional-stream transport parameter |
+  | `maxUniStreams` | `3` (fixed, not a builder field) | advertised `initial_max_streams_uni` — control + both QPACK streams, nothing more (FR-017) |
+  | `maxConnections` | `256` | `Http3Client` pool size; the least-recently-used idle connection is evicted past it |
+  | `maxQueuedRequests` | `100` | requests waiting for stream credit; overflow fails immediately, retryably |
+  | `maxInterimResponses` | `8` | informational (`1xx`) responses a client reads past on one exchange; past it the exchange fails with `H3_EXCESSIVE_LOAD` |
+  | `requestTimeout` | `60s` | per request on both sides, queued time included |
+  | `shutdownTimeout` | `1s` | ceiling on the GOAWAY drain of `Http3Server.close()`; `0` closes at once |
+
+  None of these bounds is ever allocated in advance. A declared frame length is
+  checked against its bound before anything proportional to it is taken, and a
+  DATA frame is then read in 16 KiB instalments as its payload actually
+  arrives — so a peer that declares a 100 MB body and then sends a kilobyte of
+  it costs a chunk per stream rather than the bound per stream, and the peak a
+  connection can be driven to is its concurrent-stream limit times a chunk.
+
+  Each of `maxFieldSectionSize`, `maxBodySize` and `maxControlFrameSize` is
+  refused at `build()` above `Integer.MAX_VALUE`: all three reach a frame
+  reader's declared-length check, which allocates a validated length as an
+  `int`, so a larger bound would wrap negative instead of doing what it says.
+
+  `Http3Errors`/`Http3Exception` carry the RFC 9114 §8.1 and RFC 9204 §6
+  application error codes — a third axis alongside `HttpError` (status code)
+  and `QuicTransportException` (RFC 9000 §20 transport code).
+
+  **Message validation is RFC 9114 §4.1.2/§4.3.1 strict.** Beyond the
+  pseudo-header rules: a field *value* carrying NUL, CR or LF at any position,
+  or leading/trailing space or tab, is `H3_MESSAGE_ERROR` — HTTP/3 has no
+  line-oriented framing, but the value reaches a servlet and the hop after that
+  may be HTTP/1.1. A `:path` under `http`/`https` must be origin-form
+  (`/`-prefixed); the asterisk form (`OPTIONS *`) has no representation in
+  `core-http`'s URL model and is refused with the retryable
+  `H3_REQUEST_REJECTED` rather than mangled into an origin-form URL. A repeated
+  `host`, or a repeated `content-length` whose values disagree, is
+  `H3_MESSAGE_ERROR` (RFC 9110 §7.2, §8.6): only the first was ever reconciled
+  against the DATA that arrived, and for a gateway re-serializing to HTTP/1.1
+  the pair is a request-smuggling primitive. Repeated *identical*
+  `content-length` stays legal, as RFC 9110 §8.6's list form.
+
+  **Informational (`1xx`) responses are consumed, not delivered.** RFC 9114 §4.1
+  lets a server send any number ahead of the final response, and `103 Early
+  Hints` arrives unsolicited from real CDNs; `Http3Client` reads past each and
+  delivers the final response, bounded by `maxInterimResponses` above. They are
+  not surfaced to the caller — `IHttpClient` has nowhere to put one.
+
+  **Server.** `Http3Server.builder(reactor, servlet)` serves an existing
+  `AsyncServlet` unmodified over QUIC — `withListenAddress`/`withListenPort` or
+  `withSocket`, `withServerIdentity`, `withSettings`, `withHttpErrorFormatter`,
+  then `listen()` and an idempotent `close()`. It owns its `QuicEndpoint` and
+  attaches through `QuicEndpoint.Builder.withFrameHandlerFactory`, so it neither
+  extends `AbstractReactiveServer` (UDP has no accept loop) nor reaches into
+  `core-quic` internals. A failed servlet promise is rendered through the same
+  `HttpExceptionFormatter` `HttpServer` uses, so an error response is identical
+  across HTTP/1.1 and HTTP/3, and the stream carrying it ends normally rather
+  than being reset. **`close()` is graceful** (RFC 9114 §5.2): every connection
+  announces GOAWAY carrying the last request stream it will process, the
+  exchanges already under way are left to finish, and only then does the
+  endpoint go — so a shutdown no longer fails a request the server had already
+  begun serving. A request stream opened after the announcement is refused with
+  `H3_REQUEST_REJECTED` without reaching the servlet, which tells the peer to
+  retry it elsewhere. The drain is bounded by the new `shutdownTimeout`
+  (**1 second** by default, `0` to close at once), because a peer that never
+  finishes must not be able to hold a closing server open; it ends as soon as
+  the last announced stream closes, which is the ordinary case. `Http3RequestStream` is the per-stream exchange underneath:
+  it drives the RFC 9114 §4.1 frame sequence, carries bodies as CSP channels
+  transformed from `QuicStream.reader()`/`writer()` (no buffering between HTTP
+  and QUIC, so backpressure stays QUIC's stream flow control), and surfaces a
+  peer's `RESET_STREAM`/`STOP_SENDING` to the request unwrapped, carrying the
+  peer's own application error code. `Http3RequestStream` is symmetric — a server
+  calls `receiveRequest()` then `sendResponse(...)`, a client `sendRequest(...)`
+  then `receiveResponse()` — so both roles drive one frame-sequence, QPACK and
+  body-channel implementation rather than two.
+
+  **Client.** `Http3Client.builder(reactor, dnsClient)` implements `IHttpClient`
+  — `Promise<HttpResponse> request(HttpRequest)` — so a caller's existing
+  `HttpRequest`/`HttpResponse` code is unchanged. It is a separate component from
+  `HttpClient`, whose connection model is TCP-bound. It owns one `QuicEndpoint`
+  on an ephemeral port (or `withSocket`) shared by every pooled connection, and
+  keeps **at most one QUIC connection per authority** (scheme, host, port);
+  concurrent requests racing to the same authority share one in-flight connect
+  promise and resolve the host once. `withTlsEngineFactory(host -> ...)` supplies
+  the TLS engine per authority host — the default trusts the platform PKIX store,
+  with SNI and RFC 6125 endpoint identification against that host. At
+  `maxConnections` the least-recently-used **idle** connection leaves with
+  GOAWAY to make room; with every pooled connection busy the request fails
+  immediately with a retryable `Http3Exception` naming the setting key, and the
+  pool never grows. **Idle** is the strict reading: an exchange ends at the
+  response head, but a connection still streaming that response's body into a
+  caller's hands is busy, so no eviction severs a transfer in progress. A GOAWAY
+  received on a pooled connection **retires** it: the next request to that
+  authority opens a fresh connection, while the retired one stays open for the
+  requests it is already carrying — and is closed as soon as it carries nothing,
+  so a peer that GOAWAYs every connection it accepts leaves nothing accumulating
+  (`retiredConnectionCount()` reports what it does). A request that races
+  the announcement fails with a retryable `H3_REQUEST_REJECTED` naming the
+  condition. Request streams above a received GOAWAY identifier fail the same
+  way — the peer stated it never processed them — while streams at or below it
+  are left to finish; a successor identifier **higher** than one already
+  received closes the connection with `H3_ID_ERROR`.
+  A request that finds no bidirectional-stream credit waits (the transport
+  withholds the open and announces `STREAMS_BLOCKED`) until `MAX_STREAMS` grants
+  some, bounded by `maxQueuedRequests`; past that bound it fails immediately and
+  retryably, again naming the key. `requestTimeout` covers queued time as well as
+  in-flight time and resets the stream with `H3_REQUEST_CANCELLED` on expiry. A
+  non-`https` scheme fails before any socket work or name resolution, and a
+  transport or TLS failure reaches the caller **unwrapped** as the
+  `QuicTransportException` that carries the RFC 9000 §20 code. A response that is
+  not a well-formed HTTP message fails the promise with `MalformedHttpException`
+  — the type `HttpClient` already raises for its own malformed responses, so code
+  written against `IHttpClient` catches one type whichever client is under it —
+  carrying the `Http3Exception(H3_MESSAGE_ERROR)` as its cause. `close()` is
+  idempotent and fails every outstanding request exactly once. The response the
+  promise delivers is the caller's, as is the `ByteBuf` its `loadBody()` produces.
+
+  **Server push and extended CONNECT are refused, precisely.** Server push is
+  permanently out of scope: the client never sends `MAX_PUSH_ID`, so its push
+  limit stays 0, and the server never pushes. Each construct a peer can still
+  reach for is rejected with its exact RFC 9114 code rather than ignored — a
+  push stream opened at a client, or a `PUSH_PROMISE` frame, closes the
+  connection with `H3_ID_ERROR` (RFC 9114 §4.6/§7.2.5 judge both against the
+  push limit, so this is *not* the generic `H3_FRAME_UNEXPECTED` that
+  `CANCEL_PUSH`/`SETTINGS`/`GOAWAY`/`MAX_PUSH_ID` on a request stream get); a
+  `CANCEL_PUSH` naming a push id that was never promised — which, here, is every
+  one of them — is `H3_ID_ERROR`; and a `MAX_PUSH_ID` reaching a *client* is a
+  direction violation, `H3_FRAME_UNEXPECTED`. A server records the `MAX_PUSH_ID`
+  a client sends, acts on it never, and closes the connection with `H3_ID_ERROR`
+  if a successor carries a **lower** value. Extended CONNECT and WebSocket over
+  HTTP/3 (RFC 9220) are likewise out of scope: a `CONNECT` request, or any
+  request carrying a `:protocol` pseudo-header, is refused with
+  `H3_REQUEST_REJECTED` — retryable, and without the servlet ever seeing it —
+  rather than partially handled.
+
+  **Diagnostics, without a JMX dependency.** As in `core-quic`, in two forms:
+  plain counter accessors — `Http3Server.requestsServed()`,
+  `Http3Client.queuedRequestCount()` and the rest — and an optional `Inspector`
+  hook on each of `Http3Server` and `Http3Client`, both extending
+  `BaseInspector`, both **absent by default**, and neither ever gating a
+  counter: every accessor reads the same with an inspector attached and without
+  one. Between them they report a request started and completed (stream id,
+  method, status, DATA byte counts), a stream reset and a connection error (the
+  RFC 9114 §8.1 code), a frame discarded under RFC 9114 §9's GREASE rule, a
+  GOAWAY in either direction, and — on the client — a request queued and
+  dequeued with the queue depth. Every parameter is a number, an HTTP method or
+  a direction: no inspector call, log line, counter or exception message ever
+  carries a field value, a body byte, a cookie, an authorization credential or
+  key material. `core-http3` gains no `activej-jmxapi` edge for this.
+
 - **QUIC connection layer.** A new `io.activej.quic.connection` package in
   `core-quic` turns the wire codec and the TLS engines into a working transport:
   `QuicConnection` (the reactor-confined state machine — handshake, ACK

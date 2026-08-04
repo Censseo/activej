@@ -180,7 +180,7 @@ public final class HttpResponse extends HttpMessage implements ToPromise<HttpRes
 	}
 
 	public final class Builder extends HttpMessage.Builder<Builder, HttpResponse> {
-		private Builder() {}
+		Builder() {}
 
 		public Builder withCode(int code) {
 			if (CHECKS) checkArgument(code >= 100 && code < 600, "Code should be in range [100, 600)");

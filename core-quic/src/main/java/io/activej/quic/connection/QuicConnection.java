@@ -2065,14 +2065,50 @@ public final class QuicConnection extends AbstractReactive {
 	}
 
 	/**
+	 * Closes with an RFC 9000 §19.19 <b>application</b> CONNECTION_CLOSE (wire type {@code 0x1d}), for a
+	 * protocol layered above this one — HTTP/3's RFC 9114 §8.1 codes are the caller this exists for.
+	 * Idempotent, exactly like {@link #closeWith(long, String)}.
+	 * <p>
+	 * The distinction is not cosmetic. An application code is drawn from RFC 9000 §20.2's own space, and
+	 * a peer reading one out of a {@code 0x1c} frame would name it against §20.1's: HTTP/3's
+	 * {@code H3_STREAM_CREATION_ERROR} (0x0103) falls inside the transport space's {@code CRYPTO_ERROR}
+	 * range, where it reads as a TLS alert.
+	 * <p>
+	 * RFC 9000 §10.2.3: the {@code 0x1d} form needs 1-RTT keys, so a close before the handshake finishes
+	 * goes out as the transport close carrying {@link QuicTransportErrors#APPLICATION_ERROR} the RFC
+	 * prescribes in its place. The application's own code is dropped there by design — the peer has no
+	 * application-layer state to apply it to yet.
+	 * <p>
+	 * The establishment promise fails with that same {@code APPLICATION_ERROR} rather than with
+	 * {@code applicationErrorCode}: {@link QuicTransportException} reports its code against §20.1, so
+	 * putting an application code there would misname it in every log line it reaches. The caller that
+	 * chose the code already knows it; nothing is lost that this connection could report honestly.
+	 */
+	public void closeWithApplicationError(long applicationErrorCode, String reason) {
+		checkInReactorThread(this);
+		closeWith(applicationErrorCode, null, true,
+			new QuicTransportException(QuicTransportErrors.APPLICATION_ERROR, reason));
+	}
+
+	private void closeWith(QuicTransportException e) {
+		closeWith(e.errorCode(), e.frameType(), false, e);
+	}
+
+	/**
 	 * Enters the closing state: tells the peer why if there are keys to tell it under, then holds that
 	 * CONNECTION_CLOSE for three probe timeouts so a peer that retransmits gets an answer
 	 * (RFC 9000 §10.2.1).
 	 * <p>
 	 * The establishment promise fails <i>now</i>, not at the end of the period — the caller has no
 	 * reason to wait out a timeout for an answer already known.
+	 * <p>
+	 * The one entry into the closing state, transport and application close alike: the two differ only
+	 * in which CONNECTION_CLOSE variant they retain, and everything that follows — the closing period,
+	 * the re-send budget, what is released and when — is the same protocol either way.
 	 */
-	private void closeWith(QuicTransportException e) {
+	private void closeWith(long errorCode, @Nullable Long frameType, boolean isApplication,
+		QuicTransportException cause
+	) {
 		if (state.isTerminating() || state == QuicConnectionState.CLOSED) {
 			return;
 		}
@@ -2083,13 +2119,32 @@ public final class QuicConnection extends AbstractReactive {
 		// measured in a whole PTO.
 		releaseForClosing();
 
-		if (wasOpen && highestSendableLevel() != null) {
-			closingFrame = ConnectionCloseFrame.transport(
-				e.errorCode(), e.frameType() == null ? 0 : e.frameType(), NO_TOKEN);
+		EncryptionLevel level = wasOpen ? highestSendableLevel() : null;
+		if (level != null) {
+			closingFrame = closingFrameFor(errorCode, frameType, isApplication, level);
 			sendConnectionClose();
 		}
 		armClosingTimer();
-		establishPromise.trySetException(e);
+		establishPromise.trySetException(cause);
+	}
+
+	/**
+	 * The CONNECTION_CLOSE to retain for the closing period.
+	 * <p>
+	 * RFC 9000 §10.2.3: the application form ({@code 0x1d}) may only travel under 1-RTT keys, so below
+	 * that it degrades to the transport form carrying {@link QuicTransportErrors#APPLICATION_ERROR} —
+	 * the substitute the RFC names for it, and the only thing {@link FrameTypeRules} would let onto the
+	 * wire at Initial or Handshake.
+	 */
+	private static ConnectionCloseFrame closingFrameFor(long errorCode, @Nullable Long frameType,
+		boolean isApplication, EncryptionLevel level
+	) {
+		if (!isApplication) {
+			return ConnectionCloseFrame.transport(errorCode, frameType == null ? 0 : frameType, NO_TOKEN);
+		}
+		return level == EncryptionLevel.ONE_RTT ?
+			ConnectionCloseFrame.application(errorCode, NO_TOKEN) :
+			ConnectionCloseFrame.transport(QuicTransportErrors.APPLICATION_ERROR, 0, NO_TOKEN);
 	}
 
 	/**
