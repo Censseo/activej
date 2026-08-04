@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -30,16 +31,35 @@ import java.util.function.Supplier;
 public final class TestUtils {
 	private static int activePromises = 0;
 
-	static int port = 1024;
+	private static final int MIN_PORT = 1024;
+
+	/**
+	 * One past the last port {@link #getFreePort()} will hand out. Stops below the OS ephemeral range
+	 * (Linux defaults to 32768-60999) so that a port returned here cannot also be handed to an
+	 * outbound connection in the window between the probe below and the caller's own bind.
+	 */
+	private static final int MAX_PORT = 32768;
+
+	/**
+	 * The last port considered, seeded differently in every JVM.
+	 * <p>
+	 * The seed is the fix for a {@code mvn -T1C} failure: several Surefire forks run at once, one per
+	 * module, and each holds its own copy of this counter. Started from a fixed value they all walked
+	 * the same ports in the same order and handed out the same numbers, so whichever fork bound second
+	 * failed with {@link BindException}. The probe cannot prevent that by itself — it has to release
+	 * the port before returning it, leaving a window the caller binds in. Spreading the forks across
+	 * the range means they are not contending for the same port to begin with.
+	 */
+	static int port = ThreadLocalRandom.current().nextInt(MIN_PORT, MAX_PORT / 2);
 
 	public static synchronized int getFreePort() {
-		while (++port < 65536) {
+		while (++port < MAX_PORT) {
 			if (!probeBindAddress(new InetSocketAddress(port))) continue;
 			if (!probeBindAddress(new InetSocketAddress("localhost", port))) continue;
 			if (!probeBindAddress(new InetSocketAddress("127.0.0.1", port))) continue;
 			return port;
 		}
-		throw new AssertionError();
+		throw new AssertionError("No free port in [" + MIN_PORT + ", " + MAX_PORT + ")");
 	}
 
 	@SuppressWarnings("BooleanMethodIsAlwaysInverted")
