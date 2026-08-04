@@ -32,14 +32,42 @@ import java.util.Arrays;
 public final class QpackField {
 	private final HttpHeader name;
 	private final byte[] value;
+	private final boolean nameHadUppercase;
 
 	public QpackField(HttpHeader name, byte[] value) {
+		this(name, value, false);
+	}
+
+	/**
+	 * As {@link #QpackField(HttpHeader, byte[])}, recording whether the <b>literal</b> name octets on the
+	 * wire contained an uppercase character.
+	 * <p>
+	 * The flag exists because {@link #name()} cannot answer the question. {@code HttpHeaders} interning
+	 * replaces the peer's spelling with the registry's own for any case-insensitive match, so a peer that
+	 * sends {@code Content-Type} and one that sends {@code content-type} produce the <b>same</b> token —
+	 * and RFC 9114 §4.1.1 requires the first to be rejected. Only the decoder still holds the octets, so
+	 * only the decoder can answer, and it reports the fact here rather than enforcing an HTTP/3 rule that
+	 * is not QPACK's to enforce (see {@code Http3Headers.fromQpack}).
+	 * <p>
+	 * Always {@code false} for a static-table reference: RFC 9204 Appendix A's names are lowercase by
+	 * construction, so an index can never carry a case violation.
+	 */
+	public QpackField(HttpHeader name, byte[] value, boolean nameHadUppercase) {
 		this.name = name;
 		this.value = value;
+		this.nameHadUppercase = nameHadUppercase;
 	}
 
 	public HttpHeader name() {
 		return name;
+	}
+
+	/**
+	 * Whether the literal name octets carried an uppercase character — a fact about the wire that
+	 * {@link #name()} has already lost. See {@link #QpackField(HttpHeader, byte[], boolean)}.
+	 */
+	public boolean nameHadUppercase() {
+		return nameHadUppercase;
 	}
 
 	/** Callers must not mutate the returned array. */
@@ -51,12 +79,13 @@ public final class QpackField {
 	public boolean equals(Object o) {
 		if (this == o) return true;
 		if (!(o instanceof QpackField that)) return false;
-		return name.equals(that.name) && Arrays.equals(value, that.value);
+		return name.equals(that.name) && Arrays.equals(value, that.value)
+			&& nameHadUppercase == that.nameHadUppercase;
 	}
 
 	@Override
 	public int hashCode() {
-		return 31 * name.hashCode() + Arrays.hashCode(value);
+		return 31 * (31 * name.hashCode() + Arrays.hashCode(value)) + Boolean.hashCode(nameHadUppercase);
 	}
 
 	@Override

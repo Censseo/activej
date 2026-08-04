@@ -29,6 +29,7 @@ import io.activej.http.HttpHeaders;
 import io.activej.http.HttpMessage;
 import io.activej.http.HttpRequest;
 import io.activej.http.HttpResponse;
+import io.activej.http.MalformedHttpException;
 import io.activej.http3.Http3Headers.Field;
 import io.activej.http3.frame.DataFrame;
 import io.activej.http3.frame.HeadersFrame;
@@ -55,6 +56,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.function.Consumer;
+import java.util.function.UnaryOperator;
 
 import static io.activej.common.Utils.nullify;
 import static io.activej.reactor.Reactive.checkInReactorThread;
@@ -151,6 +153,13 @@ public final class Http3RequestStream extends AbstractReactive {
 	private State state = State.IDLE;
 	private boolean inboundRequested;
 	private boolean outboundSent;
+
+	/**
+	 * Applied to every failure the inbound body channel reports. Identity for a received <b>request</b>
+	 * (a server has no caller-facing promise to shape); {@link #clientVisible} for a received
+	 * <b>response</b>, which only a client ever builds.
+	 */
+	private UnaryOperator<Exception> inboundFailureMapper = UnaryOperator.identity();
 
 	/** Whatever of the last read remains undecoded; owned here and recycled on every terminal path. */
 	private @Nullable ByteBuf pendingInput;
@@ -466,6 +475,9 @@ public final class Http3RequestStream extends AbstractReactive {
 		HttpResponse.Builder builder = Http3Headers.toResponseBuilder(fields);
 
 		bodySupplier = new InboundBodySupplier();
+		// Only a client receives a response, so this is the client-facing body channel by construction —
+		// no role flag is needed to know that its failures are the ones FR-047 speaks about.
+		inboundFailureMapper = Http3RequestStream::clientVisible;
 		builder.withBodyStream(bodySupplier);
 		builder.withMaxBodySize((int) Math.min(Integer.MAX_VALUE, settings.maxBodySize()));
 		HttpResponse response = builder.build();
@@ -687,6 +699,35 @@ public final class Http3RequestStream extends AbstractReactive {
 		return Promise.of(null);
 	}
 
+	/**
+	 * What a caller sees instead of what this module raised, for the one failure {@code core-http} already
+	 * has a name for: a response that is not a well-formed HTTP message is a {@link MalformedHttpException}
+	 * here exactly as it is from {@code HttpClient}, so code written against {@code IHttpClient} catches the
+	 * same type whichever implementation is under it (FR-047).
+	 * <p>
+	 * Exactly the message-error class is translated. {@code H3_MESSAGE_ERROR} is the code RFC 9114 §4.1.2
+	 * reserves for a message that is not fully formed — a missing or duplicated pseudo-header, an uppercase
+	 * field name, a connection-specific field, a {@code Content-Length} that disagrees with the body — and
+	 * nothing else raised here means "the response was malformed": a limit, a timeout, a rejection and a
+	 * transport failure each say something a caller would act on differently, and each keeps its own type
+	 * (FR-058c). The {@link Http3Exception} is the cause, so its error code is not lost.
+	 * <p>
+	 * Applied on <b>both</b> paths a malformed response can surface through — the head, by
+	 * {@code Http3Client}, and the body, by {@link #inboundFailureMapper} below. A {@code Content-Length}
+	 * that disagrees with the body is only discovered when the body ends, so before this was applied to the
+	 * body channel the documented type held for a bad {@code :status} but not for a short body, which is
+	 * the harder half to get right at a call site.
+	 * <p>
+	 * Client-side only, as {@code contracts/java-api.md} §2.4 states it: a server answers a malformed
+	 * request with a stream reset carrying the same code, and has no promise to fail.
+	 */
+	static Exception clientVisible(Exception e) {
+		if (e instanceof Http3Exception h3 && h3.errorCode() == Http3Errors.H3_MESSAGE_ERROR) {
+			return new MalformedHttpException(h3.reason(), h3);
+		}
+		return e;
+	}
+
 	/** Announces that nothing more will be received here; every path into COMPLETE or RESET passes through. */
 	private void receiveFinished() {
 		receiveComplete = nullify(receiveComplete, promise -> promise.trySet(null));
@@ -751,7 +792,7 @@ public final class Http3RequestStream extends AbstractReactive {
 		protected Promise<ByteBuf> doGet() {
 			// The first ask is what makes this a message somebody is reading; see isReceivingBody().
 			bodyRequested = true;
-			return readBody();
+			return readBody().mapException(inboundFailureMapper::apply);
 		}
 
 		@Override

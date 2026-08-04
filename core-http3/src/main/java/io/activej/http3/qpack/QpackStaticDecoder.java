@@ -154,9 +154,21 @@ public final class QpackStaticDecoder implements QpackDecoder {
 		long nameLength = QpackIntegers.readInteger(buf, 3);
 		accountant.add(32);
 		byte[] nameBytes = readStringBytes(buf, nameHuffman, nameLength, accountant);
+		// Recorded before interning, which is where the peer's own spelling stops being observable: a
+		// case-insensitive match hands back the registry's token, so `Content-Type` and `content-type`
+		// become indistinguishable. RFC 9114 §4.1.1 requires the former to be rejected, and only this
+		// point still has the octets to tell them apart.
+		boolean nameHadUppercase = hasUppercase(nameBytes);
 		HttpHeader name = internName(nameBytes);
 		byte[] value = readLiteralValue(buf, accountant);
-		return new QpackField(name, value);
+		return new QpackField(name, value, nameHadUppercase);
+	}
+
+	private static boolean hasUppercase(byte[] nameBytes) {
+		for (byte b : nameBytes) {
+			if (b >= 'A' && b <= 'Z') return true;
+		}
+		return false;
 	}
 
 	/** The value literal shape shared by both representations that carry one: {@code H value-len(7+)}. */

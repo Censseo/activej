@@ -34,6 +34,8 @@ import io.activej.reactor.Reactor;
 import io.activej.reactor.nio.NioReactor;
 import io.activej.test.rules.ByteBufRule;
 import org.jetbrains.annotations.Nullable;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.ClassRule;
@@ -78,6 +80,9 @@ public final class Http3MalformedResponseTest {
 	/** The response head the peer writes, as a field section; set per test. */
 	private List<Field> responseFields = List.of();
 
+	/** DATA to write after the response head, or {@code null} to FIN straight after it. */
+	private byte @Nullable [] responseBody;
+
 	private ManualEventloop loop;
 	private @Nullable Http3WirePair wire;
 	private @Nullable Http3Client client;
@@ -110,6 +115,29 @@ public final class Http3MalformedResponseTest {
 		// RFC 9114 §4.3: every pseudo-header precedes every regular field.
 		assertMalformed(requestAnsweredWith(
 			List.of(new Field("content-type", "text/plain"), new Field(STATUS, "200"))));
+	}
+
+	/**
+	 * The T114 residual, and the harder half of FR-047: a {@code Content-Length} that disagrees with the
+	 * body can only be discovered when the body <b>ends</b>, so it surfaces on the body channel rather
+	 * than on the promise {@code request(...)} returned. That path used to deliver a raw
+	 * {@code Http3Exception} while every head-level malformation delivered {@code MalformedHttpException}
+	 * — so a caller doing the documented thing caught a bad {@code :status} and missed a short body.
+	 */
+	@Test
+	public void aContentLengthThatDisagreesWithTheBodyFailsWithMalformedHttpException() {
+		responseFields = List.of(new Field(STATUS, "200"), new Field("content-length", "10"));
+		responseBody = "short".getBytes(UTF_8);
+		start();
+
+		Promise<HttpResponse> request = client.request(HttpRequest.get(url(HOST, "/short")).build());
+		wire.driveUntil(request::isComplete);
+		assertTrue("the head is well-formed, so the response itself resolves: " + request, request.isResult());
+
+		Promise<ByteBuf> body = request.getResult().loadBody();
+		wire.driveUntil(body::isComplete);
+		assertTrue("the body is shorter than it declared: " + body, body.isException());
+		assertMalformed(body.getException());
 	}
 
 	/** The other half of the contract: nothing that is not a malformed <i>message</i> is translated. */
@@ -180,6 +208,9 @@ public final class Http3MalformedResponseTest {
 				// The writer owns the buffer on every path, this one included.
 				ChannelConsumer<ByteBuf> writer = requestStream.quicStream().writer();
 				writer.accept(Http3TestBytes.headersFrame(responseFields))
+					.then(() -> responseBody == null ?
+						Promise.complete() :
+						writer.accept(Http3TestBytes.dataFrame(responseBody)))
 					.then(() -> writer.accept(null));
 			});
 	}
