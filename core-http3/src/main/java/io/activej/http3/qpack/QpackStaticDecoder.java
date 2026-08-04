@@ -22,8 +22,8 @@ import io.activej.http.HttpHeader;
 import io.activej.http.HttpHeaders;
 import io.activej.http3.Http3Errors;
 
-import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static io.activej.common.Checks.checkArgument;
@@ -179,13 +179,43 @@ public final class QpackStaticDecoder implements QpackDecoder {
 		// Bounded by min(2x encoded length, 64 KiB): a generous starting guess, never the full
 		// expansion of a hostile declared length, since the per-byte accountant.add below aborts
 		// decoding (and hence further growth of this buffer) the moment the running total exceeds
-		// the configured bound.
-		ByteArrayOutputStream decoded = new ByteArrayOutputStream(Math.min(Math.max(length, 1) * 2, 1 << 16));
+		// the configured bound. Doubled as a long — `length` is bounded by the field section, which
+		// an operator may configure up to Integer.MAX_VALUE, and 2x that is not an int.
+		GrowingBytes decoded = new GrowingBytes((int) Math.min(Math.max(length, 1) * 2L, 1 << 16));
 		QpackHuffman.decode(encoded, 0, encoded.length, b -> {
 			accountant.add(1);
 			decoded.write(b);
 		});
 		return decoded.toByteArray();
+	}
+
+	/**
+	 * The Huffman decoder's output sink: a plain growing {@code byte[]}, deliberately <b>not</b> a
+	 * {@link java.io.ByteArrayOutputStream}, whose {@code write(int)} is {@code synchronized}. This is
+	 * one octet per call on the header-decode path of every request and every response, and the array
+	 * never escapes {@link #readStringBytes} — so the monitor would be pure per-byte overhead on the
+	 * hottest loop in this class.
+	 */
+	private static final class GrowingBytes {
+		private byte[] array;
+		private int size;
+
+		GrowingBytes(int initialCapacity) {
+			this.array = new byte[initialCapacity];
+		}
+
+		void write(byte b) {
+			if (size == array.length) {
+				// Doubling, so the amortized cost per octet stays constant. Growth past the configured
+				// bound cannot happen: the caller's accountant throws first, on the octet before it.
+				array = Arrays.copyOf(array, array.length * 2);
+			}
+			array[size++] = b;
+		}
+
+		byte[] toByteArray() {
+			return size == array.length ? array : Arrays.copyOf(array, size);
+		}
 	}
 
 	/** RFC 7541 §5.1/HTTP token case-insensitive hash, matching {@code core-http}'s registry so equals/hashCode agree. */

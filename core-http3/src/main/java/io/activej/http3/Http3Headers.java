@@ -89,6 +89,29 @@ public final class Http3Headers {
 	private static final String TE_FIELD = "te";
 	private static final String TE_ALLOWED_VALUE = "trailers";
 
+	private static final String HOST_FIELD = "host";
+	private static final String CONTENT_LENGTH_FIELD = "content-length";
+
+	/**
+	 * The two regular fields a message may carry at most once, and the reason each is more than a
+	 * tidiness rule. RFC 9110 §8.6 makes differing {@code Content-Length} values invalid and §7.2 permits
+	 * exactly one {@code Host}; the receiver of a duplicate has to pick one, and for a gateway that
+	 * re-serializes to HTTP/1.1 the pair is a request-smuggling primitive — this side reconciles the
+	 * first, the next hop may well take the last.
+	 */
+	private static final Set<String> SINGLETON_FIELDS = Set.of(HOST_FIELD, CONTENT_LENGTH_FIELD);
+
+	/** The schemes RFC 9114 §4.3.1 gives a mandatory authority component, and hence a path shape. */
+	private static final Set<String> AUTHORITY_SCHEMES = Set.of("http", "https");
+
+	/**
+	 * RFC 9114 §4.3.1's one exception to "{@code :path} begins with {@code /}": an OPTIONS request that
+	 * applies to the server rather than to a resource. {@code core-http}'s {@code UrlParser} has no
+	 * representation for the asterisk form, so it is refused as an unsupported capability rather than
+	 * mangled into an origin-form URL — see {@link #requestRejected}.
+	 */
+	private static final String ASTERISK_FORM = "*";
+
 	private enum Mode {REQUEST, RESPONSE, TRAILERS}
 
 	// region validation
@@ -143,10 +166,12 @@ public final class Http3Headers {
 			throw requestRejected("The CONNECT method is not supported over HTTP/3");
 		}
 
+		validatePathShape(scheme, path);
+
 		String authority = pseudo.get(AUTHORITY);
 		if (authority == null) {
 			for (Field field : regular) {
-				if (field.name().equals("host")) {
+				if (field.name().equals(HOST_FIELD)) {
 					authority = field.value();
 					break;
 				}
@@ -165,10 +190,68 @@ public final class Http3Headers {
 			builder.withHeader(HttpHeaders.HOST, authority);
 		}
 		for (Field field : regular) {
-			if (field.name().equals("host")) continue;
+			if (field.name().equals(HOST_FIELD)) continue;
 			builder.withHeader(HttpHeaders.of(field.name()), field.value());
 		}
 		return builder;
+	}
+
+	/**
+	 * RFC 9114 §4.3.1: under a scheme with a mandatory authority component, {@code :path} is an
+	 * origin-form path and therefore begins with {@code /}. Without this check the URL assembled below
+	 * silently changes meaning — {@code :path: x} makes {@code https://example.com} into
+	 * {@code https://example.comx}, an authority the peer never named, and one a servlet reading
+	 * {@code Host} would not agree with either.
+	 * <p>
+	 * The section's one exception is the asterisk form, {@code OPTIONS *}. {@code core-http}'s
+	 * {@code UrlParser} has no representation for it — there is no origin-form URL that means "the server
+	 * itself" — so it is refused as an unsupported capability, the way CONNECT and {@code :protocol} are
+	 * (FR-040's shape, not its scope): nothing is wrong with the message, and a peer is told exactly
+	 * that rather than being handed a mangled request target.
+	 * <p>
+	 * A scheme outside {@link #AUTHORITY_SCHEMES} is left alone: the RFC constrains the path only where
+	 * the scheme constrains the authority, and this class has no business inventing a rule for a scheme
+	 * it does not know.
+	 */
+	private static void validatePathShape(String scheme, String path) throws Http3Exception {
+		if (!AUTHORITY_SCHEMES.contains(scheme)) return;
+		if (path.charAt(0) == '/') return;
+		if (path.equals(ASTERISK_FORM)) {
+			throw requestRejected("The asterisk form of :path (OPTIONS *) is not supported over HTTP/3");
+		}
+		throw messageError("A :path under a scheme with a mandatory authority must begin with '/' (RFC 9114 §4.3.1)");
+	}
+
+	/**
+	 * Whether this response field list carries an informational ({@code 1xx}) {@code :status} — a purely
+	 * syntactic scan whose <b>only</b> job is to route between {@link #validateInterimResponse} and
+	 * {@link #toResponseBuilder}, so that every field list is fully validated exactly once, by whichever
+	 * of the two it goes to.
+	 * <p>
+	 * Deliberately answers {@code false} for a {@code :status} that is missing or not three digits: that
+	 * is not an interim response, it is a malformed one, and {@link #toResponseBuilder} is where the
+	 * message-error rules live. Nothing here rejects anything.
+	 */
+	public static boolean isInformationalStatus(List<Field> fields) {
+		for (Field field : fields) {
+			if (!field.name().equals(STATUS)) continue;
+			String value = field.value();
+			return value.length() == 3 && value.charAt(0) == '1';
+		}
+		return false;
+	}
+
+	/**
+	 * Validates an informational ({@code 1xx}) response's field list without building a message from it:
+	 * RFC 9114 §4.1 has a client consume an interim response and go on reading for the final one, so
+	 * there is nothing here for a caller to receive — but the section is still a response field section,
+	 * and a malformed one is still {@code H3_MESSAGE_ERROR}.
+	 *
+	 * @throws Http3Exception {@code H3_MESSAGE_ERROR} on any validation failure, exactly as
+	 *                        {@link #toResponseBuilder} raises it
+	 */
+	public static void validateInterimResponse(List<Field> fields) throws Http3Exception {
+		collectAndValidate(fields, Mode.RESPONSE, new ArrayList<>());
 	}
 
 	/**
@@ -218,6 +301,7 @@ public final class Http3Headers {
 		for (Field field : fields) {
 			String name = field.name();
 			validateFieldName(name);
+			validateFieldValue(field.value());
 			if (!name.isEmpty() && name.charAt(0) == ':') {
 				if (mode == Mode.TRAILERS) {
 					throw messageError("Pseudo-header in a trailer section");
@@ -248,10 +332,32 @@ public final class Http3Headers {
 				if (name.equals(TE_FIELD) && !field.value().equals(TE_ALLOWED_VALUE)) {
 					throw messageError("TE field carries a value other than \"trailers\"");
 				}
+				checkSingleton(field, regularOut);
 				regularOut.add(field);
 			}
 		}
 		return pseudo;
+	}
+
+	/**
+	 * Refuses a second {@code host}, and a second {@code content-length} that disagrees with the first
+	 * (RFC 9110 §7.2 and §8.6). A repeated <i>identical</i> {@code Content-Length} is the list form §8.6
+	 * explicitly permits, and says nothing new — it is accepted, and the duplicate carried through as
+	 * any other repeated field is.
+	 * <p>
+	 * Linear over what has been collected so far, which is what the message-size bound already caps; a
+	 * map would be a second index over a list that is nearly always under a dozen entries.
+	 */
+	private static void checkSingleton(Field field, List<Field> collectedSoFar) throws Http3Exception {
+		String name = field.name();
+		if (!SINGLETON_FIELDS.contains(name)) return;
+		for (Field earlier : collectedSoFar) {
+			if (!earlier.name().equals(name)) continue;
+			if (name.equals(CONTENT_LENGTH_FIELD) && earlier.value().equals(field.value())) return;
+			// `name` is a member of SINGLETON_FIELDS by the check above — a constant of this class, not
+			// peer bytes — so naming it here carries nothing of the peer's (FR-063).
+			throw messageError("Repeated " + name + " field");
+		}
 	}
 
 	private static void validateFieldName(String name) throws Http3Exception {
@@ -274,6 +380,32 @@ public final class Http3Headers {
 				throw messageError("Illegal octet in a field name");
 			}
 		}
+	}
+
+	/**
+	 * RFC 9114 §4.1.2's field-value rules: no NUL, LF or CR at any position, and no leading or trailing
+	 * SP/HTAB. Both halves matter beyond this process — HTTP/3 has no line-oriented framing, so a CR or
+	 * LF here costs nothing to carry, but the value reaches a servlet and the hop after that may well be
+	 * HTTP/1.1, where the same octets are a header-injection primitive. Applied to pseudo-header values
+	 * as much as to regular ones: {@code :authority} and {@code :path} both end up in a request target.
+	 * <p>
+	 * FR-063 as everywhere else here: an illegal octet is by definition one that would damage the log
+	 * line naming it, so the reason names the rule and the position of nothing.
+	 */
+	private static void validateFieldValue(String value) throws Http3Exception {
+		for (int i = 0; i < value.length(); i++) {
+			char c = value.charAt(i);
+			if (c == 0 || c == '\n' || c == '\r') {
+				throw messageError("Field value contains NUL, CR or LF (RFC 9114 §4.1.2)");
+			}
+		}
+		if (!value.isEmpty() && (isSpOrHtab(value.charAt(0)) || isSpOrHtab(value.charAt(value.length() - 1)))) {
+			throw messageError("Field value starts or ends with whitespace (RFC 9114 §4.1.2)");
+		}
+	}
+
+	private static boolean isSpOrHtab(char c) {
+		return c == ' ' || c == '\t';
 	}
 
 	// RFC 9110 §5.6.2 tchar, restricted to the lowercase half since uppercase is rejected above.

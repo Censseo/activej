@@ -163,6 +163,9 @@ public final class Http3RequestStream extends AbstractReactive {
 	private long bodyBytesSent;
 	private long declaredContentLength = NO_CONTENT_LENGTH;
 
+	/** Informational (1xx) responses consumed on this exchange, against {@code maxInterimResponses}. */
+	private int interimResponsesReceived;
+
 	/** Whatever this stream decoded from the peer's HEADERS; kept for its trailers even once handed over. */
 	private @Nullable HttpMessage inboundMessage;
 
@@ -381,10 +384,16 @@ public final class Http3RequestStream extends AbstractReactive {
 		inboundRequested = true;
 	}
 
-	/** Builds the inbound message from the leading HEADERS frame, taking ownership of it on every path. */
+	/**
+	 * Builds the inbound message from the leading HEADERS frame, taking ownership of it on every path.
+	 * <p>
+	 * Returns {@code null} for a field section that is <b>not</b> the message — an informational
+	 * ({@code 1xx}) response, the one case RFC 9114 §4.1 has a HEADERS frame open nothing — which tells
+	 * {@link #readHeaders} to consume it and keep reading.
+	 */
 	@FunctionalInterface
 	private interface InboundMessage<T extends HttpMessage> {
-		T build(HeadersFrame headers) throws Http3Exception;
+		@Nullable T build(HeadersFrame headers) throws Http3Exception;
 	}
 
 	private <T extends HttpMessage> Promise<T> readHeaders(InboundMessage<T> message, long incompleteErrorCode) {
@@ -394,16 +403,27 @@ public final class Http3RequestStream extends AbstractReactive {
 					"The stream ended before its HEADERS frame")));
 			}
 			if (!(frame instanceof HeadersFrame headers)) {
-				// An unknown or GREASE frame type before HEADERS is tolerated (RFC 9114 §9); the sequence
-				// validator has already refused everything that is not.
-				discarded(frame);
-				return readHeaders(message, incompleteErrorCode);
+				// Unreachable rather than tolerated: an unknown or GREASE type never leaves nextFrame()
+				// (RFC 9114 §9, see its Javadoc), and DATA in IDLE is already H3_FRAME_UNEXPECTED from the
+				// sequence validator. Stated as a failure rather than a skip so this can never become a
+				// loop driven by what a peer sends.
+				Recyclers.recycle(frame);
+				return Promise.ofException(abortWith(new Http3Exception(Http3Errors.H3_FRAME_UNEXPECTED,
+					"A frame other than HEADERS opened the message")));
 			}
+			T built;
 			try {
-				return Promise.of(message.build(headers));
+				built = message.build(headers);
 			} catch (Http3Exception e) {
 				return Promise.ofException(abortWith(e));
 			}
+			if (built == null) {
+				// An informational response: consumed, and the message it precedes is still ahead. Bounded
+				// recursion — buildResponse refuses more than settings.maxInterimResponses() of them, which
+				// is what stops a server from making its 1xx count this thread's stack depth.
+				return readHeaders(message, incompleteErrorCode);
+			}
+			return Promise.of(built);
 		});
 	}
 
@@ -424,9 +444,25 @@ public final class Http3RequestStream extends AbstractReactive {
 		return request;
 	}
 
-	/** Takes ownership of {@code headers} on every path. */
-	private HttpResponse buildResponse(HeadersFrame headers) throws Http3Exception {
+	/**
+	 * Takes ownership of {@code headers} on every path.
+	 *
+	 * @return {@code null} for an informational ({@code 1xx}) response, which RFC 9114 §4.1 has the
+	 * client consume before reading on for the final one — see {@link InboundMessage#build}
+	 */
+	private @Nullable HttpResponse buildResponse(HeadersFrame headers) throws Http3Exception {
 		List<Field> fields = decodeFieldSection(headers);
+		if (Http3Headers.isInformationalStatus(fields)) {
+			Http3Headers.validateInterimResponse(fields);
+			if (++interimResponsesReceived > settings.maxInterimResponses()) {
+				throw new Http3Exception(Http3Errors.H3_EXCESSIVE_LOAD,
+					"More than " + settings.maxInterimResponses() + " informational responses on one exchange");
+			}
+			// The grammar has to be told, because it only ever sees a frame type: this HEADERS opened
+			// nothing, and the next one is the message rather than its trailer section.
+			inbound.withdrawInformationalHeaders();
+			return null;
+		}
 		HttpResponse.Builder builder = Http3Headers.toResponseBuilder(fields);
 
 		bodySupplier = new InboundBodySupplier();
@@ -564,10 +600,16 @@ public final class Http3RequestStream extends AbstractReactive {
 	// ---------------------------------------------------------------- reading frames
 
 	/**
-	 * The next frame the peer sent, or {@code null} once the stream is FINed. The caller owns the frame.
+	 * The next frame the peer sent <b>that this layer has semantics for</b>, or {@code null} once the
+	 * stream is FINed. The caller owns the frame.
 	 * <p>
 	 * Loops synchronously while input is already in hand — a buffer routinely carries several frames, and
-	 * recursing per frame would grow the stack with the peer's chunk size.
+	 * recursing per frame would grow the stack with the peer's chunk size. An unknown or GREASE frame
+	 * (RFC 9114 §9, FR-062) is discarded <b>inside that loop</b> rather than handed up for a caller to
+	 * skip and ask again: a completed {@link Promise} runs its continuation synchronously, so a caller
+	 * that recursed per skipped frame would take one stack frame per GREASE frame the peer chose to send
+	 * — and a 2-byte frame type with a zero length means one maximum-size datagram is tens of thousands
+	 * of them. The control stream drains the same way ({@code Http3Connection.feedControlStream}).
 	 * <p>
 	 * A long DATA frame arrives as several {@link DataFrame} instalments (see {@link Http3FrameReader}),
 	 * so a frame in hand no longer means the reader is between frames — {@code isMidFrame()} is what says
@@ -592,6 +634,13 @@ public final class Http3RequestStream extends AbstractReactive {
 				} catch (Http3Exception e) {
 					Recyclers.recycle(frame);
 					return Promise.ofException(abortWith(e));
+				}
+				if (frame instanceof UnknownFrame) {
+					// RFC 9114 §9: it carries no payload this layer holds, and the sequence validator has
+					// already refused everything that is not tolerable here. Skipped without unwinding, so
+					// the peer's GREASE frame count is not this thread's stack depth.
+					discarded(frame);
+					continue;
 				}
 				return Promise.of(frame);
 			}
@@ -673,11 +722,16 @@ public final class Http3RequestStream extends AbstractReactive {
 					return Promise.ofException(abortWith(e));
 				}
 				state = State.TRAILERS_DONE;
+				// Depth 1, not a peer-driven loop: the sequence validator refuses a third HEADERS, so the
+				// next frame this reads can only be DATA (refused after trailers) or end of input.
 				return readBody();
 			}
-			// Unknown or GREASE (RFC 9114 §9): it carries no payload this layer holds.
-			discarded(frame);
-			return readBody();
+			// Unreachable: nextFrame() discards unknown and GREASE types itself, and the sequence validator
+			// refuses every other type on a request stream. Stated rather than skipped, for the reason
+			// readHeaders states.
+			Recyclers.recycle(frame);
+			return Promise.ofException(abortWith(new Http3Exception(Http3Errors.H3_FRAME_UNEXPECTED,
+				"A frame this layer has no semantics for reached the body reader")));
 		});
 	}
 

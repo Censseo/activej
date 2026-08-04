@@ -153,6 +153,153 @@ public class Http3HeadersValidationTest {
 		}
 	}
 
+	// ---------------------------------------------------------------- T119: singleton regular fields
+
+	/**
+	 * RFC 9110 §8.6: two {@code Content-Length} values that disagree make the message invalid. Only the
+	 * first was ever reconciled against the DATA that arrived, and for a gateway re-serializing to
+	 * HTTP/1.1 the pair is a request-smuggling primitive — the next hop may well take the last.
+	 */
+	@Test
+	public void twoDisagreeingContentLengthFieldsAreRejected() {
+		assertMessageError(validRequest(new Field("content-length", "5"), new Field("content-length", "9")));
+	}
+
+	/** The RFC 9110 §8.6 list form: repeated and <i>identical</i> says nothing new, and is legal. */
+	@Test
+	public void twoIdenticalContentLengthFieldsAreAccepted() throws Http3Exception {
+		Http3Headers.toRequestBuilder(
+			validRequest(new Field("content-length", "5"), new Field("content-length", "5"))).build();
+	}
+
+	/** RFC 9110 §7.2: exactly one {@code Host}, whichever of the two the receiver would have picked. */
+	@Test
+	public void twoHostFieldsAreRejected() {
+		Http3Exception e = assertThrows(Http3Exception.class, () -> Http3Headers.toRequestBuilder(List.of(
+			new Field(":method", "GET"),
+			new Field(":scheme", "https"),
+			new Field(":path", "/"),
+			new Field("host", "example.com"),
+			new Field("host", "evil.test"))));
+		assertEquals(Http3Errors.H3_MESSAGE_ERROR, e.errorCode());
+	}
+
+	/** Identical is not an exemption here the way it is for Content-Length: §7.2 says one, not one value. */
+	@Test
+	public void twoIdenticalHostFieldsAreRejected() {
+		assertMessageError(validRequest(new Field("host", "example.com"), new Field("host", "example.com")));
+	}
+
+	/** A duplicate of any other field is ordinary HTTP and stays that way. */
+	@Test
+	public void aRepeatedOrdinaryFieldIsAccepted() throws Http3Exception {
+		Http3Headers.toRequestBuilder(
+			validRequest(new Field("accept", "text/plain"), new Field("accept", "text/html"))).build();
+	}
+
+	// ---------------------------------------------------------------- T120: request target and field values
+
+	/**
+	 * RFC 9114 §4.3.1: under a scheme with a mandatory authority component, {@code :path} is origin-form.
+	 * Without the check the assembled URL silently changes meaning — {@code :path: x} makes
+	 * {@code https://example.com} into {@code https://example.comx}, an authority nobody named.
+	 */
+	@Test
+	public void aPathNotBeginningWithASlashIsRejected() {
+		assertMessageError(List.of(
+			new Field(":method", "GET"),
+			new Field(":scheme", "https"),
+			new Field(":authority", "example.com"),
+			new Field(":path", "x")));
+	}
+
+	/** The same rule under {@code http}, and it is the scheme that decides — not the presence of a path. */
+	@Test
+	public void aRelativePathUnderHttpIsRejected() {
+		assertMessageError(List.of(
+			new Field(":method", "GET"),
+			new Field(":scheme", "http"),
+			new Field(":authority", "example.com"),
+			new Field(":path", "index.html")));
+	}
+
+	/**
+	 * The section's one exception, {@code OPTIONS *}. {@code core-http}'s {@code UrlParser} has no
+	 * representation for the asterisk form, so it is refused as an unsupported capability — retryable,
+	 * the way CONNECT and {@code :protocol} are — rather than mangled into an origin-form URL.
+	 */
+	@Test
+	public void theAsteriskFormIsRefusedAsUnsupportedRatherThanMangled() {
+		Http3Exception e = assertThrows(Http3Exception.class, () -> Http3Headers.toRequestBuilder(List.of(
+			new Field(":method", "OPTIONS"),
+			new Field(":scheme", "https"),
+			new Field(":authority", "example.com"),
+			new Field(":path", "*"))));
+		assertEquals(Http3Errors.H3_REQUEST_REJECTED, e.errorCode());
+		assertTrue("nothing is wrong with the message, so re-issuing it elsewhere is safe", e.isRetryable());
+	}
+
+	/**
+	 * A scheme this class knows no authority rule for gets no invented path rule either — RFC 9114 §4.3.1
+	 * constrains the path only where the scheme constrains the authority. Such a request is still refused,
+	 * because {@code core-http}'s {@code UrlParser} understands {@code http} and {@code https} and nothing
+	 * else; what this asserts is <b>which</b> rule refuses it, since only one of the two would still be
+	 * right if that ever changed.
+	 */
+	@Test
+	public void aPathUnderAnUnknownSchemeIsNotJudgedByThePathRule() {
+		Http3Exception e = assertThrows(Http3Exception.class, () -> Http3Headers.toRequestBuilder(List.of(
+			new Field(":method", "GET"),
+			new Field(":scheme", "ftp"),
+			new Field(":authority", "example.com"),
+			new Field(":path", "relative"))));
+		assertEquals(Http3Errors.H3_MESSAGE_ERROR, e.errorCode());
+		assertTrue("refused by the URL parse, not by the origin-form rule: " + e.reason(),
+			e.reason().contains("Malformed request target"));
+	}
+
+	/**
+	 * RFC 9114 §4.1.2: NUL, CR and LF are forbidden at any position in a field value. HTTP/3 has no
+	 * line-oriented framing, so carrying them costs this layer nothing — but the value reaches a servlet,
+	 * and the hop after that may be HTTP/1.1, where the same octets split a response.
+	 */
+	@Test
+	public void controlOctetsInAFieldValueAreRejected() {
+		for (String value : new String[] {"a\rb", "a\nb", "a" + (char) 0 + "b", "trailing\r\n", "\nleading"}) {
+			assertMessageError(validRequest(new Field("x-note", value)));
+		}
+	}
+
+	/** The same rule applies to a pseudo-header value, which is where a request target comes from. */
+	@Test
+	public void controlOctetsInAPseudoHeaderValueAreRejected() {
+		assertMessageError(List.of(
+			new Field(":method", "GET"),
+			new Field(":scheme", "https"),
+			new Field(":authority", "example.com\r\nx-injected: 1"),
+			new Field(":path", "/")));
+	}
+
+	/** RFC 9114 §4.1.2, the other half: no leading or trailing SP/HTAB either. */
+	@Test
+	public void surroundingWhitespaceInAFieldValueIsRejected() {
+		for (String value : new String[] {" leading", "trailing ", "\ttab", "tab\t"}) {
+			assertMessageError(validRequest(new Field("x-note", value)));
+		}
+	}
+
+	/** Whitespace *inside* a value is ordinary and stays legal — only the edges are the RFC's concern. */
+	@Test
+	public void interiorWhitespaceInAFieldValueIsAccepted() throws Http3Exception {
+		Http3Headers.toRequestBuilder(validRequest(new Field("x-note", "two words"))).build();
+	}
+
+	/** An empty value is legal HTTP, and has no edge to be whitespace. */
+	@Test
+	public void anEmptyFieldValueIsAccepted() throws Http3Exception {
+		Http3Headers.toRequestBuilder(validRequest(new Field("x-note", ""))).build();
+	}
+
 	@Test
 	public void teFieldMustBeExactlyTrailers() {
 		assertMessageError(validRequest(new Field("te", "gzip")));

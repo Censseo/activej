@@ -123,6 +123,28 @@ public final class Http3FrameSequence {
 		return state;
 	}
 
+	/**
+	 * Withdraws the leading HEADERS frame just accepted, because its field section turned out to carry an
+	 * informational ({@code 1xx}) {@code :status}. RFC 9114 §4.1 lets a server send any number of interim
+	 * responses ahead of the final one, and each is a HEADERS frame that opens <i>nothing</i> — the
+	 * sequence is still waiting for the one that does. Without this the final response's HEADERS would be
+	 * read as the trailer section of the interim one.
+	 * <p>
+	 * The grammar cannot decide this for itself, which is why it is a separate call: a frame <i>type</i>
+	 * is all this class ever sees, and 1xx is a property of the field section behind it. Only the reactive
+	 * layer that decoded that section can say so, and only on a response.
+	 *
+	 * @throws IllegalStateException if anything but the leading HEADERS frame is being withdrawn — a
+	 *                               programming error in the caller, not a peer's doing
+	 */
+	public void withdrawInformationalHeaders() {
+		if (state != State.HEADERS_DONE) {
+			throw new IllegalStateException(
+				"Only a leading HEADERS frame can be withdrawn as informational, not one in state " + state);
+		}
+		state = State.IDLE;
+	}
+
 	private static Http3Exception unexpected(String detail) {
 		return new Http3Exception(Http3Errors.H3_FRAME_UNEXPECTED, detail);
 	}

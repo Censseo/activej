@@ -51,6 +51,19 @@ public final class Http3Settings {
 		ApplicationSettings.getInt(Http3Settings.class, "maxConnections", 256);
 	public static final int DEFAULT_MAX_QUEUED_REQUESTS =
 		ApplicationSettings.getInt(Http3Settings.class, "maxQueuedRequests", 100);
+
+	/**
+	 * How many informational ({@code 1xx}) responses a client reads past on one exchange before the
+	 * server has said enough. RFC 9114 §4.1 puts no number on it, and each one is a field section this
+	 * side decodes and throws away — so without a bound a server could hold a request stream open, and a
+	 * caller's promise unresolved, for as long as it cared to keep sending 3-byte HEADERS frames (SI-3).
+	 * <p>
+	 * Eight: {@code 103 Early Hints} in practice arrives once, occasionally twice, and a
+	 * {@code 100 Continue} ahead of it makes three. The bound exists to be far above the legitimate case
+	 * and far below an unbounded one.
+	 */
+	public static final int DEFAULT_MAX_INTERIM_RESPONSES =
+		ApplicationSettings.getInt(Http3Settings.class, "maxInterimResponses", 8);
 	public static final Duration DEFAULT_REQUEST_TIMEOUT =
 		ApplicationSettings.getDuration(Http3Settings.class, "requestTimeout", Duration.ofSeconds(60));
 
@@ -90,13 +103,15 @@ public final class Http3Settings {
 	private final int maxConcurrentRequestStreams;
 	private final int maxConnections;
 	private final int maxQueuedRequests;
+	private final int maxInterimResponses;
 	private final long requestTimeoutMillis;
 	private final long shutdownTimeoutMillis;
 
+	@SuppressWarnings("java:S107") // one parameter per bound; the Builder is the only caller
 	private Http3Settings(
 		long maxFieldSectionSize, long maxBodySize, long maxControlFrameSize,
-		int maxConcurrentRequestStreams, int maxConnections, int maxQueuedRequests, long requestTimeoutMillis,
-		long shutdownTimeoutMillis
+		int maxConcurrentRequestStreams, int maxConnections, int maxQueuedRequests, int maxInterimResponses,
+		long requestTimeoutMillis, long shutdownTimeoutMillis
 	) {
 		this.maxFieldSectionSize = maxFieldSectionSize;
 		this.maxBodySize = maxBodySize;
@@ -104,6 +119,7 @@ public final class Http3Settings {
 		this.maxConcurrentRequestStreams = maxConcurrentRequestStreams;
 		this.maxConnections = maxConnections;
 		this.maxQueuedRequests = maxQueuedRequests;
+		this.maxInterimResponses = maxInterimResponses;
 		this.requestTimeoutMillis = requestTimeoutMillis;
 		this.shutdownTimeoutMillis = shutdownTimeoutMillis;
 	}
@@ -123,6 +139,7 @@ public final class Http3Settings {
 		private int maxConcurrentRequestStreams = DEFAULT_MAX_CONCURRENT_REQUEST_STREAMS;
 		private int maxConnections = DEFAULT_MAX_CONNECTIONS;
 		private int maxQueuedRequests = DEFAULT_MAX_QUEUED_REQUESTS;
+		private int maxInterimResponses = DEFAULT_MAX_INTERIM_RESPONSES;
 		private long requestTimeoutMillis = DEFAULT_REQUEST_TIMEOUT.toMillis();
 		private long shutdownTimeoutMillis = DEFAULT_SHUTDOWN_TIMEOUT.toMillis();
 
@@ -148,7 +165,10 @@ public final class Http3Settings {
 			return this;
 		}
 
-		/** Bounds SETTINGS / GOAWAY / control-stream frames. */
+		/**
+		 * Bounds SETTINGS / GOAWAY / control-stream frames. At least 1 byte and at most
+		 * {@link Integer#MAX_VALUE}, like {@link #withMaxFieldSectionSize} and for the same reason.
+		 */
 		public Builder withMaxControlFrameSize(MemSize maxControlFrameSize) {
 			checkNotBuilt(this);
 			this.maxControlFrameSize = maxControlFrameSize.toLong();
@@ -173,6 +193,17 @@ public final class Http3Settings {
 		public Builder withMaxQueuedRequests(int maxQueuedRequests) {
 			checkNotBuilt(this);
 			this.maxQueuedRequests = maxQueuedRequests;
+			return this;
+		}
+
+		/**
+		 * Informational ({@code 1xx}) responses a client reads past on one exchange (RFC 9114 §4.1);
+		 * past it the exchange fails with {@code H3_EXCESSIVE_LOAD}. 0 accepts none, and turns any
+		 * interim response into that failure.
+		 */
+		public Builder withMaxInterimResponses(int maxInterimResponses) {
+			checkNotBuilt(this);
+			this.maxInterimResponses = maxInterimResponses;
 			return this;
 		}
 
@@ -212,6 +243,13 @@ public final class Http3Settings {
 			if (maxControlFrameSize < 1) {
 				throw new IllegalArgumentException("maxControlFrameSize (" + maxControlFrameSize + ") must be at least 1");
 			}
+			// The control stream's reader casts the same validated declared length to an int as a request
+			// stream's does, so this bound needs the same ceiling as the two above: past it the cast wraps
+			// negative, no length ever passes the check, and the control stream stalls without a word.
+			if (maxControlFrameSize > Integer.MAX_VALUE) {
+				throw new IllegalArgumentException(
+					"maxControlFrameSize (" + maxControlFrameSize + ") must not exceed " + Integer.MAX_VALUE);
+			}
 			if (maxConcurrentRequestStreams < 1) {
 				throw new IllegalArgumentException(
 					"maxConcurrentRequestStreams (" + maxConcurrentRequestStreams + ") must be at least 1");
@@ -221,6 +259,10 @@ public final class Http3Settings {
 			}
 			if (maxQueuedRequests < 0) {
 				throw new IllegalArgumentException("maxQueuedRequests (" + maxQueuedRequests + ") must not be negative");
+			}
+			if (maxInterimResponses < 0) {
+				throw new IllegalArgumentException(
+					"maxInterimResponses (" + maxInterimResponses + ") must not be negative; 0 accepts none");
 			}
 			if (requestTimeoutMillis < 0) {
 				throw new IllegalArgumentException(
@@ -232,8 +274,8 @@ public final class Http3Settings {
 			}
 			return new Http3Settings(
 				maxFieldSectionSize, maxBodySize, maxControlFrameSize,
-				maxConcurrentRequestStreams, maxConnections, maxQueuedRequests, requestTimeoutMillis,
-				shutdownTimeoutMillis);
+				maxConcurrentRequestStreams, maxConnections, maxQueuedRequests, maxInterimResponses,
+				requestTimeoutMillis, shutdownTimeoutMillis);
 		}
 	}
 
@@ -265,6 +307,11 @@ public final class Http3Settings {
 
 	public int maxQueuedRequests() {
 		return maxQueuedRequests;
+	}
+
+	/** Informational (1xx) responses read past on one exchange; 0 accepts none (RFC 9114 §4.1). */
+	public int maxInterimResponses() {
+		return maxInterimResponses;
 	}
 
 	/** 0 disables the request timeout. */

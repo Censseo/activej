@@ -154,6 +154,7 @@ explicitly.
   | `maxUniStreams` | `3` (fixed, not a builder field) | advertised `initial_max_streams_uni` — control + both QPACK streams, nothing more (FR-017) |
   | `maxConnections` | `256` | `Http3Client` pool size; the least-recently-used idle connection is evicted past it |
   | `maxQueuedRequests` | `100` | requests waiting for stream credit; overflow fails immediately, retryably |
+  | `maxInterimResponses` | `8` | informational (`1xx`) responses a client reads past on one exchange; past it the exchange fails with `H3_EXCESSIVE_LOAD` |
   | `requestTimeout` | `60s` | per request on both sides, queued time included |
   | `shutdownTimeout` | `1s` | ceiling on the GOAWAY drain of `Http3Server.close()`; `0` closes at once |
 
@@ -164,9 +165,34 @@ explicitly.
   it costs a chunk per stream rather than the bound per stream, and the peak a
   connection can be driven to is its concurrent-stream limit times a chunk.
 
+  Each of `maxFieldSectionSize`, `maxBodySize` and `maxControlFrameSize` is
+  refused at `build()` above `Integer.MAX_VALUE`: all three reach a frame
+  reader's declared-length check, which allocates a validated length as an
+  `int`, so a larger bound would wrap negative instead of doing what it says.
+
   `Http3Errors`/`Http3Exception` carry the RFC 9114 §8.1 and RFC 9204 §6
   application error codes — a third axis alongside `HttpError` (status code)
   and `QuicTransportException` (RFC 9000 §20 transport code).
+
+  **Message validation is RFC 9114 §4.1.2/§4.3.1 strict.** Beyond the
+  pseudo-header rules: a field *value* carrying NUL, CR or LF at any position,
+  or leading/trailing space or tab, is `H3_MESSAGE_ERROR` — HTTP/3 has no
+  line-oriented framing, but the value reaches a servlet and the hop after that
+  may be HTTP/1.1. A `:path` under `http`/`https` must be origin-form
+  (`/`-prefixed); the asterisk form (`OPTIONS *`) has no representation in
+  `core-http`'s URL model and is refused with the retryable
+  `H3_REQUEST_REJECTED` rather than mangled into an origin-form URL. A repeated
+  `host`, or a repeated `content-length` whose values disagree, is
+  `H3_MESSAGE_ERROR` (RFC 9110 §7.2, §8.6): only the first was ever reconciled
+  against the DATA that arrived, and for a gateway re-serializing to HTTP/1.1
+  the pair is a request-smuggling primitive. Repeated *identical*
+  `content-length` stays legal, as RFC 9110 §8.6's list form.
+
+  **Informational (`1xx`) responses are consumed, not delivered.** RFC 9114 §4.1
+  lets a server send any number ahead of the final response, and `103 Early
+  Hints` arrives unsolicited from real CDNs; `Http3Client` reads past each and
+  delivers the final response, bounded by `maxInterimResponses` above. They are
+  not surfaced to the caller — `IHttpClient` has nowhere to put one.
 
   **Server.** `Http3Server.builder(reactor, servlet)` serves an existing
   `AsyncServlet` unmodified over QUIC — `withListenAddress`/`withListenPort` or

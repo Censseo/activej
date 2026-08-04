@@ -41,6 +41,7 @@ public class Http3SettingsTest {
 		assertEquals(3, settings.maxUniStreams());
 		assertEquals(256, settings.maxConnections());
 		assertEquals(100, settings.maxQueuedRequests());
+		assertEquals(8, settings.maxInterimResponses());
 		assertEquals(Duration.ofSeconds(60).toMillis(), settings.requestTimeoutMillis());
 	}
 
@@ -53,6 +54,7 @@ public class Http3SettingsTest {
 			.withMaxConcurrentRequestStreams(50)
 			.withMaxConnections(64)
 			.withMaxQueuedRequests(10)
+			.withMaxInterimResponses(2)
 			.withRequestTimeout(Duration.ofSeconds(5))
 			.build();
 
@@ -62,15 +64,18 @@ public class Http3SettingsTest {
 		assertEquals(50, settings.maxConcurrentRequestStreams());
 		assertEquals(64, settings.maxConnections());
 		assertEquals(10, settings.maxQueuedRequests());
+		assertEquals(2, settings.maxInterimResponses());
 		assertEquals(Duration.ofSeconds(5).toMillis(), settings.requestTimeoutMillis());
 		// maxUniStreams is fixed at 3 (FR-017): not a builder field, no withMaxUniStreams(...) exists.
 		assertEquals(3, settings.maxUniStreams());
 	}
 
 	/**
-	 * T115: both of these become a request stream's {@code maxFrameSize}, and {@code Http3FrameReader}
-	 * allocates a validated declared length as an {@code int} — so a bound above 2^31-1 would let a length
-	 * through that wraps negative on the way to the allocator instead of being refused as excessive load.
+	 * T115, extended by T118 to the third of the three: each of these becomes a frame reader's declared-
+	 * length bound, and {@code Http3FrameReader} allocates a validated declared length as an {@code int} —
+	 * so a bound above 2^31-1 would let a length through that wraps negative on the way to the allocator
+	 * instead of being refused as excessive load. On the control stream the symptom is quieter still than
+	 * on a request stream: no length ever passes the check, and the control stream stalls without a word.
 	 * The configuration is refused at {@code build()} rather than the wire length at read time.
 	 */
 	@Test
@@ -81,6 +86,8 @@ public class Http3SettingsTest {
 			() -> Http3Settings.builder().withMaxFieldSectionSize(tooLarge).build());
 		assertThrows(IllegalArgumentException.class,
 			() -> Http3Settings.builder().withMaxBodySize(tooLarge).build());
+		assertThrows(IllegalArgumentException.class,
+			() -> Http3Settings.builder().withMaxControlFrameSize(tooLarge).build());
 	}
 
 	/** The bound itself is not off by one: exactly {@link Integer#MAX_VALUE} is still a legal ceiling. */
@@ -89,10 +96,22 @@ public class Http3SettingsTest {
 		Http3Settings settings = Http3Settings.builder()
 			.withMaxFieldSectionSize(MemSize.bytes(Integer.MAX_VALUE))
 			.withMaxBodySize(MemSize.bytes(Integer.MAX_VALUE))
+			.withMaxControlFrameSize(MemSize.bytes(Integer.MAX_VALUE))
 			.build();
 
 		assertEquals(Integer.MAX_VALUE, settings.maxFieldSectionSize());
 		assertEquals(Integer.MAX_VALUE, settings.maxBodySize());
+		assertEquals(Integer.MAX_VALUE, settings.maxControlFrameSize());
+	}
+
+	/** T121: the bound on how many interim responses a server may make a client read past (SI-3). */
+	@Test
+	public void aNegativeInterimResponseBoundIsRefused() {
+		assertThrows(IllegalArgumentException.class,
+			() -> Http3Settings.builder().withMaxInterimResponses(-1).build());
+
+		// 0 is not a misconfiguration: it means "accept no informational response at all".
+		assertEquals(0, Http3Settings.builder().withMaxInterimResponses(0).build().maxInterimResponses());
 	}
 
 	@Test
