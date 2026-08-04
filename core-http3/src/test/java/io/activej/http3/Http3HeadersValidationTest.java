@@ -358,11 +358,33 @@ public class Http3HeadersValidationTest {
 	}
 
 	/**
-	 * The other half of the rule above, and the reason it cannot simply reject every uppercase octet
-	 * {@code fromQpack} sees: {@code content-length} is registered in {@code core-http}, so interning
-	 * hands the decoder's output back as {@code Content-Length} whatever the wire spelled. That case is
-	 * normalized, and the two names whose received spelling <i>did</i> survive are passed through as they
-	 * arrived.
+	 * The case interning used to hide, and the T108 residual this closes.
+	 * <p>
+	 * {@code date} is registered in {@code core-http}, so {@code HttpHeaders.of} hands back the same
+	 * token whether the wire spelled it {@code date} or {@code Date} — by the time {@code fromQpack} sees
+	 * an {@link HttpHeader} the peer's own spelling is gone, and the check could only conclude "the
+	 * registry canonicalised this" and let it through. RFC 9114 §4.1.1 requires the uppercase form to be
+	 * rejected, so the decoder now records what the octets said and {@code fromQpack} acts on that.
+	 * <p>
+	 * Goes through a real wire decode on purpose: a hand-built {@code QpackField} cannot reproduce this,
+	 * because the fact under test is one only the decoder ever holds.
+	 */
+	@Test
+	public void qpackDecodedUppercaseRegisteredFieldNameIsRejected() {
+		Http3Exception e = assertThrows(Http3Exception.class,
+			() -> fromWire(literalFieldSection("Date", "x")));
+		assertEquals(Http3Errors.H3_MESSAGE_ERROR, e.errorCode());
+	}
+
+	/** The same name, spelled as RFC 9114 §4.1.1 requires, still decodes. */
+	@Test
+	public void qpackDecodedLowercaseRegisteredFieldNameIsAccepted() throws Http3Exception {
+		assertEquals(List.of("date"), fromWire(literalFieldSection("date", "x")).stream().map(Field::name).toList());
+	}
+
+	/**
+	 * A field list assembled by hand carries no wire provenance, so the interning-aware path still applies:
+	 * a registered name reaching {@code fromQpack} as its canonical token is normalized, not rejected.
 	 */
 	@Test
 	public void qpackDecodedLowercaseFieldNamesAreAccepted() throws Http3Exception {

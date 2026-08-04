@@ -520,7 +520,7 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 			}
 			// Translated last: everything above works in this module's own terms, and only what the caller
 			// sees is stated in core-http's (T114).
-			result.setException(clientVisible(e));
+			result.setException(Http3RequestStream.clientVisible(e));
 		}
 
 		/**
@@ -556,29 +556,6 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 		private long errorCodeOf(Exception e) {
 			return e instanceof Http3Exception h3 ? h3.errorCode() : Http3Errors.H3_REQUEST_CANCELLED;
 		}
-	}
-
-	/**
-	 * What a caller sees instead of what this client raised, for the one failure {@code core-http} already
-	 * has a name for: a response that is not a well-formed HTTP message is a {@link MalformedHttpException}
-	 * here exactly as it is from {@code HttpClient}, so code written against {@link IHttpClient} catches
-	 * the same type whichever implementation is under it (FR-047).
-	 * <p>
-	 * Exactly the message-error class is translated. {@code H3_MESSAGE_ERROR} is the code RFC 9114 §4.1.2
-	 * reserves for a message that is not fully formed — a missing or duplicated pseudo-header, an uppercase
-	 * field name, a connection-specific field, a {@code Content-Length} that disagrees with the body — and
-	 * nothing else raised here means "the response was malformed": a limit, a timeout, a rejection and a
-	 * transport failure each say something a caller would act on differently, and each keeps its own type
-	 * (FR-058c). The {@link Http3Exception} is the cause, so its error code is not lost.
-	 * <p>
-	 * Client-side only, as {@code contracts/java-api.md} §2.4 states it: a server answers a malformed
-	 * request with a stream reset carrying the same code, and has no promise to fail.
-	 */
-	private static Exception clientVisible(Exception e) {
-		if (e instanceof Http3Exception h3 && h3.errorCode() == Http3Errors.H3_MESSAGE_ERROR) {
-			return new MalformedHttpException(h3.reason(), h3);
-		}
-		return e;
 	}
 
 	// ---------------------------------------------------------------- the connection pool

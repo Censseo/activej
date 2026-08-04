@@ -71,6 +71,9 @@ public final class Http3Headers {
 	private static final String PATH = ":path";
 	private static final String STATUS = ":status";
 
+	/** RFC 9114 §4.1.1. Reached from three places: the token path, the interning path, and the raw octets. */
+	private static final String UPPERCASE_FIELD_NAME = "Uppercase octet in a field name";
+
 	/**
 	 * The RFC 9220 extended-CONNECT pseudo-header — what turns a CONNECT into a WebSocket handshake or
 	 * another tunnelled protocol. Out of scope (FR-040), and named here so that it can be refused as the
@@ -371,7 +374,7 @@ public final class Http3Headers {
 		for (int i = start; i < name.length(); i++) {
 			char c = name.charAt(i);
 			if (c >= 'A' && c <= 'Z') {
-				throw messageError("Uppercase octet in a field name");
+				throw messageError(UPPERCASE_FIELD_NAME);
 			}
 			if (!isLowerTchar(c)) {
 				// FR-063, and the sharpest case of it in this file: an illegal octet is by definition
@@ -512,6 +515,11 @@ public final class Http3Headers {
 	public static List<Field> fromQpack(List<QpackField> fields) throws Http3Exception {
 		List<Field> result = new ArrayList<>(fields.size());
 		for (QpackField field : fields) {
+			// The decoder's own verdict comes first: for a name the registry canonicalises, this is the
+			// only evidence of what the peer actually sent, and the token below no longer carries it.
+			if (field.nameHadUppercase()) {
+				throw messageError(UPPERCASE_FIELD_NAME);
+			}
 			result.add(new Field(
 				decodedFieldName(field.name()),
 				new String(field.value(), StandardCharsets.ISO_8859_1)));
@@ -531,7 +539,7 @@ public final class Http3Headers {
 			return name;
 		}
 		if (!isCanonicalizedByInterning(header)) {
-			throw messageError("Uppercase octet in a field name");
+			throw messageError(UPPERCASE_FIELD_NAME);
 		}
 		return name.toLowerCase(Locale.ROOT);
 	}

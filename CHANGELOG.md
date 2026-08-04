@@ -105,6 +105,19 @@ explicitly.
 
 - Fixed an authentication bypass in `BasicAuthServlet` when a username was
   absent from the credentials store, while preserving constant-time comparison.
+- **HTTP/3: an uppercase field name is now rejected whatever its spelling.**
+  RFC 9114 §4.1.1 forbids uppercase in a field name, but `HttpHeaders`
+  interning returns the registry's own token for any case-insensitive match, so
+  by the time validation ran, a peer's `Content-Type` was indistinguishable from
+  `content-type` and was normalised instead of refused. The QPACK decoder — the
+  last place holding the received octets — now reports what they said, so the
+  rule holds for the ~150 registered names and not only for unregistered ones.
+- **HTTP/3 client: a `Content-Length` that disagrees with the body now fails
+  with `MalformedHttpException`**, like every other malformed response, instead
+  of a raw `Http3Exception`. The mismatch is only detectable once the body ends,
+  so it surfaces on the body channel rather than on the promise `request(...)`
+  returned, and only the head path was being translated.
+
 - **HTTP/3 QPACK: decompression failures now carry the RFC 9204 scope the
   cause calls for**, instead of always resetting only the stream. RFC 9204
   assigns the scope per cause while every cause shares
