@@ -44,8 +44,17 @@ public final class QpackException extends Exception {
 
 	private final long errorCode;
 	private final String reason;
+	private final boolean connectionError;
 
 	/**
+	 * A <b>stream</b>-scoped failure: the field section is undecodable, but the peer's encoder and this
+	 * decoder still agree about the format, so the rest of the connection is unaffected.
+	 * <p>
+	 * RFC 9204 §7 mandates exactly this scope for the one case it names — a value larger than the
+	 * implementation is able to decode, on a request stream. Truncation of a length-delimited field
+	 * section is treated the same way here: the HEADERS frame bounded the damage, and the static table
+	 * carries no cross-section state that could be corrupted.
+	 *
 	 * @param errorCode one of {@link Http3Errors#QPACK_DECOMPRESSION_FAILED},
 	 *                  {@link Http3Errors#QPACK_ENCODER_STREAM_ERROR} or
 	 *                  {@link Http3Errors#QPACK_DECODER_STREAM_ERROR}
@@ -54,9 +63,40 @@ public final class QpackException extends Exception {
 	 *                  format string
 	 */
 	public QpackException(long errorCode, String reason) {
+		this(errorCode, reason, false);
+	}
+
+	/**
+	 * A <b>connection</b>-scoped failure: the peer's encoder and this decoder disagree about the
+	 * compression format itself, so no field section that follows — on this stream or any other — is
+	 * trustworthy.
+	 * <p>
+	 * RFC 9204 requires this scope for an invalid <b>static</b> table index (§3.1), a reference to a
+	 * dynamic-table entry that is not available (§2.2.3), and a Required Insert Count smaller than
+	 * expected (§4.5.1, where a larger one is a MAY that this implementation exercises — with no
+	 * dynamic table, any non-zero count means the peer has misread the connection).
+	 *
+	 * @see #isConnectionError()
+	 */
+	public static QpackException connectionError(long errorCode, String reason) {
+		return new QpackException(errorCode, reason, true);
+	}
+
+	private QpackException(long errorCode, String reason, boolean connectionError) {
 		super(reason);
 		this.errorCode = errorCode;
 		this.reason = reason;
+		this.connectionError = connectionError;
+	}
+
+	/**
+	 * Whether RFC 9204 requires this failure to abort the whole <b>connection</b> rather than just the
+	 * stream that carried it. The error <i>code</i> cannot express this on its own — every failure here
+	 * is {@code QPACK_DECOMPRESSION_FAILED} (0x0200), and the RFC assigns the scope per cause, not per
+	 * code.
+	 */
+	public boolean isConnectionError() {
+		return connectionError;
 	}
 
 	/** One of the three RFC 9204 §6 codes declared on {@link Http3Errors}. */

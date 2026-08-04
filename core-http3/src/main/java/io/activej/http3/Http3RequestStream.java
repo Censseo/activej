@@ -505,8 +505,12 @@ public final class Http3RequestStream extends AbstractReactive {
 			return Http3Headers.fromQpack(qpackDecoder.decode(headers.fieldSection));
 		} catch (QpackException e) {
 			// The QPACK codes are a space of their own (RFC 9204 §6); the code it chose is the code the
-			// stream is aborted with.
-			throw new Http3Exception(e.errorCode(), e.getMessage());
+			// abort carries. The *scope*, however, does not follow from the code — RFC 9204 assigns it
+			// per cause while every cause shares QPACK_DECOMPRESSION_FAILED — so the decoder's verdict
+			// is carried across rather than re-derived here.
+			throw e.isConnectionError() ?
+				Http3Exception.connectionScoped(e.errorCode(), e.getMessage()) :
+				new Http3Exception(e.errorCode(), e.getMessage());
 		}
 	}
 
@@ -845,7 +849,7 @@ public final class Http3RequestStream extends AbstractReactive {
 		// Last, and after this stream is wholly terminal: the listener routinely closes the connection,
 		// which aborts every stream it owns — this one included, whose second abort must find nothing left
 		// to do.
-		if (e instanceof Http3Exception h3 && isConnectionError(h3.errorCode())) {
+		if (e instanceof Http3Exception h3 && isConnectionError(h3)) {
 			connectionErrorListener.accept(h3);
 		}
 		return e;
@@ -868,14 +872,25 @@ public final class Http3RequestStream extends AbstractReactive {
 	 *       protocol wrongly is not framing <i>this</i> exchange wrongly, and the bytes that follow on
 	 *       every other stream are no more trustworthy than these.</li>
 	 * </ul>
-	 * The two are the whole of it, and both are raised by the frame layer rather than here. Everything a
-	 * request stream refuses about the <i>message</i> — a missing or duplicated pseudo-header, a
-	 * connection-specific field, a {@code Content-Length} that disagrees with the body, an oversized
-	 * field section, a broken frame, an abandoned body — is a stream error and leaves the connection
-	 * alone (FR-037).
+ * Those two are derivable from the code, and both are raised by the frame layer rather than here.
+	 * A third group is <b>not</b> derivable from the code and arrives pre-classified instead: QPACK
+	 * failures, where RFC 9204 assigns the scope per cause while every cause shares
+	 * {@code QPACK_DECOMPRESSION_FAILED} (0x0200). An invalid static-table index (§3.1), a reference to
+	 * an unavailable dynamic-table entry (§2.2.3) and an unexpected Required Insert Count (§4.5.1) are
+	 * connection errors, because they mean the peer's encoder and this decoder disagree about the
+	 * format itself; a value too large to decode or a truncated section (§7) stays a stream error,
+	 * because it is a local limit and the static table carries no cross-section state to corrupt.
+	 * {@link Http3Exception#isConnectionScoped()} carries that verdict.
+	 * <p>
+	 * Everything a request stream refuses about the <i>message</i> — a missing or duplicated
+	 * pseudo-header, a connection-specific field, a {@code Content-Length} that disagrees with the body,
+	 * an oversized field section, a broken frame, an abandoned body — is a stream error and leaves the
+	 * connection alone (FR-037).
 	 */
-	private static boolean isConnectionError(long errorCode) {
-		return errorCode == Http3Errors.H3_ID_ERROR || errorCode == Http3Errors.H3_FRAME_UNEXPECTED;
+	private static boolean isConnectionError(Http3Exception e) {
+		return e.errorCode() == Http3Errors.H3_ID_ERROR
+			|| e.errorCode() == Http3Errors.H3_FRAME_UNEXPECTED
+			|| e.isConnectionScoped();
 	}
 
 	/**

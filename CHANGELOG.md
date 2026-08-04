@@ -105,6 +105,19 @@ explicitly.
 
 - Fixed an authentication bypass in `BasicAuthServlet` when a username was
   absent from the credentials store, while preserving constant-time comparison.
+- **HTTP/3 QPACK: decompression failures now carry the RFC 9204 scope the
+  cause calls for**, instead of always resetting only the stream. RFC 9204
+  assigns the scope per cause while every cause shares
+  `QPACK_DECOMPRESSION_FAILED` (0x0200): an invalid **static** table index
+  (§3.1), a reference to an unavailable dynamic-table entry (§2.2.3) and an
+  unexpected Required Insert Count (§4.5.1) are **connection** errors, while a
+  value too large to decode (§7), a truncated field section and an exceeded
+  size bound stay **stream** errors. The static-index rule applied to the table
+  this implementation already ships, so this closes a live conformance gap
+  rather than a theoretical one. The dividing line is whether the peers still
+  agree about the format: a local limit kills one exchange, a format
+  disagreement means nothing that follows on any stream is trustworthy.
+
 - **QUIC/TLS: a legal empty `ticket_nonce` no longer kills an established
   connection.** RFC 8446 §4.6.1 declares `opaque ticket_nonce<0..255>`, so an
   **empty** nonce is valid; `TlsMessages` enforced a minimum of 1 byte, having

@@ -41,6 +41,7 @@ public class Http3Exception extends Exception {
 	private final long errorCode;
 	private final String reason;
 	private final boolean retryable;
+	private final boolean connectionScoped;
 
 	/**
 	 * @param errorCode an {@link Http3Errors} constant
@@ -59,10 +60,41 @@ public class Http3Exception extends Exception {
 	 * overflow (both raised by later, connection-layer phases).
 	 */
 	public Http3Exception(long errorCode, String reason, boolean retryable) {
+		this(errorCode, reason, retryable, false);
+	}
+
+	/**
+	 * A violation that must abort the whole <b>connection</b> even though it was observed on a single
+	 * request stream, in a case the error <b>code alone cannot express</b>.
+	 * <p>
+	 * Almost every such case is identifiable from the code — {@code H3_ID_ERROR} and
+	 * {@code H3_FRAME_UNEXPECTED} always are, and {@code Http3RequestStream} classifies them that way
+	 * without help. QPACK is the exception: RFC 9204 assigns the scope <b>per cause</b> while every
+	 * cause shares {@code QPACK_DECOMPRESSION_FAILED} (0x0200), so an invalid static-table index
+	 * (§3.1) and an over-long string literal (§7) carry the same code and opposite scopes. This flag
+	 * carries the decoder's verdict across the boundary.
+	 *
+	 * @see io.activej.http3.qpack.QpackException#isConnectionError()
+	 */
+	public static Http3Exception connectionScoped(long errorCode, String reason) {
+		return new Http3Exception(errorCode, reason, false, true);
+	}
+
+	private Http3Exception(long errorCode, String reason, boolean retryable, boolean connectionScoped) {
 		super(reason);
 		this.errorCode = errorCode;
 		this.reason = reason;
 		this.retryable = retryable;
+		this.connectionScoped = connectionScoped;
+	}
+
+	/**
+	 * Whether this violation aborts the connection despite having been observed on one request stream,
+	 * in a case the code alone does not reveal. {@code false} for every exception whose scope is
+	 * derivable from {@link #errorCode()} — see {@link #connectionScoped}.
+	 */
+	public boolean isConnectionScoped() {
+		return connectionScoped;
 	}
 
 	/** An RFC 9114 §8.1 or RFC 9204 §6 application error code — an {@link Http3Errors} constant. */

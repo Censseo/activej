@@ -59,7 +59,10 @@ public final class QpackStaticDecoder implements QpackDecoder {
 		try {
 			long requiredInsertCount = QpackIntegers.readInteger(encodedFieldSection, 8);
 			if (requiredInsertCount != 0) {
-				throw new QpackException(Http3Errors.QPACK_DECOMPRESSION_FAILED,
+				// RFC 9204 §4.5.1: a Required Insert Count larger than expected MAY be a connection error.
+				// With no dynamic table the expected value is 0, so any non-zero count means the peer
+				// believes we share a table — a disagreement about the connection, not this exchange.
+				throw QpackException.connectionError(Http3Errors.QPACK_DECOMPRESSION_FAILED,
 					"non-zero Required Insert Count: this implementation never builds a dynamic table");
 			}
 			// S + Delta Base. Never used: Base only matters for Post-Base representations, which are
@@ -86,7 +89,8 @@ public final class QpackStaticDecoder implements QpackDecoder {
 		if ((first & 0x80) != 0) {
 			// Indexed Field Line: "1 T index(6+)".
 			if ((first & 0x40) == 0) {
-				throw new QpackException(Http3Errors.QPACK_DECOMPRESSION_FAILED,
+				// RFC 9204 §2.2.3: a reference to an unavailable dynamic-table entry MUST be a connection error.
+				throw QpackException.connectionError(Http3Errors.QPACK_DECOMPRESSION_FAILED,
 					"Indexed Field Line referenced the dynamic table");
 			}
 			long index = QpackIntegers.readInteger(buf, 6);
@@ -96,7 +100,8 @@ public final class QpackStaticDecoder implements QpackDecoder {
 			// Literal Field Line with Name Reference: "0 1 N T index(4+)".
 			boolean isStatic = (first & 0x10) != 0;
 			if (!isStatic) {
-				throw new QpackException(Http3Errors.QPACK_DECOMPRESSION_FAILED,
+				// RFC 9204 §2.2.3, as above.
+				throw QpackException.connectionError(Http3Errors.QPACK_DECOMPRESSION_FAILED,
 					"Literal Field Line with Name Reference referenced the dynamic table");
 			}
 			long nameIndex = QpackIntegers.readInteger(buf, 4);
@@ -108,17 +113,20 @@ public final class QpackStaticDecoder implements QpackDecoder {
 		}
 		if ((first & 0x10) != 0) {
 			// Indexed Field Line with Post-Base Index: "0 0 0 1 index(4+)".
-			throw new QpackException(Http3Errors.QPACK_DECOMPRESSION_FAILED,
+			// RFC 9204 §2.2.3, as above.
+			throw QpackException.connectionError(Http3Errors.QPACK_DECOMPRESSION_FAILED,
 				"Indexed Field Line with Post-Base Index is not supported: no dynamic table");
 		}
 		// Literal Field Line with Post-Base Name Reference: "0 0 0 0 N index(3+)".
-		throw new QpackException(Http3Errors.QPACK_DECOMPRESSION_FAILED,
+		// RFC 9204 §2.2.3, as above.
+		throw QpackException.connectionError(Http3Errors.QPACK_DECOMPRESSION_FAILED,
 			"Literal Field Line with Post-Base Name Reference is not supported: no dynamic table");
 	}
 
 	private static QpackField indexedField(long index, SizeAccountant accountant) throws QpackException {
 		if (index < 0 || index >= QpackStaticTable.SIZE) {
-			throw new QpackException(Http3Errors.QPACK_DECOMPRESSION_FAILED,
+			// RFC 9204 §3.1: an invalid static table index MUST be a connection error.
+			throw QpackException.connectionError(Http3Errors.QPACK_DECOMPRESSION_FAILED,
 				"static table index out of range: " + index);
 		}
 		HttpHeader name = QpackStaticTable.name((int) index);
@@ -130,7 +138,8 @@ public final class QpackStaticDecoder implements QpackDecoder {
 	private static QpackField literalWithNameReference(long nameIndex, ByteBuf buf, SizeAccountant accountant)
 		throws QpackException {
 		if (nameIndex < 0 || nameIndex >= QpackStaticTable.SIZE) {
-			throw new QpackException(Http3Errors.QPACK_DECOMPRESSION_FAILED,
+			// RFC 9204 §3.1, as above.
+			throw QpackException.connectionError(Http3Errors.QPACK_DECOMPRESSION_FAILED,
 				"static table name index out of range: " + nameIndex);
 		}
 		HttpHeader name = QpackStaticTable.name((int) nameIndex);
