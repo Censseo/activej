@@ -349,22 +349,33 @@ public class TlsAlertTest {
 		assertEquals(TlsAlerts.DECODE_ERROR, e.alertCode());
 	}
 
+	/**
+	 * RFC 8446 §4.6.1 declares {@code opaque ticket_nonce<0..255>} — an <b>empty</b> nonce is legal,
+	 * unlike the {@code ticket<1..2^16-1>} beside it (see {@link #zeroLengthTicketAbortsWithDecodeError}).
+	 * <p>
+	 * This test used to assert the opposite, and that mistake was a real interop failure rather than a
+	 * theoretical one: quic-go sends an empty nonce, and because {@code NewSessionTicket} arrives
+	 * <b>post-handshake</b>, rejecting it raised {@code CRYPTO_ERROR(50)} and tore down a fully
+	 * established connection moments after it started serving traffic. It presented as an HTTP/3 bug
+	 * and was not one. Nothing ActiveJ↔ActiveJ could catch it — the peer has to be someone else's.
+	 */
 	@Test
-	public void zeroLengthTicketNonceAbortsWithDecodeError() throws Exception {
+	public void zeroLengthTicketNonceIsAccepted() throws Exception {
 		ScriptedTlsServer server = new ScriptedTlsServer(rsaIdentity());
 		TlsEngine client = newTrustAllClient();
 		completeHandshake(client, server);
-		// RFC 8446 §4.6.1: ticket_nonce is 1..255 bytes
-		byte[] malformed = {
+		byte[] emptyNonce = {
 			(byte) NewSessionTicketMessage.TYPE, 0, 0, 14,
 			0, 0, 0, 0, // ticket_lifetime
 			0, 0, 0, 0, // ticket_age_add
-			0,          // ticket_nonce length = 0
+			0,          // ticket_nonce length = 0 — legal
 			0, 1, 9,    // ticket length 1 + ticket byte
 			0, 0};      // extensions length
-		TlsAlertException e = expectAlert(() ->
-			client.consume(EncryptionLevel.ONE_RTT, wrap(malformed)));
-		assertEquals(TlsAlerts.DECODE_ERROR, e.alertCode());
+		// Tolerated and discarded exactly like any other ticket (FR-015): no alert, engine alive.
+		TlsEngineResult result = client.consume(EncryptionLevel.ONE_RTT, wrap(emptyNonce));
+		assertFalse(result.handshakeComplete());
+		assertTrue(result.cryptoToSend().isEmpty());
+		assertTrue(result.keysToInstall().isEmpty());
 	}
 
 	@Test

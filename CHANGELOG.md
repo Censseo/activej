@@ -105,6 +105,18 @@ explicitly.
 
 - Fixed an authentication bypass in `BasicAuthServlet` when a username was
   absent from the credentials store, while preserving constant-time comparison.
+- **QUIC/TLS: a legal empty `ticket_nonce` no longer kills an established
+  connection.** RFC 8446 §4.6.1 declares `opaque ticket_nonce<0..255>`, so an
+  **empty** nonce is valid; `TlsMessages` enforced a minimum of 1 byte, having
+  copied the lower bound from the `ticket<1..2^16-1>` field beside it, where it
+  is correct. Because `NewSessionTicket` arrives **after** the handshake is
+  confirmed, the rejection raised `CRYPTO_ERROR(50)` and tore down a fully
+  established connection moments after it began carrying traffic. Any peer that
+  sends an empty nonce was affected — quic-go does, which made `Http3Client`
+  (and any other `core-quic` client) unusable against quic-go and Caddy, while
+  the handshake itself looked healthy. Interop with quiche (curl, Cloudflare)
+  and Chrome was unaffected and hid the bug. The `ticket` field's minimum of 1
+  is unchanged, and the nonce is still capped at 255.
 - Hardened the binary serializer against malformed input: truncated streams,
   negative lengths, oversized allocations and out-of-range enum/subclass
   ordinals now raise `CorruptedDataException` instead of corrupting memory or

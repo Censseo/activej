@@ -239,6 +239,41 @@ public class TlsMessagesTest {
 		assertRoundTrip(message);
 	}
 
+	/**
+	 * RFC 8446 §4.6.1 declares {@code opaque ticket_nonce<0..255>}: an <b>empty</b> nonce is legal, in
+	 * contrast to the {@code ticket<1..2^16-1>} beside it, whose lower bound really is 1.
+	 * <p>
+	 * This is a regression test for a real interop failure, not a hypothetical. quic-go (and therefore
+	 * Caddy) sends a NewSessionTicket with an empty nonce; rejecting it raised
+	 * {@code CRYPTO_ERROR(50)} and tore down a <b>fully established</b> connection right after the
+	 * handshake was confirmed, which made {@code Http3Client} unusable against that peer while leaving
+	 * the handshake itself looking healthy.
+	 */
+	@Test
+	public void acceptsEmptyTicketNonce() throws Exception {
+		NewSessionTicketMessage message = new NewSessionTicketMessage(
+			7200, random.nextLong() & 0xFFFFFFFFL,
+			new byte[0],
+			randomBytes(1 + random.nextInt(300)),
+			List.of());
+		assertEquals(0, message.ticketNonce.length);
+		assertRoundTrip(message);
+	}
+
+	/** The {@code ticket} lower bound of 1 is real (RFC 8446 §4.6.1) and must stay enforced. */
+	@Test
+	public void rejectsEmptyTicket() {
+		assertThrows(IllegalArgumentException.class, () -> new NewSessionTicketMessage(
+			7200, 0, randomBytes(4), new byte[0], List.of()));
+	}
+
+	/** {@code ticket_nonce} is still capped at 255 — the upper bound did not change. */
+	@Test
+	public void rejectsOversizedTicketNonce() {
+		assertThrows(IllegalArgumentException.class, () -> new NewSessionTicketMessage(
+			7200, 0, randomBytes(256), randomBytes(4), List.of()));
+	}
+
 	// ---- (c) unknown message type ----
 
 	@Test
