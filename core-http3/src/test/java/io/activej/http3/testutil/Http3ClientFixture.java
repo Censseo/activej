@@ -16,6 +16,7 @@
 
 package io.activej.http3.testutil;
 
+import io.activej.common.initializer.Initializer;
 import io.activej.http.AsyncServlet;
 import io.activej.http.HttpResponse;
 import io.activej.http3.Http3Client;
@@ -25,6 +26,7 @@ import io.activej.http3.Http3Settings;
 import io.activej.promise.Promise;
 import io.activej.quic.connection.QuicConnection.TlsEngineFactory;
 import io.activej.quic.tls.QuicSessionCache;
+import io.activej.quic.tls.TlsClientConfig;
 import io.activej.reactor.Reactor;
 import io.activej.reactor.nio.NioReactor;
 import org.jetbrains.annotations.Nullable;
@@ -74,6 +76,9 @@ public final class Http3ClientFixture implements AutoCloseable {
 	 */
 	private @Nullable Function<String, TlsEngineFactory> tlsEngineFactory;
 
+	/** Applied after the dev trust manager, so a test may name a {@link TlsClientConfig} setting of its own. */
+	private @Nullable Initializer<TlsClientConfig.Builder> tlsClientConfig;
+
 	private @Nullable QuicSessionCache sessionCache;
 	private Http3Server.@Nullable Inspector serverInspector;
 	private Http3Client.@Nullable Inspector clientInspector;
@@ -121,6 +126,16 @@ public final class Http3ClientFixture implements AutoCloseable {
 	 */
 	public Http3ClientFixture withTlsEngineFactory(Function<String, TlsEngineFactory> tlsEngineFactory) {
 		this.tlsEngineFactory = tlsEngineFactory;
+		return this;
+	}
+
+	/**
+	 * Adds a {@link TlsClientConfig} initializer of the test's own, applied after the dev trust manager and
+	 * therefore <b>after</b> whatever {@link io.activej.http3.Http3Client} itself put on that builder — which
+	 * is what makes it the seam for asserting that a consumer's explicit bound still wins.
+	 */
+	public Http3ClientFixture withTlsClientConfig(Initializer<TlsClientConfig.Builder> tlsClientConfig) {
+		this.tlsClientConfig = tlsClientConfig;
 		return this;
 	}
 
@@ -178,7 +193,10 @@ public final class Http3ClientFixture implements AutoCloseable {
 					clientBuilder.withTlsEngineFactory(tlsEngineFactory);
 				} else {
 					X509TrustManager devLeaf = Http3TestTls.trustingLeaf(Http3TestTls.devIdentity().leaf());
-					clientBuilder.withTlsClientConfig(config -> config.withTrustManager(devLeaf));
+					clientBuilder.withTlsClientConfig(config -> {
+						config.withTrustManager(devLeaf);
+						if (tlsClientConfig != null) tlsClientConfig.initialize(config);
+					});
 				}
 				if (sessionCache != null) clientBuilder.withSessionCache(sessionCache);
 				if (clientInspector != null) clientBuilder.withInspector(clientInspector);

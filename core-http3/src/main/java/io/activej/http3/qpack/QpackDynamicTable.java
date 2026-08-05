@@ -266,6 +266,22 @@ public final class QpackDynamicTable {
 		return insert(name, value, nameHadUppercase);
 	}
 
+	/**
+	 * Whether appending a copy of the entry at {@code absoluteIndex} would evict the original — the case
+	 * RFC 9204 §4.3.4 exists for: the entry sits close enough to the FIFO tail that making room for its
+	 * own copy pushes it out.
+	 * <p>
+	 * {@code false} for an index that is not {@link #isAvailable available}, for a table under no
+	 * eviction pressure, and when the eviction could not be made at all because a referenced entry is in
+	 * the way — so an encoder may read it as "the entry is about to age out, and duplicating it will
+	 * work".
+	 */
+	public boolean duplicateWouldEvict(long absoluteIndex) {
+		if (!isAvailable(absoluteIndex)) return false;
+		int evictions = evictionPlan(entryAt(absoluteIndex).size);
+		return evictions > 0 && droppedCount() + evictions > absoluteIndex;
+	}
+
 	/** RFC 9204 §3.2.4: {@code droppedCount() <= absoluteIndex < insertCount()}. */
 	public boolean isAvailable(long absoluteIndex) {
 		return absoluteIndex >= droppedCount() && absoluteIndex < insertCount;

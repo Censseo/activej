@@ -24,8 +24,10 @@ import io.activej.quic.connection.CoalescedPackets.Kind;
 import io.activej.quic.connection.CoalescedPackets.ProtectedPacket;
 import io.activej.quic.connection.QuicConnectionSettings;
 import io.activej.quic.tls.InMemoryQuicSessionCache;
+import io.activej.quic.tls.QuicReplayGuard;
 import io.activej.quic.tls.QuicSessionTicket;
 import io.activej.quic.tls.QuicTicketKeys;
+import io.activej.quic.tls.TlsServerConfig;
 
 import java.security.SecureRandom;
 import java.time.Duration;
@@ -53,12 +55,34 @@ public final class ZeroRttWire {
 
 	public static final int SERVER_PORT = QuicWirePair.SERVER_ADDRESS.getPort();
 
+	/** Enough replay records for any scenario here, which offers one ticket per connection. */
+	public static final int REPLAY_RECORDS = 16;
+
 	private ZeroRttWire() {}
 
 	/** A key ring seeded so a ticket sealed by one connection can be opened by the next. */
 	public static QuicTicketKeys ticketKeys() {
 		return QuicTicketKeys.create(new SecureRandom(), Duration.ofHours(6).toMillis(),
 			Duration.ofHours(1).toMillis(), System.currentTimeMillis());
+	}
+
+	/**
+	 * A server that seals tickets under {@code keys} and accepts early data — including the replay
+	 * register {@code TlsServerConfig.build()} requires alongside it, which is the whole configuration a
+	 * 0-RTT server needs rather than the two thirds of it that used to compile.
+	 * <p>
+	 * A fresh register per pair, because each of these scenarios offers its ticket once.
+	 */
+	public static void acceptingEarlyData(TlsServerConfig.Builder builder, QuicTicketKeys keys) {
+		acceptingEarlyData(builder, keys, true);
+	}
+
+	/** The same with early data conditional: the register goes with it, and only with it. */
+	public static void acceptingEarlyData(TlsServerConfig.Builder builder, QuicTicketKeys keys,
+		boolean earlyDataEnabled
+	) {
+		builder.withTicketKeys(keys).withEarlyDataEnabled(earlyDataEnabled);
+		if (earlyDataEnabled) builder.withReplayGuard(QuicReplayGuard.create(REPLAY_RECORDS));
 	}
 
 	/**
@@ -71,7 +95,7 @@ public final class ZeroRttWire {
 		throws MalformedDataException {
 		InMemoryQuicSessionCache cache = InMemoryQuicSessionCache.create(8, System::currentTimeMillis);
 		try (QuicWirePair pair = new QuicWirePair()) {
-			pair.withServerTlsConfig(builder -> builder.withTicketKeys(keys).withEarlyDataEnabled(true))
+			pair.withServerTlsConfig(builder -> acceptingEarlyData(builder, keys))
 				.withClientTlsConfig(builder -> builder.withSessionCache(cache, SERVER_PORT));
 			pair.handshake(settings);
 		}

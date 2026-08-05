@@ -254,18 +254,19 @@ public final class TlsServerEarlyDataReplayTest {
 	// ---------------------------------------------------------------- the no-register configuration
 
 	/**
-	 * A configuration without a register is legal and keeps the phase-5 behaviour: <b>no replay
-	 * protection at all</b>. Asserted rather than left implicit, because it is the difference between
-	 * a documented contract and a silent hole — and it is why {@code Http3Server} always supplies one.
+	 * T157: a configuration without a register used to be legal and to keep the phase-5 behaviour —
+	 * <b>no replay protection at all</b>, every presentation granted. It is now refused at
+	 * {@code build()}, so the only way to reach this method's subject is with a register in hand.
+	 * {@code Http3Server} was never able to produce the old configuration; a direct {@code core-quic}
+	 * consumer was.
 	 */
 	@Test
-	public void withoutARegisterEveryPresentationIsGranted() throws Exception {
+	public void withoutARegisterTheConfigurationIsRefused() throws Exception {
 		QuicTicketKeys keys = newKeys();
-		QuicSessionTicket ticket = issueTicket(keys);
 
-		assertNull(TlsServerConfig.builder(rsaIdentity(), SERVER_PARAMS).build().replayGuard());
-		assertTrue(resumeWithEarlyData(keys, null, ticket).earlyDataAccepted());
-		assertTrue(resumeWithEarlyData(keys, null, ticket).earlyDataAccepted());
+		assertNull("a config that admits no early data still needs no register",
+			TlsServerConfig.builder(rsaIdentity(), SERVER_PARAMS).build().replayGuard());
+		assertThrows(IllegalStateException.class, () -> server(keys, null, true, () -> T0));
 	}
 
 	// ---------------------------------------------------------------- SI-6
@@ -427,10 +428,14 @@ public final class TlsServerEarlyDataReplayTest {
 		return issueTickets(keys).get(0);
 	}
 
-	/** A full handshake against a ticket-issuing server, opening every ticket it sealed. */
+	/**
+	 * A full handshake against a ticket-issuing server, opening every ticket it sealed. Nothing resumes
+	 * here, so this server's own register is never consulted — it is present because a server that
+	 * accepts early data may not be built without one.
+	 */
 	private static List<QuicSessionTicket> issueTickets(QuicTicketKeys keys) throws Exception {
 		TlsServerIdentity identity = rsaIdentity();
-		TlsEngine engine = server(keys, null, true, () -> T0);
+		TlsEngine engine = server(keys, QuicReplayGuard.create(16), true, () -> T0);
 		ScriptedResumptionClient client = new ScriptedResumptionClient();
 
 		TlsEngineResult serverFlight = engine.consume(

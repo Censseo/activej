@@ -165,7 +165,7 @@ public final class ZeroRttResumptionWithoutEarlyDataTest {
 		assertNotNull(ticket);
 
 		wire = new QuicWirePair();
-		wire.withServerTlsConfig(builder -> builder.withTicketKeys(keys).withEarlyDataEnabled(true));
+		wire.withServerTlsConfig(builder -> ZeroRttWire.acceptingEarlyData(builder, keys));
 		wire.handshake(settings);
 		assertFalse("a handshake that offered no ticket reported a resumption", wire.client().isSessionResumed());
 		assertFalse(wire.client().isEarlyDataAccepted());
@@ -244,9 +244,7 @@ public final class ZeroRttResumptionWithoutEarlyDataTest {
 
 	private QuicWirePair resuming(QuicTicketKeys keys, QuicSessionTicket ticket, boolean serverAcceptsEarlyData) {
 		QuicWirePair pair = new QuicWirePair();
-		pair.withServerTlsConfig(builder -> builder
-				.withTicketKeys(keys)
-				.withEarlyDataEnabled(serverAcceptsEarlyData))
+		pair.withServerTlsConfig(builder -> ZeroRttWire.acceptingEarlyData(builder, keys, serverAcceptsEarlyData))
 			.withClientTlsConfig(builder -> builder.withSessionTicket(ticket).withEarlyDataEnabled(true))
 			.withClientRememberedTransportParameters(ticket.transportParameters());
 		return pair;

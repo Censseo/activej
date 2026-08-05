@@ -57,6 +57,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.channels.DatagramChannel;
 import java.security.SecureRandom;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
@@ -505,6 +506,15 @@ public final class Http3Server extends AbstractNioReactive implements AutoClosea
 	 */
 	private int ticketsPerHandshake;
 
+	/**
+	 * The obfuscated-ticket-age tolerance {@code TlsServerEngine} judges a resumption attempt against,
+	 * read back off the same {@link TlsServerConfig} for the same reason — but with no counter of its
+	 * own, since a tolerance is never a total. It exists so that the value which actually reached the
+	 * TLS layer is observable rather than inferred from a default it happens to coincide with. 0 until
+	 * a handshake has been configured.
+	 */
+	private long ticketAgeToleranceMillis;
+
 	private Http3Server(NioReactor reactor, AsyncServlet servlet) {
 		super(reactor);
 		this.servlet = servlet;
@@ -761,10 +771,13 @@ public final class Http3Server extends AbstractNioReactive implements AutoClosea
 	 * no ticket keys means no {@code NewSessionTicket} is ever issued, so nothing about a handshake
 	 * changes (SC-011).
 	 * <p>
-	 * The ticket lifetime, the tickets-per-handshake count and the age tolerance are deliberately left
-	 * unset: {@link TlsServerConfig}'s defaults already mirror the {@link QuicConnectionSettings} ones,
-	 * and with keys present the lifetime follows {@link QuicTicketKeys#ticketLifetimeMillis()} — one
-	 * source of truth rather than two that can drift.
+	 * The tickets-per-handshake count and the obfuscated-age tolerance are passed through from
+	 * {@link QuicConnectionSettings} (FR-045, FR-088b), which is what makes
+	 * {@code -DQuicConnection.sessionTicketsPerHandshake} and {@code -DQuicConnection.ticketAgeTolerance}
+	 * reach the TLS layer at all: {@link TlsServerConfig}'s own defaults are numerically the same, so
+	 * leaving them unset looked correct and silently discarded every configured value. The ticket
+	 * <i>lifetime</i> is the one that stays unset, because with keys present it follows
+	 * {@link QuicTicketKeys#ticketLifetimeMillis()} — one source of truth rather than two that can drift.
 	 * <p>
 	 * The replay register (spec FR-069, RFC 8446 §8) is built <b>here rather than inside the returned
 	 * factory</b>, so every connection this server accepts shares one: a replayed early-data flight
@@ -780,16 +793,20 @@ public final class Http3Server extends AbstractNioReactive implements AutoClosea
 			return params -> QuicTls.serverEngine(TlsServerConfig.builder(identity, params).build());
 		}
 		QuicTicketKeys keys = ticketKeys;
-		QuicReplayGuard guard = QuicReplayGuard.create(quicSettings().maxEarlyDataReplayRecords());
+		QuicConnectionSettings quic = quicSettings();
+		QuicReplayGuard guard = QuicReplayGuard.create(quic.maxEarlyDataReplayRecords());
 		replayGuard = guard;
 		return params -> {
 			TlsServerConfig config = TlsServerConfig.builder(identity, params)
 				.withCurrentTimeMillis(reactor::currentTimeMillis)
 				.withTicketKeys(keys)
+				.withSessionTicketsPerHandshake(quic.sessionTicketsPerHandshake())
+				.withTicketAgeTolerance(Duration.ofMillis(quic.ticketAgeToleranceMillis()))
 				.withEarlyDataEnabled(true)
 				.withReplayGuard(guard)
 				.build();
 			ticketsPerHandshake = config.sessionTicketsPerHandshake();
+			ticketAgeToleranceMillis = config.ticketAgeToleranceMillis();
 			return QuicTls.serverEngine(config);
 		};
 	}
@@ -1073,6 +1090,22 @@ public final class Http3Server extends AbstractNioReactive implements AutoClosea
 	public long sessionTicketsIssued() {
 		checkInReactorThread(this);
 		return sessionTicketsIssued;
+	}
+
+	/**
+	 * What {@link #serverEngineFactory()} actually handed the TLS layer for the two
+	 * {@link QuicConnectionSettings} resumption bounds that reach it through no other observable —
+	 * package-private, because it answers "did the configured value arrive?" and nothing a consumer
+	 * would act on. Both 0 until the first engine is built.
+	 */
+	int ticketsPerHandshake() {
+		checkInReactorThread(this);
+		return ticketsPerHandshake;
+	}
+
+	long ticketAgeToleranceMillis() {
+		checkInReactorThread(this);
+		return ticketAgeToleranceMillis;
 	}
 
 	/** Handshakes that resumed a session from one of those tickets rather than exchanging a certificate. */

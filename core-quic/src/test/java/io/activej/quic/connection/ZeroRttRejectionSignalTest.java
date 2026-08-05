@@ -185,7 +185,7 @@ public final class ZeroRttRejectionSignalTest {
 		assertNotNull("the first handshake issued no ticket, so nothing here resumes", ticket);
 
 		wire = new QuicWirePair()
-			.withServerTlsConfig(builder -> builder.withTicketKeys(keys).withEarlyDataEnabled(serverAccepts))
+			.withServerTlsConfig(builder -> ZeroRttWire.acceptingEarlyData(builder, keys, serverAccepts))
 			.withClientTlsConfig(builder -> builder.withSessionTicket(ticket).withEarlyDataEnabled(clientOffers))
 			.withClientRememberedTransportParameters(ticket.transportParameters())
 			.withClientFrameHandler(clientHandler)

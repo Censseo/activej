@@ -32,6 +32,7 @@ import io.activej.quic.connection.QuicEndpoint;
 import io.activej.quic.connection.QuicFrameHandler;
 import io.activej.quic.stream.QuicStreamException;
 import io.activej.quic.tls.EncryptionLevel;
+import io.activej.quic.tls.QuicReplayGuard;
 import io.activej.quic.tls.QuicTicketKeys;
 import io.activej.quic.tls.QuicTls;
 import io.activej.quic.tls.TlsServerConfig;
@@ -148,14 +149,17 @@ public final class Http3TestServer implements AutoCloseable {
 		QuicConnectionSettings quic = quicSettings();
 		QuicTicketKeys ticketKeys = QuicTicketKeys.create(new SecureRandom(), quic.sessionTicketKeyRotationMillis(),
 			quic.sessionTicketLifetimeMillis(), reactor.currentTimeMillis());
+		QuicReplayGuard replayGuard = QuicReplayGuard.create(quic.maxEarlyDataReplayRecords());
 		endpoint = QuicEndpoint.builder(reactor, socket)
 			.withSettings(quic)
-			.withServerEngineFactory(params -> QuicTls.serverEngine(
-				TlsServerConfig.builder(Http3TestTls.devIdentity(), params)
+			.withServerEngineFactory(params -> {
+				TlsServerConfig.Builder builder = TlsServerConfig.builder(Http3TestTls.devIdentity(), params)
 					.withCurrentTimeMillis(reactor::currentTimeMillis)
 					.withTicketKeys(ticketKeys)
-					.withEarlyDataEnabled(earlyDataEnabled)
-					.build()))
+					.withEarlyDataEnabled(earlyDataEnabled);
+				if (earlyDataEnabled) builder.withReplayGuard(replayGuard);
+				return QuicTls.serverEngine(builder.build());
+			})
 			.withFrameHandlerFactory(this::onConnection)
 			.build();
 		endpoint.listen();

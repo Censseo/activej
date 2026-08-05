@@ -171,6 +171,24 @@ public class TlsServerResumptionTest {
 		assertResumedHandshake(resume(keys, () -> T0 + 1_000, ticket, 1_000 + TOLERANCE_MILLIS - 1), 0);
 	}
 
+	/**
+	 * T155: the tolerance is not decoration — a widened one accepts exactly what the 10 s default
+	 * refuses, on the same ticket, the same clock and the same reported age. This is what makes
+	 * {@code -DQuicConnection.ticketAgeTolerance} worth wiring through, and what a test pinned to the
+	 * default value could never show.
+	 */
+	@Test
+	public void aWidenedAgeToleranceAcceptsAnAgeTheDefaultRefuses() throws Exception {
+		QuicTicketKeys keys = newKeys();
+		QuicSessionTicket ticket = issueTicket(keys);
+		// the ticket is one second old and the client claims 21 s: 20 s of skew, outside 10 s, inside 30 s
+		long reportedAge = 21_000;
+		long now = T0 + 1_000;
+
+		assertFullHandshake(resume(keys, () -> now, ticket, reportedAge, TOLERANCE_MILLIS));
+		assertResumedHandshake(resume(keys, () -> now, ticket, reportedAge, 30_000L), 0);
+	}
+
 	@Test
 	public void ticketForADifferentServerNameFallsBack() throws Exception {
 		QuicTicketKeys keys = newKeys();
@@ -361,10 +379,15 @@ public class TlsServerResumptionTest {
 	}
 
 	private static TlsEngine resumingServer(QuicTicketKeys keys, LongSupplier clock) throws Exception {
+		return resumingServer(keys, clock, TOLERANCE_MILLIS);
+	}
+
+	private static TlsEngine resumingServer(QuicTicketKeys keys, LongSupplier clock, long toleranceMillis)
+		throws Exception {
 		return QuicTls.serverEngine(TlsServerConfig.builder(rsaIdentity(), SERVER_PARAMS)
 			.withTicketKeys(keys)
 			.withSessionTicketsPerHandshake(2)
-			.withTicketAgeTolerance(Duration.ofMillis(TOLERANCE_MILLIS))
+			.withTicketAgeTolerance(Duration.ofMillis(toleranceMillis))
 			.withCurrentTimeMillis(clock)
 			.build());
 	}
@@ -413,7 +436,12 @@ public class TlsServerResumptionTest {
 
 	private static Flight resume(QuicTicketKeys keys, LongSupplier clock, QuicSessionTicket ticket,
 			long reportedAgeMillis) throws Exception {
-		TlsEngine engine = resumingServer(keys, clock);
+		return resume(keys, clock, ticket, reportedAgeMillis, TOLERANCE_MILLIS);
+	}
+
+	private static Flight resume(QuicTicketKeys keys, LongSupplier clock, QuicSessionTicket ticket,
+			long reportedAgeMillis, long toleranceMillis) throws Exception {
+		TlsEngine engine = resumingServer(keys, clock, toleranceMillis);
 		ScriptedResumptionClient client = new ScriptedResumptionClient();
 		return consumeFlight(engine, client.resumingClientHello(
 			client.defaultExtensions(), ticket, reportedAgeMillis, TRUNCATED, 0, false));

@@ -181,8 +181,8 @@ public final class TlsServerConfig {
 	 * the part that carries a replay exposure, so it is a separate, explicit opt-in.
 	 * <p>
 	 * <b>Off is the safe value and the default for a reason.</b> Turning it on without a
-	 * {@link #replayGuard()} means accepting a replayed early-data flight as readily as a fresh one
-	 * (spec FR-069+, RFC 8446 §8).
+	 * {@link #replayGuard()} would accept a replayed early-data flight as readily as a fresh one
+	 * (spec FR-069+, RFC 8446 §8), so {@code build()} refuses that pair outright.
 	 */
 	public boolean earlyDataEnabled() {
 		return earlyDataEnabled;
@@ -190,7 +190,8 @@ public final class TlsServerConfig {
 
 	/**
 	 * The single-use register early data is checked against before it is accepted (spec FR-069,
-	 * RFC 8446 §8), or {@code null} for <b>no replay protection at all</b>.
+	 * RFC 8446 §8), or {@code null} when {@link #earlyDataEnabled()} is off and there is no early data
+	 * to check — the two are refused together at {@code build()}.
 	 * <p>
 	 * One register serves a whole server and is shared by every connection's configuration: a replayed
 	 * flight arrives on a new connection by construction, so a per-connection register would catch
@@ -199,8 +200,9 @@ public final class TlsServerConfig {
 	 * a replay across processes or nodes is.
 	 * <p>
 	 * {@code null} is legal and is what a configuration that never enables {@link #earlyDataEnabled()}
-	 * wants; it costs nothing there, because early data is what a replay buys. With early data on it is
-	 * a deliberate choice to accept duplicate execution of whatever rode the replayed flight.
+	 * wants; it costs nothing there, because early data is what a replay buys. With early data on there
+	 * is no such choice to make — {@code build()} throws rather than let a consumer reach a
+	 * replay-vulnerable 0-RTT server with no signal.
 	 */
 	public @Nullable QuicReplayGuard replayGuard() {
 		return replayGuard;
@@ -282,7 +284,8 @@ public final class TlsServerConfig {
 
 		/**
 		 * Accepts early data on a resumed handshake (spec FR-048). Default {@code false}, which resumes
-		 * in 1-RTT and leaves the wire byte-identical to phase 1.
+		 * in 1-RTT and leaves the wire byte-identical to phase 1. Turning it on requires
+		 * {@link #withReplayGuard}; {@code build()} refuses the pair otherwise.
 		 */
 		public Builder withEarlyDataEnabled(boolean earlyDataEnabled) {
 			checkNotBuilt(this);
@@ -291,8 +294,8 @@ public final class TlsServerConfig {
 		}
 
 		/**
-		 * The single-use register early data is checked against (spec FR-069). Absent, a replayed
-		 * early-data flight is accepted as readily as a fresh one — see {@link #replayGuard()}.
+		 * The single-use register early data is checked against (spec FR-069). Mandatory once
+		 * {@link #withEarlyDataEnabled} is on — see {@link #replayGuard()}.
 		 * <p>
 		 * The same instance goes to every connection of one server; building one per connection
 		 * compiles, runs, and defends nothing.
@@ -336,6 +339,14 @@ public final class TlsServerConfig {
 				throw new IllegalStateException(
 					"sessionTicketLifetime of " + sessionTicketLifetimeMillis + " ms exceeds the " +
 					ticketKeys.ticketLifetimeMillis() + " ms the configured ticketKeys can still open");
+			}
+			if (earlyDataEnabled && replayGuard == null) {
+				// Unguarded 0-RTT accepts a replayed early-data flight as readily as a fresh one
+				// (RFC 8446 §8), and nothing downstream can tell the two apart — so the combination is
+				// refused here rather than at the first replay.
+				throw new IllegalStateException(
+					"earlyDataEnabled without a replayGuard is 0-RTT with no replay protection at all" +
+					" (RFC 8446 §8) — set withReplayGuard(...), or leave early data off");
 			}
 			return TlsServerConfig.this;
 		}

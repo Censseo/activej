@@ -494,8 +494,8 @@ public final class TlsServerEngine implements TlsEngine {
 	 * <p>
 	 * The register is judged at the same instant the rest of the resumption decision was, which is why
 	 * {@code nowMillis} is threaded down from {@link #processClientHello} rather than read again here.
-	 * With no register configured there is no replay protection at all — see
-	 * {@link TlsServerConfig#replayGuard()}.
+	 * A null register is unreachable with early data on — {@link TlsServerConfig.Builder#build()}
+	 * refuses that pair — and the check remains so that this method is total on its own field.
 	 */
 	private void acceptEarlyData(@Nullable AcceptedPsk accepted, byte[] clientHelloBytes,
 			TlsCipherSuite selectedSuite, List<KeyInstallation> installations, long nowMillis) {

@@ -22,6 +22,7 @@ import io.activej.http.HttpHeader;
 import io.activej.http.HttpHeaders;
 import io.activej.http3.Http3Errors;
 import io.activej.http3.qpack.QpackInstructions.DecoderInstruction;
+import io.activej.http3.qpack.QpackInstructions.Duplicate;
 import io.activej.http3.qpack.QpackInstructions.EncoderInstruction;
 import io.activej.http3.qpack.QpackInstructions.InsertCountIncrement;
 import io.activej.http3.qpack.QpackInstructions.InsertWithLiteralName;
@@ -238,6 +239,9 @@ public final class QpackDynamicEncoder implements QpackEncoder {
 	 * reference with a literal value, full literal. A never-indexed field (RFC 9204 §7.1) skips the
 	 * first three outright and never takes a <i>dynamic</i> name reference either, so it can contribute
 	 * nothing to a Required Insert Count and can never block a stream.
+	 * <p>
+	 * The dynamic-index step may first duplicate the entry it is about to reference
+	 * ({@link #duplicateAndRecord}); that changes the index the line carries, never which step is taken.
 	 */
 	private Line plan(QpackField field, boolean mayInsert, boolean mayReference, boolean mayBlock) {
 		HttpHeader name = field.name();
@@ -262,7 +266,10 @@ public final class QpackDynamicEncoder implements QpackEncoder {
 		long knownIndex = mayInsert ? table.findNameAndValue(name, value) : QpackDynamicTable.NOT_FOUND;
 		if (knownIndex != QpackDynamicTable.NOT_FOUND) {
 			if (mayReference && isReferenceable(knownIndex, mayBlock)) {
-				return new Line(Form.INDEXED_DYNAMIC, -1, knownIndex, null, value, false);
+				long duplicatedIndex = duplicateAndRecord(knownIndex, mayBlock);
+				long referencedIndex =
+					duplicatedIndex != QpackDynamicTable.NOT_INSERTED ? duplicatedIndex : knownIndex;
+				return new Line(Form.INDEXED_DYNAMIC, -1, referencedIndex, null, value, false);
 			}
 		} else if (mayInsert && pending.size() < MAX_PENDING_INSTRUCTIONS &&
 				   table.fits(QpackDynamicTable.entrySize(name, value))
@@ -346,6 +353,37 @@ public final class QpackDynamicEncoder implements QpackEncoder {
 			pending.add(new InsertWithLiteralName(field.lowercaseNameBytes(), owned));
 		}
 		return absoluteIndex;
+	}
+
+	/**
+	 * RFC 9204 §4.3.4 {@code Duplicate}, emitted for the one case the instruction exists for: the entry
+	 * this line is about to reference sits so close to the FIFO tail that the next insertion of its own
+	 * size evicts it. A copy costs one instruction and no name or value octets, and moving the reference
+	 * onto it buys two things — the section pins the table's <b>head</b> rather than its tail, so
+	 * eviction is not frozen while the section stays unacknowledged; and a later line of this same
+	 * section cannot evict what this line references, which the repair in {@link #encode(long, List)}
+	 * would otherwise have to pay for with a whole literal.
+	 * <p>
+	 * The relative index is resolved <b>before</b> the copy goes in, for the reason
+	 * {@link #insertAndRecord} resolves its name reference before its insertion: the peer resolves it
+	 * against the Insert Count it holds when the instruction arrives.
+	 *
+	 * @return the copy's absolute index, or {@link QpackDynamicTable#NOT_INSERTED} — in which case
+	 * nothing was duplicated, nothing was accumulated, and the original is untouched and still the
+	 * entry to reference
+	 */
+	private long duplicateAndRecord(long absoluteIndex, boolean mayBlock) {
+		if (pending.size() >= MAX_PENDING_INSTRUCTIONS) return QpackDynamicTable.NOT_INSERTED;
+		if (!table.duplicateWouldEvict(absoluteIndex)) return QpackDynamicTable.NOT_INSERTED;
+		// The copy lands at the current Insert Count. A copy this section may not reference is pure cost,
+		// since the entry it copies is right there to be referenced instead.
+		if (!isReferenceable(table.insertCount(), mayBlock)) return QpackDynamicTable.NOT_INSERTED;
+
+		long relativeIndex = table.insertCount() - 1 - absoluteIndex;
+		long copyIndex = table.duplicate(absoluteIndex);
+		if (copyIndex == QpackDynamicTable.NOT_INSERTED) return QpackDynamicTable.NOT_INSERTED;
+		pending.add(new Duplicate(relativeIndex));
+		return copyIndex;
 	}
 
 	private ByteBuf write(List<Line> lines, long requiredInsertCount) {

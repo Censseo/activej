@@ -108,7 +108,7 @@ public final class ZeroRttFlowControlTest {
 			REMEMBERED_WINDOW, ticket.transportParameters().initialMaxData());
 
 		wire = new QuicWirePair();
-		wire.withServerTlsConfig(builder -> builder.withTicketKeys(keys).withEarlyDataEnabled(true))
+		wire.withServerTlsConfig(builder -> ZeroRttWire.acceptingEarlyData(builder, keys))
 			.withClientTlsConfig(builder -> builder.withSessionTicket(ticket).withEarlyDataEnabled(true))
 			.withClientRememberedTransportParameters(ticket.transportParameters())
 			.withClientFrameHandlerFactory(connection -> clientManager =

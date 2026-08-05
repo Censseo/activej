@@ -522,6 +522,13 @@ explicitly.
      towards admitting a replay — a register that treated an evicted record as
      unseen would make its own bound the attack.
 
+     Early data **without** a register is refused outright rather than run
+     unprotected: `TlsServerConfig.Builder.build()` throws an
+     `IllegalStateException` naming both settings when `earlyDataEnabled` is on
+     and no `replayGuard` is set, so a direct `core-quic` consumer cannot reach a
+     replay-vulnerable 0-RTT server by omission. `Http3Server` sets the two in one
+     breath and is unaffected.
+
      **Residual limitation, stated as one rather than dressed as a mitigation.**
      The single-use register is **process-local** — and reactor-local: one per
      `Http3Server` instance, not shared across workers, processes or nodes.

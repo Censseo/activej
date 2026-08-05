@@ -1518,11 +1518,23 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 		private final List<QuicSessionTicket> pending = new ArrayList<>();
 		private final int maxPending;
 
+		/**
+		 * FR-043a's two bounds on post-handshake {@code NewSessionTicket} input, read from the transport's
+		 * settings once per dial and handed to the {@link TlsClientConfig} that enforces them. Read here
+		 * rather than in {@link #tlsEngineFactory()} so that {@link #maxPending} and the engine's own count
+		 * bound cannot come from two lookups that disagree.
+		 */
+		private final MemSize maxSessionTicketSize;
+		private final int maxSessionTicketsPerConnection;
+
 		Resumption(String host, int port, QuicSessionCache store) {
 			this.host = host;
 			this.port = port;
 			this.store = store;
-			this.maxPending = quicSettings().maxSessionTicketsPerConnection();
+			QuicConnectionSettings quic = quicSettings();
+			this.maxSessionTicketSize = MemSize.bytes(quic.maxSessionTicketSize());
+			this.maxSessionTicketsPerConnection = quic.maxSessionTicketsPerConnection();
+			this.maxPending = maxSessionTicketsPerConnection;
 
 			QuicSessionTicket taken = store.take(host, port, ALPN_H3);
 			if (taken != null && taken.isExpiredAt(reactor.currentTimeMillis())) taken = null;
@@ -1545,10 +1557,16 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 		 * Research D-6: this is the <b>only</b> place resumption is plumbed. {@code TlsEngineFactory}'s
 		 * signature is untouched; the ticket to offer, the store to fill and the early-data switch all
 		 * travel on {@link TlsClientConfig}.
+		 * <p>
+		 * FR-043a's two bounds are applied <b>before</b> {@link Builder#withTlsClientConfig}'s initializer,
+		 * so a consumer that names either explicitly still wins; the transport's setting is the default
+		 * they replace, not a value written over theirs.
 		 */
 		TlsEngineFactory tlsEngineFactory() {
 			return params -> {
-				TlsClientConfig.Builder builder = TlsClientConfig.builder(host, params);
+				TlsClientConfig.Builder builder = TlsClientConfig.builder(host, params)
+					.withMaxSessionTicketSize(maxSessionTicketSize)
+					.withMaxSessionTicketsPerConnection(maxSessionTicketsPerConnection);
 				tlsClientConfig.initialize(builder);
 				builder.withCurrentTimeMillis(reactor::currentTimeMillis).withSessionCache(this, port);
 				if (offered != null) {

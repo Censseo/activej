@@ -186,7 +186,7 @@ public final class StreamArrivalLevelTest {
 
 	private void resume(QuicSessionTicket ticket, QuicTicketKeys keys) {
 		wire = new QuicWirePair();
-		wire.withServerTlsConfig(builder -> builder.withTicketKeys(keys).withEarlyDataEnabled(true))
+		wire.withServerTlsConfig(builder -> ZeroRttWire.acceptingEarlyData(builder, keys))
 			.withClientTlsConfig(builder -> builder.withSessionTicket(ticket).withEarlyDataEnabled(true))
 			.withClientRememberedTransportParameters(ticket.transportParameters())
 			.withClientFrameHandlerFactory(connection -> clientManager =

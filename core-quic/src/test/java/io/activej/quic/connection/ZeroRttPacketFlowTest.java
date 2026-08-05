@@ -332,7 +332,7 @@ public final class ZeroRttPacketFlowTest {
 		QuicFrameHandler serverHandler
 	) {
 		QuicWirePair pair = new QuicWirePair();
-		pair.withServerTlsConfig(builder -> builder.withTicketKeys(keys).withEarlyDataEnabled(true))
+		pair.withServerTlsConfig(builder -> ZeroRttWire.acceptingEarlyData(builder, keys))
 			.withClientTlsConfig(builder -> builder.withSessionTicket(ticket).withEarlyDataEnabled(true))
 			.withClientRememberedTransportParameters(ticket.transportParameters())
 			.withServerFrameHandler(serverHandler)
