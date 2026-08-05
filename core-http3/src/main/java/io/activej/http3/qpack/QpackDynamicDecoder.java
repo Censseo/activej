@@ -104,6 +104,11 @@ public final class QpackDynamicDecoder implements QpackDecoder {
 	 */
 	public record Blocked(long requiredInsertCount, ByteBuf section) implements SectionResult {}
 
+	/**
+	 * The {@link QpackDecoder} entry point, which cannot wait: a section that would block is a
+	 * connection error here, since this signature has nowhere to put one. A caller that can hold a
+	 * blocked section calls {@link #decodeOrBlock} instead.
+	 */
 	@Override
 	public List<QpackField> decode(ByteBuf encodedFieldSection) throws QpackException {
 		SectionResult result = decodeOrBlock(encodedFieldSection);

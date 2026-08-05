@@ -65,16 +65,27 @@ public final class Http3DatagramException extends Exception {
 
 	private final Reason reason;
 
+	/**
+	 * @param reason  why the send was refused
+	 * @param message names the size, count or setting that refused it — never a payload byte (SI-6).
+	 *                Stored and reported verbatim, never used as a format string
+	 */
 	public Http3DatagramException(Reason reason, String message) {
 		super(message);
 		this.reason = reason;
 	}
 
+	/**
+	 * As {@link #Http3DatagramException(Reason, String)}, for a refusal that originated in the
+	 * transport: {@code cause} is the {@code QuicDatagramException} that carried it, kept so the
+	 * transport-level verdict survives the HTTP-level type.
+	 */
 	public Http3DatagramException(Reason reason, String message, Throwable cause) {
 		super(message, cause);
 		this.reason = reason;
 	}
 
+	/** Why the send was refused; the remedy differs per member, so callers switch on it. */
 	public Reason reason() {
 		return reason;
 	}

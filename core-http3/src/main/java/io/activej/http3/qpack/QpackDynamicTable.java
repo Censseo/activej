@@ -73,9 +73,15 @@ public final class QpackDynamicTable {
 	private final boolean encoderRole;
 	private final int maxOutstandingSections;
 
-	private final Map<HttpHeader, Long> newestByName;
+	private final Map<NameKey, Long> newestByName;
 	private final Map<NameValue, Long> newestByNameValue;
 	private final Map<Long, Deque<Section>> outstandingByStream;
+
+	/**
+	 * Reusable scratch for {@link #hashName}. Safe as a field because this class is confined to one
+	 * reactor thread by its owning {@code Http3Connection}, and nothing here escapes a single call.
+	 */
+	private byte[] nameHashScratch = new byte[64];
 
 	private Entry[] ring = new Entry[INITIAL_RING_SIZE];
 	private int head;
@@ -125,6 +131,7 @@ public final class QpackDynamicTable {
 		return entrySize > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) entrySize;
 	}
 
+	/** {@link #entrySize(HttpHeader, byte[])} for an already-assembled field. */
 	public static int entrySize(QpackField field) {
 		return entrySize(field.name(), field.value());
 	}
@@ -144,6 +151,7 @@ public final class QpackDynamicTable {
 		return size;
 	}
 
+	/** The entries available now — {@link #insertCount()} minus {@link #droppedCount()}. */
 	public int entryCount() {
 		return count;
 	}
@@ -305,23 +313,30 @@ public final class QpackDynamicTable {
 
 	/**
 	 * The newest available entry with this exact name and value, or {@link #NOT_FOUND}.
+	 * <p>
+	 * <b>O(1) average in the table's size</b>, and required to stay so: the encoder asks this once per
+	 * field line, and a scan over a 4 KB table per field is a measurable regression against
+	 * {@link QpackStaticEncoder}'s array lookup. See {@link #hashName} for what that costs and why the
+	 * key is not the {@link HttpHeader} itself.
 	 *
 	 * @throws IllegalStateException on a decoder table, which never queries by name
 	 */
 	public long findNameAndValue(HttpHeader name, byte[] value) {
 		checkState(encoderRole, "name/value lookup is encoder-only");
-		Long absoluteIndex = newestByNameValue.get(new NameValue(name, value));
+		Long absoluteIndex = newestByNameValue.get(new NameValue(nameKey(name), value));
 		return absoluteIndex != null ? absoluteIndex : NOT_FOUND;
 	}
 
 	/**
 	 * The newest available entry with this name, whatever its value, or {@link #NOT_FOUND}.
+	 * <p>
+	 * <b>O(1) average in the table's size</b>, on the same terms as {@link #findNameAndValue}.
 	 *
 	 * @throws IllegalStateException on a decoder table, which never queries by name
 	 */
 	public long findName(HttpHeader name) {
 		checkState(encoderRole, "name lookup is encoder-only");
-		Long absoluteIndex = newestByName.get(name);
+		Long absoluteIndex = newestByName.get(nameKey(name));
 		return absoluteIndex != null ? absoluteIndex : NOT_FOUND;
 	}
 
@@ -495,8 +510,9 @@ public final class QpackDynamicTable {
 		size += entry.size;
 		long absoluteIndex = insertCount++;
 		if (encoderRole) {
-			newestByName.put(entry.name, absoluteIndex);
-			newestByNameValue.put(new NameValue(entry.name, entry.value), absoluteIndex);
+			NameKey name = nameKey(entry.name);
+			newestByName.put(name, absoluteIndex);
+			newestByNameValue.put(new NameValue(name, entry.value), absoluteIndex);
 		}
 		return absoluteIndex;
 	}
@@ -511,8 +527,9 @@ public final class QpackDynamicTable {
 		if (encoderRole) {
 			// FIFO: when the evicted index is still the mapped one it was the last holder of that
 			// name (or name/value), so removing is exact and never orphans a newer entry.
-			newestByName.remove(entry.name, absoluteIndex);
-			newestByNameValue.remove(new NameValue(entry.name, entry.value), absoluteIndex);
+			NameKey name = nameKey(entry.name);
+			newestByName.remove(name, absoluteIndex);
+			newestByNameValue.remove(new NameValue(name, entry.value), absoluteIndex);
 		}
 	}
 
@@ -541,6 +558,43 @@ public final class QpackDynamicTable {
 		return entryAt(absoluteIndex);
 	}
 
+	private NameKey nameKey(HttpHeader name) {
+		return new NameKey(name, hashName(name));
+	}
+
+	/**
+	 * A case-insensitive <b>polynomial</b> hash over the field name's octets — the reason
+	 * {@link NameKey} exists at all.
+	 * <p>
+	 * {@link HttpHeader#hashCode()} is the <i>sum</i> of the name's lowercased octets, which is exactly
+	 * right for the open-addressed registry it was written for and unusable as a {@link HashMap} key
+	 * here: the sums of same-length names occupy a couple of hundred values, so distinct names collapse
+	 * onto the same bucket in the thousands, and {@link HttpHeader} is not {@link Comparable}, so
+	 * {@code HashMap} cannot treeify the bucket either. The result is a linked-list walk — a linear scan
+	 * reached through the back door of a weak hash, which is what the spec's O(1)-average requirement
+	 * for {@link #findName} and {@link #findNameAndValue} forbids. Measured before this hash existed:
+	 * 2 560 distinct names produced 83 distinct hashes and a worst bucket of 124, and {@code findName}
+	 * cost ten times more at ten times the table
+	 * ({@code QpackDynamicTableLookupComplexityTest.lookupCostIsFlatAsTheTableGrowsTenfold}).
+	 * <p>
+	 * The cost is {@code O(name length)} — bounded, short, and above all independent of the table's
+	 * size, which is the property being bought. {@code | 0x20} lowercases ASCII letters, so the hash
+	 * agrees with {@link HttpHeader#equals}'s case-insensitivity; it also folds a few non-letters
+	 * together, which a hash is entitled to do.
+	 */
+	private int hashName(HttpHeader name) {
+		int nameLength = name.size();
+		if (nameHashScratch.length < nameLength) {
+			nameHashScratch = new byte[Math.max(nameLength, nameHashScratch.length * 2)];
+		}
+		name.writeTo(nameHashScratch, 0);
+		int hash = 1;
+		for (int i = 0; i < nameLength; i++) {
+			hash = 31 * hash + (nameHashScratch[i] | 0x20);
+		}
+		return hash;
+	}
+
 	private static final class Entry {
 		private final HttpHeader name;
 		private final byte[] value;
@@ -564,7 +618,24 @@ public final class QpackDynamicTable {
 	/** One emitted, not-yet-released field section and the dynamic entries it pinned. */
 	private record Section(long streamId, long requiredInsertCount, long[] absoluteIndices) {}
 
-	private record NameValue(HttpHeader name, byte[] value) {
+	/**
+	 * A field name as a map key, carrying the hash {@link HttpHeader#hashCode()} does not provide —
+	 * see {@link #hashName}. Equality is {@link HttpHeader}'s and therefore still case-insensitive;
+	 * only the hash is this record's own, so the two indices behave identically and are merely fast.
+	 */
+	private record NameKey(HttpHeader name, int hash) {
+		@Override
+		public boolean equals(Object o) {
+			return this == o || o instanceof NameKey that && name.equals(that.name);
+		}
+
+		@Override
+		public int hashCode() {
+			return hash;
+		}
+	}
+
+	private record NameValue(NameKey name, byte[] value) {
 		@Override
 		public boolean equals(Object o) {
 			if (this == o) return true;

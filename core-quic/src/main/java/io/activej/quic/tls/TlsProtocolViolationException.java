@@ -39,6 +39,10 @@ import io.activej.common.exception.MalformedDataException;
  */
 public final class TlsProtocolViolationException extends MalformedDataException {
 
+	/**
+	 * @param message names the condition and the setting key that bounds it — never a ticket byte or
+	 *                any key material (FR-050, SI-6)
+	 */
 	public TlsProtocolViolationException(String message) {
 		super(message);
 	}

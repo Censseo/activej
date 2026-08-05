@@ -525,14 +525,17 @@ public final class QpackDynamicEncoder implements QpackEncoder {
 		return dynamicEnabled;
 	}
 
+	/** The capacity this encoder set on its own table, at most the peer's advertised maximum. */
 	public int capacity() {
 		return capacity;
 	}
 
+	/** Insertions ever made into this encoder's table. Monotonic, unaffected by eviction. */
 	public long insertCount() {
 		return table.insertCount();
 	}
 
+	/** Entries evicted to make room — the absolute index of the oldest entry still available. */
 	public long evictedCount() {
 		return table.droppedCount();
 	}
@@ -552,6 +555,7 @@ public final class QpackDynamicEncoder implements QpackEncoder {
 		return blocked.size();
 	}
 
+	/** Field lines encoded in any form — the hit-rate denominator against {@link #dynamicReferences()}. */
 	public long fieldsEncoded() {
 		return fieldsEncoded;
 	}

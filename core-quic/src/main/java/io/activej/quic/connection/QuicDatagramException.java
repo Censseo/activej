@@ -53,11 +53,17 @@ public final class QuicDatagramException extends Exception {
 
 	private final Reason reason;
 
+	/**
+	 * @param reason  why the send was refused
+	 * @param message names the size, count or setting that refused it — never a payload byte (SI-6).
+	 *                Stored and reported verbatim, never used as a format string
+	 */
 	public QuicDatagramException(Reason reason, String message) {
 		super(message);
 		this.reason = reason;
 	}
 
+	/** Why the send was refused; the remedy differs per member, so callers switch on it. */
 	public Reason reason() {
 		return reason;
 	}

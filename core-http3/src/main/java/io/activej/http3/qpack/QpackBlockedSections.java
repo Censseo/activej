@@ -218,12 +218,14 @@ public final class QpackBlockedSections {
 		return byStream.size();
 	}
 
+	/** The sections held, which is {@link #blockedStreamCount()} or more — one stream may hold several. */
 	public int sectionCount() {
 		int count = 0;
 		for (Deque<HeldSection> queue : byStream.values()) count += queue.size();
 		return count;
 	}
 
+	/** Whether nothing is held, so the caller may cancel its timeout check. */
 	public boolean isEmpty() {
 		return byStream.isEmpty();
 	}
@@ -238,10 +240,12 @@ public final class QpackBlockedSections {
 		return maxHeldBytes;
 	}
 
+	/** The locally advertised {@code SETTINGS_QPACK_BLOCKED_STREAMS} this instance was built with. */
 	public int maxBlockedStreams() {
 		return maxBlockedStreams;
 	}
 
+	/** How long one section may stay blocked; {@code 0} means the time bound is disabled. */
 	public long timeoutMillis() {
 		return timeoutMillis;
 	}

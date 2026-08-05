@@ -431,6 +431,26 @@ explicitly.
   per section so a consumer picks its own window). Every parameter is a number
   or which-table: a field name or a field value has no way to reach an inspector.
 
+  Measured, on a Chrome-shaped 17-field request repeated over one connection at
+  the 4 KB capacity (`benchmarks/http3`, `-P examples`): request 1 costs 20 B of
+  field section plus 482 B of encoder stream, and requests 2..N cost **20 B each
+  — 96 % less than request 1 and 96 % less than the 493 B the static-table
+  encoder spends on every one of them**. A browsing sequence whose `:path` and
+  `referer` change scores 93 %. A **256 B** capacity is a pessimisation, not a
+  small win: entries are evicted before they are reused, so every request pays
+  its insertions again on the encoder stream and the connection sends about
+  twice what phase 1 would. Pick a capacity that holds the traffic's repeated
+  fields, or leave it at `0`.
+
+  Both dynamic-table lookups — by name and by name and value — are O(1) average
+  in the table's size, and are now measured to be
+  (`QpackDynamicTableLookupComplexityTest`). They index on a polynomial hash of
+  the field name's octets rather than on `HttpHeader.hashCode()`, which is the
+  *sum* of those octets: right for the open-addressed registry it was written
+  for, and a linear scan through the back door here, since 2 560 distinct names
+  produce only 83 distinct sums and `HttpHeader` is not `Comparable`, so
+  `HashMap` cannot treeify the bucket either.
+
 - **TLS 1.3 session resumption and HTTP/3 0-RTT, off by default.** `core-quic`
   gains RFC 8446 §2.2 / §4.6.1 resumption — a server issues `NewSessionTicket`
   messages sealed under its own `QuicTicketKeys`, a client stores them in a
