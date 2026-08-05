@@ -31,6 +31,10 @@ import java.util.List;
  * Reference when only the name matches; otherwise Literal Field Line with Literal Name. The Encoded
  * Field Section Prefix is always Required Insert Count {@code 0}, {@code S=0}, Delta Base {@code 0}
  * (FR-032).
+ * <p>
+ * A literal name is written lowercase per RFC 9114 §4.1.1, via
+ * {@link QpackField#lowercaseNameBytes()} rather than the {@link HttpHeader}'s own octets — see that
+ * method for why the difference is not cosmetic.
  *
  * @see <a href="https://www.rfc-editor.org/rfc/rfc9204#section-4.5">RFC 9204 §4.5 — Field Line
  * Representations</a>
@@ -78,8 +82,8 @@ public final class QpackStaticEncoder implements QpackEncoder {
 			return writeStringLiteral(out, value, 7, 0, VALUE_HUFFMAN_FLAG);
 		}
 
-		byte[] nameBytes = new byte[name.size()];
-		name.writeTo(nameBytes, 0);
+		// RFC 9114 §4.1.1 — lowercase, and never `name`'s own octets: see QpackField.lowercaseNameBytes.
+		byte[] nameBytes = field.lowercaseNameBytes();
 		out = ByteBufPool.ensureWriteRemaining(out, 16 + nameBytes.length + value.length);
 		out = writeStringLiteral(out, nameBytes, 3, LITERAL_LITERAL_NAME_FLAGS, LITERAL_NAME_HUFFMAN_FLAG);
 		return writeStringLiteral(out, value, 7, 0, VALUE_HUFFMAN_FLAG);

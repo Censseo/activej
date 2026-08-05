@@ -1,0 +1,84 @@
+# RFC 9204 Appendix B.4 -- Duplicate Instruction, Stream Cancellation
+#
+# "The encoder duplicates an existing entry in the dynamic table, then sends an encoded
+#  field section referencing the dynamic table entries including the duplicated entry.
+#  The packet containing the encoder stream data is delayed.  Before the packet arrives,
+#  the decoder cancels the stream and notifies the encoder that the encoded field section
+#  was not processed."
+#
+# Transcribed byte-for-byte from https://www.rfc-editor.org/rfc/rfc9204.txt (2026-08-04).
+# See ./README.md for the file format.
+#
+# NOTE ON delivery-order: the RFC *presents* the encoder stream first (and its dynamic
+# table diagrams follow that presentation order), but *narrates* the encoder-stream packet
+# as delayed past the field section. Both readings are recorded:
+#   - delivery-order below is the RFC's presentation order, which is the state-consistent
+#     replay: nothing blocks, and the field section decodes to expected-fields.
+#   - blocked-delivery-order is the narrated one: the section arrives with Required Insert
+#     Count 4 while the decoder's Insert Count is still 3, so it blocks until the delayed
+#     encoder-stream byte arrives. A decoder replaying that order needs blocked-streams >= 1
+#     (blocked-streams below is the minimum for the presentation order, which is 0).
+# In the narrated order the decoder cancels stream 8 while still blocked and therefore
+# never surfaces the fields at all; expected-fields is what the *encoder* encoded, and what
+# a decoder that received the encoder stream first would produce.
+
+name: B.4
+title: Duplicate Instruction, Stream Cancellation
+rfc: RFC 9204 Appendix B.4
+continues-from: B.3
+stream: 8
+
+max-table-capacity: 220
+table-capacity-before: 220
+table-capacity-after: 220
+max-entries: 6
+blocked-streams: 0
+delivery-order: encoder-stream, field-section, decoder-stream
+blocked-delivery-order: field-section, encoder-stream, decoder-stream
+
+[encoder-stream]
+# Duplicate (Relative Index = 2)
+#  Absolute Index = Insert Count(3) - Index(2) - 1 = 0
+# 0x02 = 0000_0010 -> pattern 000, 5-bit prefix relative index = 2
+02
+
+[field-section]
+# Required Insert Count = 4, Base = 4
+# 0x05 = (4 % (2 * MaxEntries=6)) + 1 = 5
+# 0x00 = S=0 (Base >= Required Insert Count), Delta Base = 4 - 4 = 0
+05 00
+# Indexed Field Line, Dynamic Table
+#  Absolute Index = Base(4) - Index(0) - 1 = 3  (:authority=www.example.com)
+# 0x80 = 1000_0000 -> pattern 1, T=0 (dynamic), 6-bit prefix index = 0
+80
+# Indexed Field Line, Static Table Index = 1  (:path=/)
+# 0xc1 = 1100_0001 -> pattern 1, T=1 (static), 6-bit prefix index = 1
+c1
+# Indexed Field Line, Dynamic Table
+#  Absolute Index = Base(4) - Index(1) - 1 = 2  (custom-key=custom-value)
+81
+
+[expected-fields]
+:authority: www.example.com
+:path: /
+custom-key: custom-value
+
+[decoder-stream]
+# Stream Cancellation (Stream=8)
+# 0x48 = 0100_1000 -> pattern 01, 6-bit prefix stream id = 8
+48
+
+# Encoder's dynamic table at the end of this example, i.e. AFTER the Stream Cancellation.
+# Between the field section and the cancellation the RFC shows abs 2 and abs 3 at Ref=1;
+# the cancellation releases them.
+[expected-table]
+# abs ref name value
+0 0 :authority www.example.com
+1 0 :path /sample/path
+2 0 custom-key custom-value
+3 0 :authority www.example.com
+
+[expected-state]
+insert-count: 4
+known-received-count: 3
+size: 217

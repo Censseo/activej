@@ -16,6 +16,7 @@
 
 package io.activej.http3;
 
+import io.activej.common.MemSize;
 import io.activej.common.builder.AbstractBuilder;
 import io.activej.common.inspector.BaseInspector;
 import io.activej.dns.IDnsClient;
@@ -27,6 +28,8 @@ import io.activej.http.IHttpClient;
 import io.activej.http.MalformedHttpException;
 import io.activej.http.Protocol;
 import io.activej.http3.Http3Connection.GoAwayDirection;
+import io.activej.http3.Http3Connection.QpackBlockedExit;
+import io.activej.http3.Http3Connection.QpackTable;
 import io.activej.net.socket.udp.IUdpSocket;
 import io.activej.net.socket.udp.UdpSocket;
 import io.activej.promise.Promise;
@@ -183,6 +186,64 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 		 * @param queueDepth requests still waiting after this one left
 		 */
 		void onRequestDequeued(Http3Client client, int queueDepth);
+
+		/**
+		 * Entries were inserted into one of a connection's two QPACK dynamic tables (FR-018) — by this
+		 * client's encoder ({@link QpackTable#ENCODER}) or by a peer's encoder stream
+		 * ({@link QpackTable#DECODER}). Silent on a connection whose negotiated capacity is 0, which is
+		 * the default and has no table to insert into.
+		 *
+		 * @param insertions entries inserted, always at least 1
+		 * @param tableBytes RFC 9204 §3.2.1 accounted size that table holds afterwards
+		 */
+		default void onQpackInsertions(Http3Client client, QpackTable table, int insertions, int tableBytes) {}
+
+		/**
+		 * Entries were evicted from one of them to make room (RFC 9204 §3.2.2).
+		 *
+		 * @param evictions  entries evicted, always at least 1
+		 * @param tableBytes RFC 9204 §3.2.1 accounted size that table holds afterwards
+		 */
+		default void onQpackEvictions(Http3Client client, QpackTable table, int evictions, int tableBytes) {}
+
+		/**
+		 * A request field section was encoded against the dynamic table: the numerator and denominator of
+		 * a dynamic-table hit rate, reported per section so a consumer picks its own window.
+		 *
+		 * @param fieldLines        field lines the section carried
+		 * @param dynamicReferences those of them emitted as a dynamic-table reference, not a literal
+		 */
+		default void onQpackFieldSectionEncoded(
+			Http3Client client, long streamId, int fieldLines, int dynamicReferences) {}
+
+		/**
+		 * A request stream became blocked: a field section of its arrived whole but referenced an insertion
+		 * the peer's encoder stream has not delivered yet (RFC 9204 §2.1.2, FR-033). Fired once per stream,
+		 * not once per section — a stream already blocked does not become blocked again.
+		 *
+		 * @param blockedStreams streams blocked now, this one included
+		 * @param heldBytes      bytes held across all of them, this section included
+		 */
+		default void onQpackStreamBlocked(Http3Client client, long streamId, int blockedStreams, long heldBytes) {}
+
+		/**
+		 * A blocked stream stopped being blocked, one of the four ways {@link QpackBlockedExit} names. Only
+		 * {@code DECODED} is the ordinary end of head-of-line blocking; the other three are a peer that
+		 * never sent what it referenced.
+		 *
+		 * @param blockedMillis  how long the stream was blocked — the delay FR-036 bounds
+		 * @param blockedStreams streams still blocked after this one left
+		 */
+		default void onQpackStreamUnblocked(
+			Http3Client client, long streamId, QpackBlockedExit exit, long blockedMillis, int blockedStreams) {}
+
+		/**
+		 * A field section was refused rather than held, because holding it would have exceeded a bound on
+		 * blocked sections — which closes the connection (FR-034, FR-035). The two numbers are what was
+		 * already held when it arrived, and so say which bound was reached.
+		 */
+		default void onQpackBlockedSectionRefused(
+			Http3Client client, long streamId, int blockedStreams, long heldBytes) {}
 	}
 
 	private final IDnsClient dnsClient;
@@ -228,7 +289,7 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 
 	/**
 	 * What every connection this client dials reports through, forwarded to the {@link Inspector} if one
-	 * is attached — the four events a client cannot see for itself, because they happen on a connection or
+	 * is attached — the events a client cannot see for itself, because they happen on a connection or
 	 * on a stream rather than inside an exchange.
 	 */
 	private final Http3EventListener connectionEvents = new Http3EventListener() {
@@ -250,6 +311,46 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 		@Override
 		public void onStreamReset(long streamId, long errorCode) {
 			if (inspector != null) inspector.onStreamReset(Http3Client.this, streamId, errorCode);
+		}
+
+		@Override
+		public void onQpackInsertions(QpackTable table, int insertions, int tableBytes) {
+			if (inspector != null) inspector.onQpackInsertions(Http3Client.this, table, insertions, tableBytes);
+		}
+
+		@Override
+		public void onQpackEvictions(QpackTable table, int evictions, int tableBytes) {
+			if (inspector != null) inspector.onQpackEvictions(Http3Client.this, table, evictions, tableBytes);
+		}
+
+		@Override
+		public void onQpackFieldSectionEncoded(long streamId, int fieldLines, int dynamicReferences) {
+			if (inspector != null) {
+				inspector.onQpackFieldSectionEncoded(Http3Client.this, streamId, fieldLines, dynamicReferences);
+			}
+		}
+
+		@Override
+		public void onQpackStreamBlocked(long streamId, int blockedStreams, long heldBytes) {
+			if (inspector != null) {
+				inspector.onQpackStreamBlocked(Http3Client.this, streamId, blockedStreams, heldBytes);
+			}
+		}
+
+		@Override
+		public void onQpackStreamUnblocked(
+			long streamId, QpackBlockedExit exit, long blockedMillis, int blockedStreams
+		) {
+			if (inspector != null) {
+				inspector.onQpackStreamUnblocked(Http3Client.this, streamId, exit, blockedMillis, blockedStreams);
+			}
+		}
+
+		@Override
+		public void onQpackBlockedSectionRefused(long streamId, int blockedStreams, long heldBytes) {
+			if (inspector != null) {
+				inspector.onQpackBlockedSectionRefused(Http3Client.this, streamId, blockedStreams, heldBytes);
+			}
 		}
 	};
 
@@ -806,16 +907,41 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 	}
 
 	/**
-	 * FR-058b: the two stream-related transport parameters this feature depends on are supplied as
-	 * <i>values</i>; encoding them is the transport's job and no part of this module's. A client advertises
-	 * them for the streams a <i>server</i> might open toward it — which in HTTP/3 is its control and QPACK
-	 * streams and nothing else.
+	 * FR-058b: the transport parameters this feature depends on are supplied as <i>values</i>; encoding
+	 * them is the transport's job and no part of this module's. Two are unconditional — the stream-related
+	 * pair, which a client advertises for the streams a <i>server</i> might open toward it, in HTTP/3 its
+	 * control and QPACK streams and nothing else — and one is conditional on an {@link Http3Settings}
+	 * switch. This private mapping is deliberately the <b>only</b> way an H3-level setting reaches the
+	 * transport: there is no public {@code withQuicSettings} pass-through, because a consumer handed the
+	 * whole {@link QuicConnectionSettings} could set a parameter that contradicts what this layer requires
+	 * — {@code initialMaxStreamsUni < 3} alone breaks the control stream plus both QPACK streams (FR-017).
+	 * <p>
+	 * With {@link Http3Settings#datagramsEnabled()} false — the default (FR-089) — nothing conditional is
+	 * called at all, so the builder produces exactly the value phase 1 produced, keeping
+	 * {@code max_datagram_frame_size} unadvertised (SC-011). Guarding rather than passing an explicit 0
+	 * is the point: 0 happens to be {@link QuicConnectionSettings#DEFAULT_MAX_DATAGRAM_FRAME_SIZE} today,
+	 * and the default path must not depend on that staying true.
+	 * <p>
+	 * {@link Http3Settings#zeroRttEnabled()} is <b>deliberately not mapped here</b>, and its absence is a
+	 * decision rather than an omission: 0-RTT needs a ticket store, sealing keys and a replay register,
+	 * none of which is a connection setting — they arrive on the TLS configs and the {@code QuicConnection}
+	 * builder in the 0-RTT slice (research D-6). The eight session-resumption bounds already on
+	 * {@code QuicConnectionSettings} are the transport's own defaults and stay untouched until then.
+	 * <p>
+	 * Three further {@link Http3Settings} fields have no counterpart by construction:
+	 * {@code maxInboundDatagramsPerStream} is per-exchange H3 state owned by {@code Http3RequestStream}
+	 * and never a QUIC parameter, {@code maxOutboundDatagrams} is QUIC-level with its own default and no
+	 * H3 switch, and the five QPACK settings are H3-only — they travel in SETTINGS, not in the handshake.
 	 */
 	private QuicConnectionSettings quicSettings() {
-		return QuicConnectionSettings.builder()
+		QuicConnectionSettings.Builder builder = QuicConnectionSettings.builder()
 			.withInitialMaxStreamsBidi(settings.maxConcurrentRequestStreams())
-			.withInitialMaxStreamsUni(settings.maxUniStreams())
-			.build();
+			.withInitialMaxStreamsUni(settings.maxUniStreams());
+		if (settings.datagramsEnabled()) {
+			builder.withMaxDatagramFrameSize(MemSize.bytes(QuicConnectionSettings.maxDatagramFrameSizeFor(
+				QuicConnectionSettings.DEFAULT_MAX_DATAGRAM_SIZE.toInt())));
+		}
+		return builder.build();
 	}
 
 	/** One {@link Http3Connection} per dialled QUIC connection; its stream manager is the frame handler. */

@@ -30,12 +30,30 @@ import io.activej.http3.frame.Http3StreamType;
 import io.activej.http3.frame.MaxPushIdFrame;
 import io.activej.http3.frame.SettingsFrame;
 import io.activej.http3.frame.UnknownFrame;
+import io.activej.http3.qpack.QpackBlockedSections;
+import io.activej.http3.qpack.QpackBlockedSections.HeldSection;
 import io.activej.http3.qpack.QpackDecoder;
+import io.activej.http3.qpack.QpackDecoderStreamReader;
+import io.activej.http3.qpack.QpackDynamicDecoder;
+import io.activej.http3.qpack.QpackDynamicDecoder.Blocked;
+import io.activej.http3.qpack.QpackDynamicDecoder.Decoded;
+import io.activej.http3.qpack.QpackDynamicDecoder.SectionResult;
+import io.activej.http3.qpack.QpackDynamicEncoder;
 import io.activej.http3.qpack.QpackEncoder;
+import io.activej.http3.qpack.QpackEncoderStreamReader;
+import io.activej.http3.qpack.QpackException;
+import io.activej.http3.qpack.QpackField;
+import io.activej.http3.qpack.QpackInstructions;
+import io.activej.http3.qpack.QpackInstructions.DecoderInstruction;
+import io.activej.http3.qpack.QpackInstructions.EncoderInstruction;
+import io.activej.http3.qpack.QpackInstructions.InsertCountIncrement;
+import io.activej.http3.qpack.QpackInstructions.SectionAcknowledgment;
+import io.activej.http3.qpack.QpackInstructions.StreamCancellation;
 import io.activej.http3.qpack.QpackStaticDecoder;
 import io.activej.http3.qpack.QpackStaticEncoder;
 import io.activej.promise.Promise;
 import io.activej.promise.Promises;
+import io.activej.promise.SettablePromise;
 import io.activej.quic.codec.QuicVarInts;
 import io.activej.quic.connection.QuicConnection;
 import io.activej.quic.connection.QuicConnection.Role;
@@ -44,6 +62,7 @@ import io.activej.quic.stream.QuicStreamManager;
 import io.activej.quic.stream.StreamIds;
 import io.activej.reactor.AbstractReactive;
 import io.activej.reactor.Reactor;
+import io.activej.reactor.schedule.ScheduledRunnable;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -51,10 +70,12 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
 
+import static io.activej.common.Utils.nullify;
 import static io.activej.reactor.Reactive.checkInReactorThread;
 
 /**
@@ -185,6 +206,35 @@ public final class Http3Connection extends AbstractReactive {
 		RECEIVED,
 	}
 
+	/**
+	 * Which of a connection's two QPACK dynamic tables an {@code Inspector}'s insertion and eviction
+	 * counts belong to. RFC 9204 §3.2 gives every connection one per direction, and they are never the
+	 * same object — a report that did not say which would be two numbers added together.
+	 */
+	public enum QpackTable {
+		/** The table this endpoint inserts into and encodes its own field sections from. */
+		ENCODER,
+		/** The table the peer's encoder stream inserts into and this endpoint decodes with. */
+		DECODER,
+	}
+
+	/**
+	 * Why a stream stopped being blocked on a QPACK field section — what an {@code Inspector}'s
+	 * {@code onQpackStreamUnblocked} reports. A section leaves the hold in exactly these four ways, and
+	 * only the first of them is the one head-of-line blocking is supposed to end in: the other three are
+	 * a peer that never sent what it referenced, seen from three different sides.
+	 */
+	public enum QpackBlockedExit {
+		/** The peer's insertions arrived: the section left the hold to be decoded (FR-033). */
+		DECODED,
+		/** Its request stream was reset or abandoned while it was still held (FR-025). */
+		RESET,
+		/** It stayed blocked past {@link Http3Settings#qpackBlockedStreamTimeoutMillis()} (FR-036). */
+		TIMED_OUT,
+		/** The connection is closing, and everything it was holding goes with it (FR-035). */
+		CLOSED,
+	}
+
 	public enum State {
 		/** Constructed; the local control stream has not been opened yet. */
 		NEW,
@@ -208,6 +258,103 @@ public final class Http3Connection extends AbstractReactive {
 	private Http3EventListener eventListener = Http3EventListener.NONE;
 	private QpackEncoder qpackEncoder;
 	private QpackDecoder qpackDecoder;
+
+	/**
+	 * The dynamic half of QPACK, when a capacity was negotiated for it. The two directions appear at
+	 * different moments, and that asymmetry is the whole shape of this wiring: the <b>decoder</b>
+	 * depends on nothing the peer says — this endpoint's own advertised maximum bounds what the peer's
+	 * encoder may do — so it exists from {@code build()}; the <b>encoder</b> may not request more than
+	 * the peer's {@code SETTINGS_QPACK_MAX_TABLE_CAPACITY} (RFC 9204 §3.2.3), which arrives later, so
+	 * it exists only once the peer's SETTINGS have landed.
+	 * <p>
+	 * {@link #qpackEncoder} / {@link #qpackDecoder} alias whichever implementation is live, and stay
+	 * what {@link #qpackEncoder()} / {@link #qpackDecoder()} return.
+	 */
+	private @Nullable QpackDynamicDecoder qpackDynamicDecoder;
+	private @Nullable QpackDynamicEncoder qpackDynamicEncoder;
+
+	private @Nullable QpackEncoderStreamReader qpackEncoderStreamReader;
+	private @Nullable QpackDecoderStreamReader qpackDecoderStreamReader;
+
+	/**
+	 * The field sections received whole but not decodable yet, and the three bounds on holding them
+	 * (FR-033 – FR-036). Non-null exactly when {@link #qpackDynamicDecoder} is: with no dynamic table
+	 * nothing can block, which is why capacity 0 is phase-1 behaviour byte for byte (SC-011).
+	 */
+	private @Nullable QpackBlockedSections blockedSections;
+
+	/**
+	 * One waiter per blocked section, keyed by stream: what {@link StreamQpackDecoder} handed its
+	 * request stream in place of the fields, and what {@link #resumeBlockedSections()} settles.
+	 * <p>
+	 * Keyed by <i>stream</i> rather than by section because an {@link Http3RequestStream} decodes one
+	 * field section at a time and does not read the frame behind a held one — so a stream can have at
+	 * most one section outstanding here, whatever {@link QpackBlockedSections} is prepared to hold.
+	 * <p>
+	 * It is also the register of <i>which streams are blocked</i> — the entry and exit counters of FR-091
+	 * are per stream, and this is the only structure keyed that way.
+	 */
+	private final Map<Long, BlockedStream> blockedSectionWaiters = new HashMap<>();
+
+	/**
+	 * @param blockedSinceMillis when the stream became blocked, which is what makes an exit report a
+	 *                           duration. Not read back off {@link QpackBlockedSections}: its timestamps
+	 *                           are per <i>section</i>, and a stream that held two would have two.
+	 */
+	private record BlockedStream(SettablePromise<List<QpackField>> waiter, long blockedSinceMillis) {}
+
+	/** {@link #rearmBlockedSectionTimeout()}'s handle — the one timer FR-036 needs, never a second one. */
+	private @Nullable ScheduledRunnable blockedSectionTimeout;
+
+	/**
+	 * What {@link #abortOwnedStreams} reports the sections still held as leaving for. {@code CLOSED},
+	 * unless FR-036's deadline is what closed the connection — in which case they are all leaving for
+	 * that reason, and reporting them as merely "closing" would hide the bound that fired.
+	 */
+	private QpackBlockedExit blockedSectionExit = QpackBlockedExit.CLOSED;
+
+	/**
+	 * What {@link #reportQpackDecoderTable()} has already reported of the peer-driven table's two
+	 * cumulative counters. Watermarks rather than a snapshot taken around each feed, because the codec
+	 * holding those counters is reachable only through a nullable field — the same shape
+	 * {@link #flushInsertCountIncrement()} beside it uses for the same reason.
+	 */
+	private long qpackDecoderInsertionsReported;
+	private long qpackDecoderEvictionsReported;
+
+	private final LocalQpackStream localQpackEncoderStream = new LocalQpackStream(Http3StreamType.QPACK_ENCODER);
+	private final LocalQpackStream localQpackDecoderStream = new LocalQpackStream(Http3StreamType.QPACK_DECODER);
+
+	/**
+	 * What every {@link Http3RequestStream} this connection adopts reports to, forwarding to
+	 * {@link #eventListener} unchanged and taking one action of its own: a stream reset is where
+	 * FR-025's {@code Stream Cancellation} comes from. {@code Http3RequestStream.abortWith} fires it
+	 * exactly once per stream, which is what makes it the single funnel rather than a second one —
+	 * {@code QuicStream.whenClosed()} could not serve, since it completes <i>normally</i> on a peer
+	 * reset and so cannot tell an abort from a clean close.
+	 */
+	private final Http3EventListener requestStreamEventListener = new Http3EventListener() {
+		@Override
+		public void onConnectionError(long errorCode) {
+			eventListener.onConnectionError(errorCode);
+		}
+
+		@Override
+		public void onFrameDiscarded(long frameType, long declaredLength) {
+			eventListener.onFrameDiscarded(frameType, declaredLength);
+		}
+
+		@Override
+		public void onGoAway(GoAwayDirection direction, long id) {
+			eventListener.onGoAway(direction, id);
+		}
+
+		@Override
+		public void onStreamReset(long streamId, long errorCode) {
+			onRequestStreamAborted(streamId, errorCode);
+			eventListener.onStreamReset(streamId, errorCode);
+		}
+	};
 
 	private State state = State.NEW;
 	private boolean started;
@@ -313,8 +460,25 @@ public final class Http3Connection extends AbstractReactive {
 
 		@Override
 		protected Http3Connection doBuild() {
+			int localCapacity = settings.qpackMaxTableCapacity();
+			if (localCapacity > 0) {
+				QpackDynamicDecoder decoder = new QpackDynamicDecoder(localCapacity,
+					settings.qpackBlockedStreams(), settings.maxFieldSectionSize());
+				qpackDynamicDecoder = decoder;
+				qpackDecoder = decoder;
+				qpackEncoderStreamReader = new QpackEncoderStreamReader(decoder, settings.qpackMaxInstructionSize());
+				// The count is read back off the decoder, not off the settings, for the reason
+				// localSettingsFrame() gives: advertisement, decoder behaviour and holding capacity are one
+				// value with three consumers, and this is what stops them drifting.
+				blockedSections = new QpackBlockedSections(decoder.blockedStreams(),
+					settings.maxFieldSectionSize(), settings.qpackBlockedStreamTimeoutMillis());
+			} else {
+				qpackDecoder = new QpackStaticDecoder(settings.maxFieldSectionSize());
+			}
+			// The peer has said nothing yet, and RFC 9204 §3.2.3 makes an unadvertised capacity 0 — so
+			// this is the correct encoder until SETTINGS arrive, not a placeholder for one. It stays the
+			// encoder for the life of a connection whose peer advertises 0 (FR-019, FR-040).
 			qpackEncoder = new QpackStaticEncoder();
-			qpackDecoder = new QpackStaticDecoder(settings.maxFieldSectionSize());
 			return Http3Connection.this;
 		}
 	}
@@ -347,6 +511,11 @@ public final class Http3Connection extends AbstractReactive {
 				settingsSent = true;
 				updateState();
 			});
+		// After the control stream, so that one keeps the lowest unidirectional stream id, and outside
+		// `starting`, so that a QPACK stream's failure cannot hide the control stream's. The decoder
+		// stream needs nothing from the peer — what the peer's encoder may do is bounded by the maximum
+		// this endpoint advertises — so this is the earliest it can be opened (FR-023).
+		if (qpackDynamicDecoder != null) localQpackDecoderStream.open(null);
 		return starting;
 	}
 
@@ -397,14 +566,16 @@ public final class Http3Connection extends AbstractReactive {
 		long id = stream.id();
 		Http3RequestStream requestStream = Http3RequestStream.builder(reactor, stream)
 			.withSettings(settings)
-			.withQpackEncoder(qpackEncoder)
-			.withQpackDecoder(qpackDecoder)
+			// Wrapped unconditionally, capacity 0 included: the views delegate to the static codecs
+			// byte-for-byte there, and one code path is worth more than the indirection it costs.
+			.withQpackEncoder(new StreamQpackEncoder(id))
+			.withQpackFieldSectionDecoder(new StreamQpackDecoder(id))
 			// The two violations a request stream can observe that the *connection* owns: a PUSH_PROMISE
 			// against a push limit of 0 (FR-040), and a frame RFC 9114 §7.2's table does not permit on a
 			// request stream at all (FR-024, FR-025). Everything it refuses about the message itself stays
 			// on its own stream (FR-037).
 			.withConnectionErrorListener(this::closeWithError)
-			.withEventListener(eventListener)
+			.withEventListener(requestStreamEventListener)
 			.build();
 		requestStreams.put(id, requestStream);
 		stream.whenClosed().whenComplete(($, e) -> requestStreams.remove(id));
@@ -537,13 +708,21 @@ public final class Http3Connection extends AbstractReactive {
 	 */
 	public long peerMaxFieldSectionSize() {
 		checkInReactorThread(this);
-		if (peerSettings == null) return Long.MAX_VALUE;
+		return peerSetting(SettingsFrame.MAX_FIELD_SECTION_SIZE, Long.MAX_VALUE);
+	}
+
+	/**
+	 * The value the peer advertised for {@code identifier}, or {@code defaultValue} if it advertised
+	 * none — which for every setting this connection reads is the RFC's own default for an omitted one.
+	 */
+	private long peerSetting(long identifier, long defaultValue) {
+		if (peerSettings == null) return defaultValue;
 		for (int i = 0; i < peerSettings.identifiers.length; i++) {
-			if (peerSettings.identifiers[i] == SettingsFrame.MAX_FIELD_SECTION_SIZE) {
+			if (peerSettings.identifiers[i] == identifier) {
 				return peerSettings.values[i];
 			}
 		}
-		return Long.MAX_VALUE;
+		return defaultValue;
 	}
 
 	public QpackEncoder qpackEncoder() {
@@ -674,17 +853,28 @@ public final class Http3Connection extends AbstractReactive {
 		return buf;
 	}
 
-	/** FR-012: the three settings this implementation advertises, and no others. */
+	/**
+	 * FR-012, FR-038: the three settings this implementation advertises, and no others.
+	 * <p>
+	 * Both QPACK values are read back off the <b>decoder that was actually built</b> rather than off
+	 * {@link #settings}, so there is one source of truth for what this endpoint can honour. That is what
+	 * makes phase 2's departure fall out instead of being a special case: a capacity of 0 builds no
+	 * decoder and advertises 0 for <b>both</b> (SC-011 byte identity, since RFC 9204 §2.1.2 makes a
+	 * blocked-stream permission meaningless without a table), while a configured capacity advertises the
+	 * limit the decoder was built with and {@link QpackBlockedSections} sized itself from — one value,
+	 * three consumers, no drift.
+	 */
 	private SettingsFrame localSettingsFrame() {
+		QpackDynamicDecoder decoder = qpackDynamicDecoder;
 		return new SettingsFrame(
 			new long[]{
 				SettingsFrame.QPACK_MAX_TABLE_CAPACITY,
 				SettingsFrame.MAX_FIELD_SECTION_SIZE,
 				SettingsFrame.QPACK_BLOCKED_STREAMS},
 			new long[]{
-				settings.qpackMaxTableCapacity(),
+				decoder == null ? 0 : decoder.maxCapacity(),
 				settings.maxFieldSectionSize(),
-				settings.qpackBlockedStreams()});
+				decoder == null ? 0 : decoder.blockedStreams()});
 	}
 
 	// ---------------------------------------------------------------- peer-opened streams
@@ -851,6 +1041,7 @@ public final class Http3Connection extends AbstractReactive {
 			validatePeerSettings(settingsFrame);
 			peerSettings = settingsFrame;
 			updateState();
+			onPeerSettingsApplied();
 			return;
 		}
 		if (frame instanceof SettingsFrame) {
@@ -942,6 +1133,323 @@ public final class Http3Connection extends AbstractReactive {
 		}
 	}
 
+	// ---------------------------------------------------------------- the local QPACK streams
+
+	/**
+	 * The peer's SETTINGS have landed, which is the earliest moment the encoder half of QPACK can
+	 * exist: RFC 9204 §3.2.3 makes the peer's advertised {@code SETTINGS_QPACK_MAX_TABLE_CAPACITY} the
+	 * ceiling on what this endpoint may request, and a peer that advertises none permits 0 (FR-019).
+	 * The encoder stream opens here too, and its preamble <i>is</i> the encoder's first drained
+	 * instruction — which is what makes FR-017's "a {@code Set Dynamic Table Capacity} first"
+	 * structural rather than asserted.
+	 * <p>
+	 * Must not throw: its caller reports RFC 9114 §8.1 errors, and a runtime failure raised here would
+	 * escape as one.
+	 */
+	private void onPeerSettingsApplied() {
+		int localCapacity = settings.qpackMaxTableCapacity();
+		if (localCapacity == 0) return;
+		// Every wire-sourced value is clamped before it reaches an int constructor, so a peer advertising
+		// 2^62 cannot wrap into range. Clamping the advertised maximum does shift RFC 9204 §4.5.1.1's
+		// MaxEntries, but this endpoint's own table is orders of magnitude below the wrap point, so no
+		// encoded insert count it ever writes differs.
+		int peerMaxTableCapacity = clampToInt(peerSetting(SettingsFrame.QPACK_MAX_TABLE_CAPACITY, 0));
+		int capacity = Math.min(localCapacity, peerMaxTableCapacity);
+		if (capacity <= 0) return;
+		int peerBlockedStreams = clampToInt(peerSetting(SettingsFrame.QPACK_BLOCKED_STREAMS, 0));
+		// Derived rather than configured (WI-14): a setting of its own would be a new Http3Settings field
+		// plus a CHANGELOG entry. Two sections per concurrent request stream covers a request and its
+		// response, and the multiplication is widened first so the bound cannot overflow into a small one.
+		// Not the same bound as qpackBlockedStreams, and not comparable to it: this counts sections this
+		// endpoint's *encoder* has emitted and not had acknowledged, pinning entries in the table it
+		// encodes from, while qpackBlockedStreams counts sections this endpoint's *decoder* holds awaiting
+		// the peer's insertions (see QpackBlockedSections). Two tables, two directions, two bounds.
+		int maxOutstandingSections = clampToInt(2L * settings.maxConcurrentRequestStreams());
+		QpackDynamicEncoder encoder = new QpackDynamicEncoder(peerMaxTableCapacity, capacity,
+			peerBlockedStreams, maxOutstandingSections, settings.qpackNeverIndexedFields());
+		qpackDynamicEncoder = encoder;
+		qpackEncoder = encoder;
+		qpackDecoderStreamReader = new QpackDecoderStreamReader(encoder, settings.qpackMaxInstructionSize());
+		localQpackEncoderStream.open(instructionBuffer(encoder.drainPendingInstructions()));
+	}
+
+	private static int clampToInt(long value) {
+		return (int) Math.min(Math.max(value, 0), Integer.MAX_VALUE);
+	}
+
+	/**
+	 * The one place encoder-stream instructions are written (research D-2). Called from
+	 * {@link StreamQpackEncoder#encode} between the encode that accumulated them and the return that
+	 * hands the field section to whoever writes it — a second drain site would be the registry's
+	 * "second route into release bookkeeping" in another costume.
+	 */
+	private void drainQpackInstructions(QpackDynamicEncoder encoder) {
+		if (!encoder.hasPendingInstructions()) return;
+		localQpackEncoderStream.write(instructionBuffer(encoder.drainPendingInstructions()));
+	}
+
+	/**
+	 * {@code instructions} back to back in one owned buffer. They are values, never buffers, so nothing
+	 * can leak between the encode that accumulated them and this (DI-1).
+	 */
+	private static ByteBuf instructionBuffer(List<EncoderInstruction> instructions) {
+		int length = 0;
+		for (EncoderInstruction instruction : instructions) {
+			length += instruction.encodedLength();
+		}
+		ByteBuf buf = ByteBufPool.allocate(length);
+		for (EncoderInstruction instruction : instructions) {
+			instruction.writeTo(buf);
+		}
+		return buf;
+	}
+
+	private void writeDecoderInstruction(DecoderInstruction instruction) {
+		localQpackDecoderStream.write(QpackInstructions.encode(instruction));
+	}
+
+	/**
+	 * FR-026, RFC 9204 §4.4.3: the insertions this endpoint has processed that no
+	 * {@code Section Acknowledgment} already covered. Called after every successful read of the peer's
+	 * encoder stream, so an entry the peer inserted speculatively becomes referenceable without waiting
+	 * for a request to name it.
+	 */
+	private void flushInsertCountIncrement() {
+		QpackDynamicDecoder decoder = qpackDynamicDecoder;
+		if (decoder == null) return;
+		long increment = decoder.pendingInsertCountIncrement();
+		if (increment <= 0) return;
+		writeDecoderInstruction(new InsertCountIncrement(increment));
+		decoder.onInsertCountAnnounced(decoder.insertCount());
+	}
+
+	/**
+	 * FR-018: what the peer's encoder stream just inserted into — and evicted from — the table this
+	 * endpoint decodes with. Called after every successful read of that stream, and after
+	 * {@link #flushInsertCountIncrement()}, so nothing is reported ahead of what the wire owes.
+	 * <p>
+	 * The watermarks advance <i>before</i> the listener is called: an implementation that throws fails
+	 * the operation it was reporting on, and must not also make the next report count these insertions
+	 * a second time.
+	 */
+	private void reportQpackDecoderTable() {
+		QpackDynamicDecoder decoder = qpackDynamicDecoder;
+		if (decoder == null) return;
+		long insertions = decoder.insertCount() - qpackDecoderInsertionsReported;
+		long evictions = decoder.evictedCount() - qpackDecoderEvictionsReported;
+		qpackDecoderInsertionsReported = decoder.insertCount();
+		qpackDecoderEvictionsReported = decoder.evictedCount();
+		reportQpackTable(QpackTable.DECODER, insertions, evictions, decoder.tableSize());
+	}
+
+	/**
+	 * The one place a dynamic-table counter becomes an event (FR-018). A counter that did not move is
+	 * not an event, and every argument is a number — a field name or a value has no way to reach an
+	 * inspector from here (SI-6).
+	 */
+	private void reportQpackTable(QpackTable table, long insertions, long evictions, int tableBytes) {
+		if (insertions > 0) eventListener.onQpackInsertions(table, clampToInt(insertions), tableBytes);
+		if (evictions > 0) eventListener.onQpackEvictions(table, clampToInt(evictions), tableBytes);
+	}
+
+	// ---------------------------------------------------------------- blocked field sections (FR-033–FR-037)
+
+	/**
+	 * The single acknowledgment funnel (FR-024), taken by a section that decoded on arrival and by one
+	 * that decoded after waiting alike — the two paths must owe the peer the same thing, and one funnel
+	 * is how that stops being a coincidence.
+	 */
+	private List<QpackField> onSectionDecoded(long streamId, Decoded decoded) {
+		QpackDynamicDecoder decoder = qpackDynamicDecoder;
+		if (decoder != null && decoded.requiredInsertCount() > 0) {
+			writeDecoderInstruction(new SectionAcknowledgment(streamId));
+			// RFC 9204 §4.4.1: the acknowledgment itself tells the peer's encoder that every insertion up
+			// to this count arrived, so an Insert Count Increment measured from anywhere below it would
+			// count those insertions twice.
+			decoder.onInsertCountAnnounced(decoded.requiredInsertCount());
+		}
+		return decoded.fields();
+	}
+
+	/**
+	 * RFC 9204 §2.1.2, FR-033: the section waits here instead of failing, and its request stream waits on
+	 * the promise this returns.
+	 * <p>
+	 * Exceeding the count or the byte bound is a <b>connection</b> error (FR-034, FR-035), and it needs no
+	 * escalation path of its own: {@code hold} has already recycled the section and raises a
+	 * {@code connectionError}-marked {@link QpackException}, which travels the route every QPACK failure
+	 * takes — {@code decodeFieldSection} → {@code Http3Exception.connectionScoped} → {@code abortWith} →
+	 * the connection-error listener → {@link #closeWithError}.
+	 */
+	private Promise<List<QpackField>> holdBlockedSection(long streamId, Blocked blocked) {
+		QpackBlockedSections sections = blockedSections;
+		if (sections == null) {
+			// Unreachable: a section can only block against a dynamic decoder, and the two are built together.
+			blocked.section().recycle();
+			return Promise.ofException(QpackException.connectionError(Http3Errors.QPACK_DECOMPRESSION_FAILED,
+				"a field section blocked on an unarrived insertion, which this endpoint does not hold"));
+		}
+		long now = reactor.currentTimeMillis();
+		try {
+			sections.hold(streamId, blocked.requiredInsertCount(), blocked.section(), now);
+		} catch (QpackException e) {
+			eventListener.onQpackBlockedSectionRefused(streamId, blockedSectionWaiters.size(), sections.heldBytes());
+			return Promise.ofException(e);
+		}
+		rearmBlockedSectionTimeout();
+		SettablePromise<List<QpackField>> waiter = new SettablePromise<>();
+		BlockedStream previous = blockedSectionWaiters.get(streamId);
+		blockedSectionWaiters.put(streamId,
+			new BlockedStream(waiter, previous == null ? now : previous.blockedSinceMillis()));
+		if (previous == null) {
+			eventListener.onQpackStreamBlocked(streamId, blockedSectionWaiters.size(), sections.heldBytes());
+			return waiter;
+		}
+		// Unreachable — a request stream issues no second decode while its first is pending — and failed
+		// rather than skipped, because stranding the earlier caller would be the worse of the two. No entry
+		// is reported for it: a stream already blocked does not become blocked again.
+		previous.waiter().trySetException(QpackException.connectionError(Http3Errors.QPACK_DECOMPRESSION_FAILED,
+			"two field sections blocked at once on stream " + streamId));
+		return waiter;
+	}
+
+	/**
+	 * The single exit funnel of FR-091's counters: a stream stops being blocked in exactly the four ways
+	 * {@link QpackBlockedExit} names, and routing all four through here is what makes an entry without an
+	 * exit unreachable rather than merely unlikely.
+	 *
+	 * @return the waiter its request stream is holding, or {@code null} if that stream was not blocked
+	 */
+	private @Nullable SettablePromise<List<QpackField>> unblock(long streamId, QpackBlockedExit exit) {
+		BlockedStream blocked = blockedSectionWaiters.remove(streamId);
+		if (blocked == null) return null;
+		eventListener.onQpackStreamUnblocked(streamId, exit,
+			reactor.currentTimeMillis() - blocked.blockedSinceMillis(), blockedSectionWaiters.size());
+		return blocked.waiter();
+	}
+
+	/**
+	 * Settles every section the peer's latest insertions made decodable, <b>in arrival order</b> (FR-037)
+	 * — the decode path of FR-035's three releases.
+	 *
+	 * <h4>Two guarantees make FR-037 hold, and only one of them is load-bearing</h4>
+	 * The load-bearing one is structural and lives in {@link Http3RequestStream}: a request stream reads
+	 * its frames strictly in sequence, so while one of its field sections is held the <i>next</i> HEADERS
+	 * frame is never even taken off the QUIC stream — a later section cannot overtake an earlier one
+	 * because it does not exist here yet. The second is {@link QpackBlockedSections#release} draining each
+	 * stream from its head and sorting globally by arrival order, which is what keeps the first from being
+	 * the only thing standing between a peer and a reordered message.
+	 * <p>
+	 * Every waiter is settled synchronously, and settling one routinely resets a stream or closes the
+	 * connection from inside this loop. That is safe only because {@link QpackBlockedSections#release}
+	 * has already handed the sections over — nothing here reads the structure again — and because the
+	 * per-iteration {@code remove} and {@code CLOSED} check below are what keep a section whose waiter has
+	 * meanwhile gone from being decoded into nobody's hands. Neither is optional.
+	 */
+	private void resumeBlockedSections() {
+		QpackDynamicDecoder decoder = qpackDynamicDecoder;
+		QpackBlockedSections sections = blockedSections;
+		if (decoder == null || sections == null || sections.isEmpty()) return;
+		List<HeldSection> released = sections.release(decoder.insertCount());
+		if (released.isEmpty()) return;
+		rearmBlockedSectionTimeout();
+		for (HeldSection held : released) {
+			SettablePromise<List<QpackField>> waiter = unblock(held.streamId(), QpackBlockedExit.DECODED);
+			if (waiter == null || state == State.CLOSED) {
+				held.section().recycle();
+				continue;
+			}
+			try {
+				SectionResult result = decoder.decodeOrBlock(held.section());
+				if (result instanceof Decoded decoded) {
+					waiter.set(onSectionDecoded(held.streamId(), decoded));
+				} else {
+					// Unreachable: the Insert Count only rises, and release() hands back only sections at or
+					// below it. Stated as a failure rather than re-held, so it cannot become a silent loop.
+					((Blocked) result).section().recycle();
+					waiter.setException(QpackException.connectionError(Http3Errors.QPACK_DECOMPRESSION_FAILED,
+						"a released field section that blocked again"));
+				}
+			} catch (QpackException e) {
+				waiter.setException(e);
+			}
+		}
+	}
+
+	/**
+	 * FR-036's one timer, re-armed from <b>every</b> site that changes what is held — after a hold, after
+	 * a release, after a discard — and cancelled before it is re-scheduled, always. One entry point is
+	 * what makes "a timer that outlives what it was watching" unreachable rather than merely unlikely.
+	 * <p>
+	 * {@link QpackBlockedSections#earliestDeadlineMillis()} is already an absolute reactor-clock
+	 * timestamp, since {@code arrivalMillis} came from {@code reactor.currentTimeMillis()} — so
+	 * {@code schedule(timestamp, …)} is the exact fit rather than a departure from the module's
+	 * {@code reactor.delay(...)} rule: {@code delay(ms, r)} <i>is</i>
+	 * {@code schedule(currentTimeMillis() + ms, r)}, and both are driven by the same hand-set clock a
+	 * test installs.
+	 */
+	private void rearmBlockedSectionTimeout() {
+		blockedSectionTimeout = nullify(blockedSectionTimeout, ScheduledRunnable::cancel);
+		QpackBlockedSections sections = blockedSections;
+		if (sections == null || state == State.CLOSED) return;
+		long deadline = sections.earliestDeadlineMillis();
+		if (deadline == QpackBlockedSections.NO_DEADLINE) return;
+		blockedSectionTimeout = reactor.schedule(deadline, this::onBlockedSectionDeadline);
+	}
+
+	/**
+	 * FR-036: a peer may legally block a stream and then simply stop sending, so a held section has a
+	 * bounded lifetime and exceeding it closes the <b>connection</b> with
+	 * {@code QPACK_DECOMPRESSION_FAILED} (research D-4).
+	 * <p>
+	 * Nothing is released here. {@link QpackBlockedSections#checkTimeout} deliberately holds on to what
+	 * it refuses, so that {@link #abortOwnedStreams} stays the single place held memory goes back and
+	 * FR-035 and FR-036 cannot disagree about which of them owed the recycle.
+	 */
+	private void onBlockedSectionDeadline() {
+		// First: this handle has run, and a later cancel must not be aimed at a stale one.
+		blockedSectionTimeout = null;
+		QpackBlockedSections sections = blockedSections;
+		if (sections == null || state == State.CLOSED) return;
+		try {
+			sections.checkTimeout(reactor.currentTimeMillis());
+		} catch (QpackException e) {
+			// Before the close, because the close is what releases them and this is what says why.
+			blockedSectionExit = QpackBlockedExit.TIMED_OUT;
+			closeWithError(new Http3Exception(e.errorCode(), e.reason()));
+			return;
+		}
+		// Clock granularity, or a section released in the same turn: nothing is due yet, so re-aim.
+		rearmBlockedSectionTimeout();
+	}
+
+	/**
+	 * A request stream ended abnormally: two of the three terminal paths into the reference-release
+	 * bookkeeping of both tables (research D-3). The peer's encoder learns it will never acknowledge
+	 * this stream's section, this endpoint's own encoder releases what that stream pinned, and a section
+	 * this endpoint was still <b>holding</b> for that stream is released with them (FR-025, FR-035).
+	 * <p>
+	 * FR-025's "unless the connection is already closing" is the state check, and it is exact because
+	 * {@link #close()} and {@link #closeWithError} both transition to {@code CLOSED} <i>before</i>
+	 * aborting the streams they own. Over-emitting a {@code Stream Cancellation} is safe — RFC 9204
+	 * §4.4.2 gives its receipt no "no outstanding section" error, unlike §4.4.1 — while under-emitting
+	 * pins the peer's table, so it fires on every abnormal termination.
+	 */
+	private void onRequestStreamAborted(long streamId, long errorCode) {
+		if (state == State.CLOSED) return;
+		if (qpackDynamicDecoder != null) writeDecoderInstruction(new StreamCancellation(streamId));
+		if (qpackDynamicEncoder != null) qpackDynamicEncoder.onStreamCancelled(streamId);
+		QpackBlockedSections sections = blockedSections;
+		// The reset path of FR-035's three: discard recycles every section held for this stream, and the
+		// timeout is re-armed because the deadline it was watching may have been this stream's.
+		if (sections != null && sections.discard(streamId) > 0) rearmBlockedSectionTimeout();
+		SettablePromise<List<QpackField>> waiter = unblock(streamId, QpackBlockedExit.RESET);
+		if (waiter != null) {
+			waiter.trySetException(new Http3Exception(errorCode,
+				"Request stream " + streamId + " ended while a field section of its was still blocked"));
+		}
+	}
+
 	// ---------------------------------------------------------------- server push, refused (FR-040)
 
 	/**
@@ -1022,12 +1530,59 @@ public final class Http3Connection extends AbstractReactive {
 	}
 
 	/**
+	 * Takes ownership of {@code buf}, and routes it per <b>direction</b> and per <b>codec</b> rather
+	 * than per connection: the decoder half of QPACK exists from {@code build()} while the encoder half
+	 * appears only when the peer's SETTINGS arrive, so the peer's decoder stream may legitimately be
+	 * read by the capacity-0 path first and by the dynamic one afterwards — and before that switch the
+	 * capacity-0 path is the correct answer anyway, since nothing has been inserted for the peer to
+	 * acknowledge.
+	 * <p>
+	 * <b>Ownership differs between the two branches.</b> Both readers take {@code buf} on every path,
+	 * a throw included, so nothing here may recycle it; {@link #feedQpackStreamAtCapacityZero} owns and
+	 * recycles it itself.
+	 */
+	private boolean feedQpackStream(ByteBuf buf, boolean encoder) throws Http3Exception {
+		QpackEncoderStreamReader encoderStreamReader = qpackEncoderStreamReader;
+		if (encoder && encoderStreamReader != null) {
+			try {
+				encoderStreamReader.feed(buf);
+			} catch (QpackException e) {
+				// Per-cause scope is already resolved inside QpackException and FR-032 forbids widening it,
+				// so the code travels unchanged rather than being re-derived here.
+				throw new Http3Exception(e.errorCode(), e.reason());
+			}
+			// Before the increment, not after: a resumed section's Section Acknowledgment already tells the
+			// peer's encoder that every insertion up to its Required Insert Count arrived (RFC 9204 §4.4.1),
+			// so acknowledging first leaves flushInsertCountIncrement the smaller remainder to send instead
+			// of counting those insertions twice.
+			resumeBlockedSections();
+			flushInsertCountIncrement();
+			reportQpackDecoderTable();
+			return state != State.CLOSED;
+		}
+		QpackDecoderStreamReader decoderStreamReader = qpackDecoderStreamReader;
+		if (!encoder && decoderStreamReader != null) {
+			try {
+				decoderStreamReader.feed(buf);
+			} catch (QpackException e) {
+				throw new Http3Exception(e.errorCode(), e.reason());
+			}
+			return state != State.CLOSED;
+		}
+		return feedQpackStreamAtCapacityZero(buf, encoder);
+	}
+
+	/**
 	 * Takes ownership of {@code buf}. With a dynamic-table capacity of 0 the peer's encoder stream may
 	 * carry only {@code Set Dynamic Table Capacity 0}, and its decoder stream nothing at all: nothing
 	 * was ever inserted, so there is no section to acknowledge and no insert count to increment
 	 * (FR-018, RFC 9204 §4.2).
+	 * <p>
+	 * Phase 1's body, kept verbatim rather than routed through the dynamic readers, because D-10 and
+	 * SC-011 require capacity-0 behaviour to be phase 1 <i>exactly</i> — down to which instruction is
+	 * refused with which code.
 	 */
-	private boolean feedQpackStream(ByteBuf buf, boolean encoder) throws Http3Exception {
+	private boolean feedQpackStreamAtCapacityZero(ByteBuf buf, boolean encoder) throws Http3Exception {
 		try {
 			while (buf.canRead()) {
 				int instruction = buf.readByte() & 0xFF;
@@ -1089,6 +1644,11 @@ public final class Http3Connection extends AbstractReactive {
 		discard(peerControlStream, errorCode);
 		discard(peerQpackEncoderStream, errorCode);
 		discard(peerQpackDecoderStream, errorCode);
+		localQpackEncoderStream.abort(errorCode);
+		localQpackDecoderStream.abort(errorCode);
+		// Each holds the partial instruction it was part-way through; nothing will ever finish it (DI-1).
+		if (qpackEncoderStreamReader != null) qpackEncoderStreamReader.recycle();
+		if (qpackDecoderStreamReader != null) qpackDecoderStreamReader.recycle();
 		// A copy: aborting fails pending writes, whose continuations routinely close streams.
 		// Through the request stream rather than the QUIC stream, so the message it owns is released with
 		// it (FR-057a) instead of surviving the connection that produced it.
@@ -1096,6 +1656,24 @@ public final class Http3Connection extends AbstractReactive {
 			requestStream.abort(errorCode, "The HTTP/3 connection is closing");
 		}
 		requestStreams.clear();
+		// The third terminal path into the release bookkeeping (research D-3), and the only one that
+		// releases every stream at once. Both directions, and there is no fourth: a section held here goes
+		// back when it decodes (resumeBlockedSections), when its stream is reset (onRequestStreamAborted)
+		// or here — and this is the only one of the three that releases every section at once (FR-035).
+		if (qpackDynamicEncoder != null) qpackDynamicEncoder.releaseAll();
+		blockedSectionTimeout = nullify(blockedSectionTimeout, ScheduledRunnable::cancel);
+		if (blockedSections != null) blockedSections.recycle();
+		if (!blockedSectionWaiters.isEmpty()) {
+			// Over a copy of the keys: failing a waiter re-enters abortWith, which is idempotent and by now
+			// already terminal, but which must not find a waiter this loop has yet to reach — and unblock()
+			// removes as it goes, so a re-entrant path finds nothing rather than a stale entry.
+			List<Long> streamIds = new ArrayList<>(blockedSectionWaiters.keySet());
+			Http3Exception failure = new Http3Exception(errorCode, "The HTTP/3 connection is closing");
+			for (Long streamId : streamIds) {
+				SettablePromise<List<QpackField>> waiter = unblock(streamId, blockedSectionExit);
+				if (waiter != null) waiter.trySetException(failure);
+			}
+		}
 	}
 
 	/** Aborts whichever halves {@code stream} owns; both verbs are idempotent, so a second call is free. */
@@ -1112,6 +1690,178 @@ public final class Http3Connection extends AbstractReactive {
 			(goAwayReceivedId == NO_GOAWAY_ID ? "" : ", goAwayReceived=" + goAwayReceivedId) +
 			(closeException == null ? "" : ", closedWith=0x" + Long.toHexString(closeException.errorCode())) +
 			", requestStreams=" + requestStreams.size() + '}';
+	}
+
+	/**
+	 * One locally-opened QPACK unidirectional stream (RFC 9204 §4.2): its type varint, its preamble,
+	 * and an ordered chain of writes.
+	 * <p>
+	 * <b>The chain is the ordering guarantee.</b> An encoder instruction must reach the peer before the
+	 * field section that references it, and two writes issued in order can only arrive in order if the
+	 * second is queued behind the first's promise. Every write takes ownership of its buffer on every
+	 * path — this stream already aborted included — and a failure resets the chain to a completed
+	 * promise, since one failed write must not strand every later one.
+	 * <p>
+	 * A write failure is a debug line, not an escalation, exactly as the local control stream's is
+	 * ({@link #writeGoAway}): a peer that {@code STOP_SENDING}s a stream this endpoint opened has ended
+	 * this side of it, and there is nothing left to announce on a stream that is gone. The <i>peer's</i>
+	 * QPACK streams stay critical as phase 1 makes them; this is about the two we open.
+	 */
+	private final class LocalQpackStream {
+		private final Http3StreamType type;
+
+		private @Nullable QuicStream stream;
+		private Promise<Void> chain = Promise.complete();
+		private boolean opened;
+		private boolean closed;
+		private long abortCode = Http3Errors.H3_NO_ERROR;
+
+		private LocalQpackStream(Http3StreamType type) {
+			this.type = type;
+		}
+
+		/**
+		 * Opens the stream and writes its RFC 9114 §6.2 type varint followed by {@code preamble}.
+		 * Takes ownership of {@code preamble}, which may be {@code null} for a type varint alone.
+		 */
+		void open(@Nullable ByteBuf preamble) {
+			if (opened || closed) {
+				if (preamble != null) preamble.recycle();
+				return;
+			}
+			opened = true;
+			int preambleLength = preamble == null ? 0 : preamble.readRemaining();
+			ByteBuf buf = ByteBufPool.allocate(QuicVarInts.encodedLength(type.code()) + preambleLength);
+			QuicVarInts.write(buf, type.code());
+			if (preamble != null) {
+				buf.put(preamble);
+				preamble.recycle();
+			}
+			chain = streamManager.openUnidirectional()
+				.then(
+					local -> {
+						if (closed) {
+							buf.recycle();
+							discard(local, abortCode);
+							return Promise.complete();
+						}
+						stream = local;
+						// writer() owns the buffer on every path, this one included.
+						return local.writer().accept(buf);
+					},
+					e -> {
+						// The open failed, so nothing ever took the buffer.
+						buf.recycle();
+						return Promise.<Void>ofException(e);
+					})
+				.then($ -> Promise.complete(), this::logAndContinue);
+		}
+
+		/** Takes ownership of {@code buf} on every path, this stream already aborted included. */
+		void write(ByteBuf buf) {
+			chain = chain
+				.then(
+					$ -> {
+						QuicStream open = stream;
+						if (open == null || closed) {
+							buf.recycle();
+							return Promise.complete();
+						}
+						return open.writer().accept(buf);
+					},
+					e -> {
+						buf.recycle();
+						return Promise.<Void>ofException(e);
+					})
+				.then($ -> Promise.complete(), this::logAndContinue);
+		}
+
+		void abort(long errorCode) {
+			closed = true;
+			abortCode = errorCode;
+			discard(stream, errorCode);
+			stream = null;
+		}
+
+		/** Resets the chain to a completed promise, so one failure cannot strand every later write. */
+		private Promise<Void> logAndContinue(Exception e) {
+			logger.debug("The local {} stream could not be written: {}", type, e.toString());
+			return Promise.complete();
+		}
+	}
+
+	/**
+	 * The per-request-stream {@link QpackEncoder} view, and the one place the FR-017/D-2 ordering
+	 * discipline lives: the instructions a section's encoding produced are drained to the encoder stream
+	 * <b>after</b> the encode that accumulated them and <b>before</b> the section is returned, because
+	 * the caller writes the section the moment it has it.
+	 * <p>
+	 * {@code QpackDynamicEncoder.forStream(id)} is deliberately not used: a plain view cannot express a
+	 * drain that has to interleave between the encode and the return.
+	 * <p>
+	 * The FR-018 counters are read across that same encode and reported <b>after</b> the drain: they
+	 * write nothing to any stream, so nothing in them can reorder what does.
+	 */
+	private final class StreamQpackEncoder implements QpackEncoder {
+		private final long streamId;
+
+		private StreamQpackEncoder(long streamId) {
+			this.streamId = streamId;
+		}
+
+		@Override
+		public ByteBuf encode(List<QpackField> fields) {
+			QpackDynamicEncoder encoder = qpackDynamicEncoder;
+			// qpackEncoder never holds one of these wrappers — it is the static encoder or the dynamic
+			// one — so the delegation cannot recurse.
+			if (encoder == null) return qpackEncoder.encode(fields);
+			// Snapshotted rather than watermarked, the encoder being in hand here: what one encode
+			// contributed to the four cumulative counters is what FR-018 reports (SI-6 — four numbers).
+			long insertions = encoder.insertCount();
+			long evictions = encoder.evictedCount();
+			long fieldLines = encoder.fieldsEncoded();
+			long dynamicReferences = encoder.dynamicReferences();
+			ByteBuf section = encoder.encode(streamId, fields);
+			drainQpackInstructions(encoder);
+			reportQpackTable(QpackTable.ENCODER, encoder.insertCount() - insertions,
+				encoder.evictedCount() - evictions, encoder.tableSize());
+			eventListener.onQpackFieldSectionEncoded(streamId,
+				clampToInt(encoder.fieldsEncoded() - fieldLines),
+				clampToInt(encoder.dynamicReferences() - dynamicReferences));
+			return section;
+		}
+	}
+
+	/**
+	 * The per-request-stream field-section decoder: it decodes as the connection's decoder does, owes the
+	 * peer an acknowledgment for every section that referenced the dynamic table (FR-024), and — this
+	 * being the half a bare {@link QpackDecoder} cannot express — <b>holds</b> a section whose Required
+	 * Insert Count has not arrived rather than failing it (FR-033).
+	 * <p>
+	 * With no dynamic table there is nothing to wait for, so that path delegates to the connection's
+	 * static decoder and completes synchronously: capacity 0 is phase-1 behaviour byte for byte (SC-011).
+	 */
+	private final class StreamQpackDecoder implements Http3FieldSectionDecoder {
+		private final long streamId;
+
+		private StreamQpackDecoder(long streamId) {
+			this.streamId = streamId;
+		}
+
+		@Override
+		public Promise<List<QpackField>> decode(ByteBuf encodedFieldSection) {
+			QpackDynamicDecoder decoder = qpackDynamicDecoder;
+			try {
+				if (decoder == null) return Promise.of(qpackDecoder.decode(encodedFieldSection));
+				SectionResult result = decoder.decodeOrBlock(encodedFieldSection);
+				if (result instanceof Decoded decoded) return Promise.of(onSectionDecoded(streamId, decoded));
+				// Blocked hands the buffer back untouched, so holdBlockedSection is what owns it from here.
+				return holdBlockedSection(streamId, (Blocked) result);
+			} catch (QpackException e) {
+				// Both decoders own and recycle their input on every path, this throw included (DI-1).
+				return Promise.ofException(e);
+			}
+		}
 	}
 
 	/**

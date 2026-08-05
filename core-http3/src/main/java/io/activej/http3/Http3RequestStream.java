@@ -142,6 +142,7 @@ public final class Http3RequestStream extends AbstractReactive {
 	private Http3Settings settings = Http3Settings.create();
 	private QpackEncoder qpackEncoder = new QpackStaticEncoder();
 	private @Nullable QpackDecoder qpackDecoder;
+	private @Nullable Http3FieldSectionDecoder fieldSectionDecoder;
 	private Consumer<Http3Exception> connectionErrorListener = e -> {};
 	private Http3EventListener eventListener = Http3EventListener.NONE;
 
@@ -167,6 +168,12 @@ public final class Http3RequestStream extends AbstractReactive {
 	/** Whether the frame reader stopped inside a frame — what makes an end of input a truncation. */
 	private boolean midFrame;
 	private boolean endOfInput;
+
+	/** The read {@link #watchWhileBlocked()} armed, or {@code null}; never more than one at a time. */
+	private @Nullable Promise<ByteBuf> blockedRead;
+
+	/** That watch reached end of input while a section was still held; {@link #nextFrame()} finishes it. */
+	private boolean blockedEndOfInput;
 
 	private long bodyBytesReceived;
 	private long bodyBytesSent;
@@ -233,6 +240,20 @@ public final class Http3RequestStream extends AbstractReactive {
 		}
 
 		/**
+		 * The seam a connection that can <b>hold</b> a blocked field section uses instead of
+		 * {@link #withQpackDecoder} (US2, FR-033): its promise stays pending while the section waits for
+		 * an insertion the peer's encoder stream has not sent yet.
+		 * <p>
+		 * Package-private, and it supersedes {@link #withQpackDecoder} when both are given — a connection
+		 * with a dynamic table lends both halves of the same decoder, and only this one can wait.
+		 */
+		Builder withQpackFieldSectionDecoder(Http3FieldSectionDecoder fieldSectionDecoder) {
+			checkNotBuilt(this);
+			Http3RequestStream.this.fieldSectionDecoder = fieldSectionDecoder;
+			return this;
+		}
+
+		/**
 		 * Where a violation this stream observes but the <b>connection</b> owns is reported — see
 		 * {@link #isConnectionError}. The listener is invoked after the stream has been aborted with the
 		 * same code, so an owner that closes the connection finds nothing half-done.
@@ -258,6 +279,18 @@ public final class Http3RequestStream extends AbstractReactive {
 		protected Http3RequestStream doBuild() {
 			if (qpackDecoder == null) {
 				qpackDecoder = new QpackStaticDecoder(settings.maxFieldSectionSize());
+			}
+			if (fieldSectionDecoder == null) {
+				// A decoder that cannot wait is one whose answer is always already in hand; it owns and
+				// recycles its input on every path, this throw included, so nothing here recycles after it.
+				QpackDecoder decoder = qpackDecoder;
+				fieldSectionDecoder = section -> {
+					try {
+						return Promise.of(decoder.decode(section));
+					} catch (QpackException e) {
+						return Promise.ofException(e);
+					}
+				};
 			}
 			// Each frame type is bounded by what this endpoint accepts of that type, at the moment its
 			// declared length parses and before a byte of its payload is allocated — the field section to
@@ -402,7 +435,7 @@ public final class Http3RequestStream extends AbstractReactive {
 	 */
 	@FunctionalInterface
 	private interface InboundMessage<T extends HttpMessage> {
-		@Nullable T build(HeadersFrame headers) throws Http3Exception;
+		Promise<T> build(HeadersFrame headers);
 	}
 
 	private <T extends HttpMessage> Promise<T> readHeaders(InboundMessage<T> message, long incompleteErrorCode) {
@@ -420,71 +453,68 @@ public final class Http3RequestStream extends AbstractReactive {
 				return Promise.ofException(abortWith(new Http3Exception(Http3Errors.H3_FRAME_UNEXPECTED,
 					"A frame other than HEADERS opened the message")));
 			}
-			T built;
-			try {
-				built = message.build(headers);
-			} catch (Http3Exception e) {
-				return Promise.ofException(abortWith(e));
-			}
-			if (built == null) {
-				// An informational response: consumed, and the message it precedes is still ahead. Bounded
-				// recursion — buildResponse refuses more than settings.maxInterimResponses() of them, which
-				// is what stops a server from making its 1xx count this thread's stack depth.
-				return readHeaders(message, incompleteErrorCode);
-			}
-			return Promise.of(built);
+			return message.build(headers).then(
+				built -> built == null ?
+					// An informational response: consumed, and the message it precedes is still ahead.
+					// Bounded recursion — buildResponse refuses more than settings.maxInterimResponses() of
+					// them, which is what stops a server from making its 1xx count this thread's stack depth.
+					readHeaders(message, incompleteErrorCode) :
+					Promise.of(built),
+				e -> Promise.ofException(abortWith(e)));
 		});
 	}
 
 	/** Takes ownership of {@code headers} on every path. */
-	private HttpRequest buildRequest(HeadersFrame headers) throws Http3Exception {
-		List<Field> fields = decodeFieldSection(headers);
-		HttpRequest.Builder builder = Http3Headers.toRequestBuilder(fields);
+	private Promise<HttpRequest> buildRequest(HeadersFrame headers) {
+		return decodeFieldSection(headers).map(fields -> {
+			HttpRequest.Builder builder = Http3Headers.toRequestBuilder(fields);
 
-		bodySupplier = new InboundBodySupplier();
-		builder.withBodyStream(bodySupplier);
-		builder.withMaxBodySize((int) Math.min(Integer.MAX_VALUE, settings.maxBodySize()));
-		// Assigned before the last validation step, so that a rejection releases the message through the
-		// one path that owns it rather than through a second, parallel one.
-		HttpRequest request = builder.build();
-		inboundMessage = request;
-		readDeclaredContentLength(request);
-		state = State.HEADERS_DONE;
-		return request;
+			bodySupplier = new InboundBodySupplier();
+			builder.withBodyStream(bodySupplier);
+			builder.withMaxBodySize((int) Math.min(Integer.MAX_VALUE, settings.maxBodySize()));
+			// Assigned before the last validation step, so that a rejection releases the message through the
+			// one path that owns it rather than through a second, parallel one.
+			HttpRequest request = builder.build();
+			inboundMessage = request;
+			readDeclaredContentLength(request);
+			state = State.HEADERS_DONE;
+			return request;
+		});
 	}
 
 	/**
 	 * Takes ownership of {@code headers} on every path.
 	 *
-	 * @return {@code null} for an informational ({@code 1xx}) response, which RFC 9114 §4.1 has the
-	 * client consume before reading on for the final one — see {@link InboundMessage#build}
+	 * @return a promise of {@code null} for an informational ({@code 1xx}) response, which RFC 9114 §4.1
+	 * has the client consume before reading on for the final one — see {@link InboundMessage#build}
 	 */
-	private @Nullable HttpResponse buildResponse(HeadersFrame headers) throws Http3Exception {
-		List<Field> fields = decodeFieldSection(headers);
-		if (Http3Headers.isInformationalStatus(fields)) {
-			Http3Headers.validateInterimResponse(fields);
-			if (++interimResponsesReceived > settings.maxInterimResponses()) {
-				throw new Http3Exception(Http3Errors.H3_EXCESSIVE_LOAD,
-					"More than " + settings.maxInterimResponses() + " informational responses on one exchange");
+	private Promise<HttpResponse> buildResponse(HeadersFrame headers) {
+		return decodeFieldSection(headers).map(fields -> {
+			if (Http3Headers.isInformationalStatus(fields)) {
+				Http3Headers.validateInterimResponse(fields);
+				if (++interimResponsesReceived > settings.maxInterimResponses()) {
+					throw new Http3Exception(Http3Errors.H3_EXCESSIVE_LOAD,
+						"More than " + settings.maxInterimResponses() + " informational responses on one exchange");
+				}
+				// The grammar has to be told, because it only ever sees a frame type: this HEADERS opened
+				// nothing, and the next one is the message rather than its trailer section.
+				inbound.withdrawInformationalHeaders();
+				return null;
 			}
-			// The grammar has to be told, because it only ever sees a frame type: this HEADERS opened
-			// nothing, and the next one is the message rather than its trailer section.
-			inbound.withdrawInformationalHeaders();
-			return null;
-		}
-		HttpResponse.Builder builder = Http3Headers.toResponseBuilder(fields);
+			HttpResponse.Builder builder = Http3Headers.toResponseBuilder(fields);
 
-		bodySupplier = new InboundBodySupplier();
-		// Only a client receives a response, so this is the client-facing body channel by construction —
-		// no role flag is needed to know that its failures are the ones FR-047 speaks about.
-		inboundFailureMapper = Http3RequestStream::clientVisible;
-		builder.withBodyStream(bodySupplier);
-		builder.withMaxBodySize((int) Math.min(Integer.MAX_VALUE, settings.maxBodySize()));
-		HttpResponse response = builder.build();
-		inboundMessage = response;
-		readDeclaredContentLength(response);
-		state = State.HEADERS_DONE;
-		return response;
+			bodySupplier = new InboundBodySupplier();
+			// Only a client receives a response, so this is the client-facing body channel by construction —
+			// no role flag is needed to know that its failures are the ones FR-047 speaks about.
+			inboundFailureMapper = Http3RequestStream::clientVisible;
+			builder.withBodyStream(bodySupplier);
+			builder.withMaxBodySize((int) Math.min(Integer.MAX_VALUE, settings.maxBodySize()));
+			HttpResponse response = builder.build();
+			inboundMessage = response;
+			readDeclaredContentLength(response);
+			state = State.HEADERS_DONE;
+			return response;
+		});
 	}
 
 	/** FR-039: what the message says its body will weigh, reconciled against the DATA at end of input. */
@@ -504,26 +534,77 @@ public final class Http3RequestStream extends AbstractReactive {
 	/**
 	 * Bounds the encoded field section before decoding it (FR-030), then hands the payload to the QPACK
 	 * decoder, <b>which owns and recycles it on every path</b>.
+	 * <p>
+	 * The pre-decode bound is what keeps {@code QpackBlockedSections}' derived byte bound
+	 * ({@code blocked streams × maxFieldSectionSize}) sound: no section reaches the decoder — and so
+	 * none is ever held — above the size that product is computed from.
+	 * <p>
+	 * The promise stays <b>pending</b> while the connection holds the section on an insertion the peer's
+	 * encoder stream has not sent yet (FR-033). This stream issues no second decode in the meantime and
+	 * does not even read the frame behind it, which is the structural half of FR-037's per-stream arrival
+	 * order; {@code QpackBlockedSections.release} draining each stream from its head is the other.
 	 */
-	private List<Field> decodeFieldSection(HeadersFrame headers) throws Http3Exception {
+	private Promise<List<Field>> decodeFieldSection(HeadersFrame headers) {
 		int encodedLength = headers.fieldSection.readRemaining();
 		if (encodedLength > settings.maxFieldSectionSize()) {
 			headers.recycle();
-			throw new Http3Exception(Http3Errors.H3_EXCESSIVE_LOAD,
+			return Promise.ofException(new Http3Exception(Http3Errors.H3_EXCESSIVE_LOAD,
 				"A field section of " + encodedLength + " bytes exceeds the " +
-				settings.maxFieldSectionSize() + "-byte bound");
+				settings.maxFieldSectionSize() + "-byte bound"));
 		}
-		try {
-			return Http3Headers.fromQpack(qpackDecoder.decode(headers.fieldSection));
-		} catch (QpackException e) {
-			// The QPACK codes are a space of their own (RFC 9204 §6); the code it chose is the code the
-			// abort carries. The *scope*, however, does not follow from the code — RFC 9204 assigns it
-			// per cause while every cause shares QPACK_DECOMPRESSION_FAILED — so the decoder's verdict
-			// is carried across rather than re-derived here.
-			throw e.isConnectionError() ?
-				Http3Exception.connectionScoped(e.errorCode(), e.getMessage()) :
-				new Http3Exception(e.errorCode(), e.getMessage());
-		}
+		Promise<List<Field>> decoded = fieldSectionDecoder.decode(headers.fieldSection)
+			.mapException(Http3RequestStream::qpackFailure)
+			.map(Http3Headers::fromQpack);
+		if (!decoded.isComplete()) watchWhileBlocked();
+		return decoded;
+	}
+
+	/**
+	 * The QPACK codes are a space of their own (RFC 9204 §6); the code the decoder chose is the code the
+	 * abort carries. The <i>scope</i>, however, does not follow from the code — RFC 9204 assigns it per
+	 * cause while every cause shares {@code QPACK_DECOMPRESSION_FAILED} — so the decoder's verdict is
+	 * carried across rather than re-derived here.
+	 */
+	private static Exception qpackFailure(Exception e) {
+		if (!(e instanceof QpackException qpack)) return e;
+		return qpack.isConnectionError() ?
+			Http3Exception.connectionScoped(qpack.errorCode(), qpack.getMessage()) :
+			new Http3Exception(qpack.errorCode(), qpack.getMessage());
+	}
+
+	/**
+	 * Arms the one read that exists while a field section of this stream is held (FR-025).
+	 * <p>
+	 * With no frame being read there is nothing else here to observe a peer's {@code RESET_STREAM}: the
+	 * QUIC receive half fails a <i>parked</i> read and closes nothing when none is parked, so a stream
+	 * abandoned while blocked would wait out the blocked-section timeout and take the whole connection
+	 * with it. Exactly one read is armed and whatever it yields is parked in {@link #pendingInput} — a
+	 * one-slice watch rather than a read-ahead, since reading on would refresh the stream's flow-control
+	 * window and let a peer buffer a body's worth here behind a section it never unblocks.
+	 */
+	private void watchWhileBlocked() {
+		if (blockedRead != null || pendingInput != null || endOfInput || blockedEndOfInput) return;
+		if (state == State.RESET || state == State.COMPLETE) return;
+		Promise<ByteBuf> armed = reader().get();
+		blockedRead = armed;
+		armed.whenComplete((buf, e) -> {
+			blockedRead = null;
+			if (e != null) {
+				onReadFailure(e);
+				return;
+			}
+			if (buf == null) {
+				// Not endOfInput itself: onEndOfInput() reconciles Content-Length and finishes the receive
+				// direction, and neither may happen while the message this stream carries is still blocked.
+				blockedEndOfInput = true;
+				return;
+			}
+			if (state == State.RESET) {
+				buf.recycle();
+				return;
+			}
+			pendingInput = buf;
+		});
 	}
 
 	// ---------------------------------------------------------------- sending a message
@@ -661,6 +742,18 @@ public final class Http3RequestStream extends AbstractReactive {
 				return Promise.of(frame);
 			}
 			if (endOfInput) return Promise.of(null);
+			Promise<ByteBuf> armed = blockedRead;
+			if (armed != null) {
+				// A section unblocked while the watch read was still in flight. Two concurrent get()s on one
+				// CSP supplier would overwrite each other's parked read, so this one waits for that one.
+				return armed.then(
+					$ -> nextFrame(),
+					e -> Promise.ofException(terminalException != null ? terminalException : e));
+			}
+			if (blockedEndOfInput) {
+				blockedEndOfInput = false;
+				return onEndOfInput();
+			}
 
 			Promise<ByteBuf> next = reader().get();
 			if (next.isResult()) {
@@ -759,17 +852,20 @@ public final class Http3RequestStream extends AbstractReactive {
 				return Promise.of(data.data);
 			}
 			if (frame instanceof HeadersFrame trailers) {
-				try {
-					List<Field> fields = decodeFieldSection(trailers);
-					Http3Headers.validateTrailers(fields);
-					if (inboundMessage != null) Http3Trailers.set(inboundMessage, fields);
-				} catch (Http3Exception e) {
-					return Promise.ofException(abortWith(e));
-				}
-				state = State.TRAILERS_DONE;
-				// Depth 1, not a peer-driven loop: the sequence validator refuses a third HEADERS, so the
-				// next frame this reads can only be DATA (refused after trailers) or end of input.
-				return readBody();
+				return decodeFieldSection(trailers).then(
+					fields -> {
+						try {
+							Http3Headers.validateTrailers(fields);
+							if (inboundMessage != null) Http3Trailers.set(inboundMessage, fields);
+						} catch (Http3Exception e) {
+							return Promise.ofException(abortWith(e));
+						}
+						state = State.TRAILERS_DONE;
+						// Depth 1, not a peer-driven loop: the sequence validator refuses a third HEADERS, so
+						// the next frame this reads can only be DATA (refused after trailers) or end of input.
+						return readBody();
+					},
+					e -> Promise.ofException(abortWith(e)));
 			}
 			// Unreachable: nextFrame() discards unknown and GREASE types itself, and the sequence validator
 			// refuses every other type on a request stream. Stated rather than skipped, for the reason

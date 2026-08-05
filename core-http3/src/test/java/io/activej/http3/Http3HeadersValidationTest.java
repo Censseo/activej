@@ -333,11 +333,11 @@ public class Http3HeadersValidationTest {
 	 */
 	@Test
 	public void qpackDecodedUppercaseFieldNameIsRejected() {
-		// Encoded by this module's own encoder: "x-custom-name" is in neither the QPACK static table nor
-		// core-http's registry, so it goes on the wire as a Literal Field Line with Literal Name, spelled
-		// exactly as given.
-		Http3Exception e = assertThrows(Http3Exception.class, () -> fromQpack(
-			new QpackField(HttpHeaders.of("X-Custom-Name"), encodeAscii("value"))));
+		// Hand-built rather than encoded: QpackStaticEncoder now lowercases every literal name it writes
+		// (RFC 9114 §4.1.1, QpackField.lowercaseNameBytes), so this module can no longer produce the bytes
+		// under test. A peer is under no such obligation, which is why the receive side still checks.
+		Http3Exception e = assertThrows(Http3Exception.class,
+			() -> fromWire(literalFieldSection("X-Note", "value")));
 		assertEquals(Http3Errors.H3_MESSAGE_ERROR, e.errorCode());
 	}
 

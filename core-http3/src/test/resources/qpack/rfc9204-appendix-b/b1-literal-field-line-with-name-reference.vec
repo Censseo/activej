@@ -1,0 +1,51 @@
+# RFC 9204 Appendix B.1 -- Literal Field Line with Name Reference
+#
+# "The encoder sends an encoded field section containing a literal representation
+#  of a field with a static name reference."
+#
+# Transcribed byte-for-byte from https://www.rfc-editor.org/rfc/rfc9204.txt (2026-08-04).
+# See ./README.md for the file format.
+
+name: B.1
+title: Literal Field Line with Name Reference
+rfc: RFC 9204 Appendix B.1
+continues-from: none
+stream: 0
+
+# SETTINGS_QPACK_MAX_TABLE_CAPACITY this endpoint advertises. 220 is the value the
+# whole B.1..B.5 series needs (B.2 sets the capacity to exactly 220); B.1 on its own
+# would decode with 0, which is why table-capacity-before/after are both 0 here --
+# this example predates the Set Dynamic Table Capacity instruction.
+max-table-capacity: 220
+table-capacity-before: 0
+table-capacity-after: 0
+max-entries: 6
+blocked-streams: 0
+delivery-order: field-section
+
+[encoder-stream]
+# empty -- no dynamic table instruction has been sent yet
+
+[field-section]
+# Required Insert Count = 0, Base = 0
+00 00
+# Literal Field Line with Name Reference, Static Table, Index=1 (:path)
+# 0x51 = 0101_0001 -> pattern 01, N=0, T=1 (static), 4-bit prefix index = 1
+# 0x0b = H=0, value length 11
+51 0b
+# "/index.html"
+2f 69 6e 64 65 78 2e 68 74 6d 6c
+
+[expected-fields]
+:path: /index.html
+
+[decoder-stream]
+# empty -- the RFC shows no acknowledgment for this section
+
+[expected-table]
+# empty
+
+[expected-state]
+insert-count: 0
+known-received-count: 0
+size: 0

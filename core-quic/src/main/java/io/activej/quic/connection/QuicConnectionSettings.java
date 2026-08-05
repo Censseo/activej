@@ -46,11 +46,20 @@ import java.time.Duration;
  * parameters, so raising one hands a remote peer more room. The three stream bounds that stay local —
  * {@code maxOutstandingStreamBytes}, {@code maxReceiveRangesPerStream}, {@code maxPendingStreamOpens} —
  * never appear on the wire.
+ * <p>
+ * The eight session-resumption bounds are local state in the same sense: RFC 8446 §4.6.1 puts a
+ * ticket's lifetime, the keys that seal it and the registers that bound it nowhere on the wire.
+ * {@code maxDatagramFrameSize} is the one limit here destined to leave the process, as the RFC 9221 §3
+ * {@code max_datagram_frame_size} transport parameter; it defaults to {@code 0}, "DATAGRAM not
+ * supported", and nothing encodes it yet — a value set here advertises nothing until the datagram
+ * layer is wired behind it.
  *
  * @see <a href="https://www.rfc-editor.org/rfc/rfc9000#section-14">RFC 9000 §14 — Datagram Size</a>
  * @see <a href="https://www.rfc-editor.org/rfc/rfc9000#section-10.1">RFC 9000 §10.1 — Idle Timeout</a>
  * @see <a href="https://www.rfc-editor.org/rfc/rfc9002#section-7.2">RFC 9002 §7.2 — Initial and Minimum Congestion Window</a>
  * @see <a href="https://www.rfc-editor.org/rfc/rfc9000#section-18.2">RFC 9000 §18.2 — Transport Parameter Definitions</a>
+ * @see <a href="https://www.rfc-editor.org/rfc/rfc8446#section-4.6.1">RFC 8446 §4.6.1 — New Session Ticket Message</a>
+ * @see <a href="https://www.rfc-editor.org/rfc/rfc9221#section-3">RFC 9221 §3 — max_datagram_frame_size</a>
  */
 public final class QuicConnectionSettings {
 	/**
@@ -69,6 +78,15 @@ public final class QuicConnectionSettings {
 	 * package validates the value it advertises, the stream layer validates the peer's.
 	 */
 	private static final long MAX_STREAM_COUNT = 1L << 60;
+
+	/**
+	 * A 1-RTT packet's cost beyond its frames, at its widest (RFC 9000 §17.3): the first byte, a 20-byte
+	 * destination connection ID, a four-byte packet number and the AEAD tag. The <b>worst</b> case rather
+	 * than any particular connection's actual overhead. Duplicated from {@code stream.QuicStreamManager}
+	 * rather than shared, because {@code connection} must not depend on {@code stream} (ADR-016) — the
+	 * same reason {@link #MAX_STREAM_COUNT} is duplicated above.
+	 */
+	private static final int MAX_SHORT_HEADER_PACKET_OVERHEAD = 1 + 20 + 4 + 16;
 
 	public static final MemSize DEFAULT_MAX_DATAGRAM_SIZE =
 		ApplicationSettings.getMemSize(QuicConnection.class, "maxDatagramSize", MemSize.bytes(1350));
@@ -115,6 +133,32 @@ public final class QuicConnectionSettings {
 	public static final int DEFAULT_MAX_PENDING_STREAM_OPENS =
 		ApplicationSettings.getInt(QuicConnection.class, "maxPendingStreamOpens", 128);
 
+	// Eight session-resumption bounds (RFC 8446 §4.6.1). Every one is local state — a ticket's lifetime,
+	// the keys that seal it and the registers that bound it are never on the wire.
+	public static final Duration DEFAULT_SESSION_TICKET_LIFETIME =
+		ApplicationSettings.getDuration(QuicConnection.class, "sessionTicketLifetime", Duration.ofHours(1));
+	public static final Duration DEFAULT_SESSION_TICKET_KEY_ROTATION =
+		ApplicationSettings.getDuration(QuicConnection.class, "sessionTicketKeyRotation", Duration.ofHours(6));
+	public static final int DEFAULT_SESSION_TICKETS_PER_HANDSHAKE =
+		ApplicationSettings.getInt(QuicConnection.class, "sessionTicketsPerHandshake", 2);
+	public static final int DEFAULT_MAX_SESSION_TICKETS =
+		ApplicationSettings.getInt(QuicConnection.class, "maxSessionTickets", 256);
+	public static final int DEFAULT_MAX_EARLY_DATA_REPLAY_RECORDS =
+		ApplicationSettings.getInt(QuicConnection.class, "maxEarlyDataReplayRecords", 65536);
+	public static final Duration DEFAULT_TICKET_AGE_TOLERANCE =
+		ApplicationSettings.getDuration(QuicConnection.class, "ticketAgeTolerance", Duration.ofSeconds(10));
+	public static final MemSize DEFAULT_MAX_SESSION_TICKET_SIZE =
+		ApplicationSettings.getMemSize(QuicConnection.class, "maxSessionTicketSize", MemSize.kilobytes(8));
+	public static final int DEFAULT_MAX_SESSION_TICKETS_PER_CONNECTION =
+		ApplicationSettings.getInt(QuicConnection.class, "maxSessionTicketsPerConnection", 8);
+
+	// Two unreliable-datagram bounds (RFC 9221 §3). A maxDatagramFrameSize of 0 means "DATAGRAM not
+	// supported", which is the default: max_datagram_frame_size is then not advertised at all.
+	public static final MemSize DEFAULT_MAX_DATAGRAM_FRAME_SIZE =
+		ApplicationSettings.getMemSize(QuicConnection.class, "maxDatagramFrameSize", MemSize.ZERO);
+	public static final int DEFAULT_MAX_OUTBOUND_DATAGRAMS =
+		ApplicationSettings.getInt(QuicConnection.class, "maxOutboundDatagrams", 64);
+
 	private final int maxDatagramSize;
 	private final long maxIdleTimeoutMillis;
 	private final long handshakeTimeoutMillis;
@@ -134,6 +178,16 @@ public final class QuicConnectionSettings {
 	private final long maxOutstandingStreamBytes;
 	private final int maxReceiveRangesPerStream;
 	private final int maxPendingStreamOpens;
+	private final long sessionTicketLifetimeMillis;
+	private final long sessionTicketKeyRotationMillis;
+	private final int sessionTicketsPerHandshake;
+	private final int maxSessionTickets;
+	private final int maxEarlyDataReplayRecords;
+	private final long ticketAgeToleranceMillis;
+	private final long maxSessionTicketSize;
+	private final int maxSessionTicketsPerConnection;
+	private final long maxDatagramFrameSize;
+	private final int maxOutboundDatagrams;
 
 	private QuicConnectionSettings(
 		int maxDatagramSize, long maxIdleTimeoutMillis, long handshakeTimeoutMillis, int maxAckRanges,
@@ -141,7 +195,11 @@ public final class QuicConnectionSettings {
 		int maxBufferedDatagramsAwaitingKeys, int connectionIdLength, @Nullable Long keepAliveIntervalMillis,
 		long initialMaxData, long initialMaxStreamDataBidiLocal, long initialMaxStreamDataBidiRemote,
 		long initialMaxStreamDataUni, long initialMaxStreamsBidi, long initialMaxStreamsUni,
-		long maxOutstandingStreamBytes, int maxReceiveRangesPerStream, int maxPendingStreamOpens
+		long maxOutstandingStreamBytes, int maxReceiveRangesPerStream, int maxPendingStreamOpens,
+		long sessionTicketLifetimeMillis, long sessionTicketKeyRotationMillis, int sessionTicketsPerHandshake,
+		int maxSessionTickets, int maxEarlyDataReplayRecords, long ticketAgeToleranceMillis,
+		long maxSessionTicketSize, int maxSessionTicketsPerConnection, long maxDatagramFrameSize,
+		int maxOutboundDatagrams
 	) {
 		this.maxDatagramSize = maxDatagramSize;
 		this.maxIdleTimeoutMillis = maxIdleTimeoutMillis;
@@ -162,6 +220,16 @@ public final class QuicConnectionSettings {
 		this.maxOutstandingStreamBytes = maxOutstandingStreamBytes;
 		this.maxReceiveRangesPerStream = maxReceiveRangesPerStream;
 		this.maxPendingStreamOpens = maxPendingStreamOpens;
+		this.sessionTicketLifetimeMillis = sessionTicketLifetimeMillis;
+		this.sessionTicketKeyRotationMillis = sessionTicketKeyRotationMillis;
+		this.sessionTicketsPerHandshake = sessionTicketsPerHandshake;
+		this.maxSessionTickets = maxSessionTickets;
+		this.maxEarlyDataReplayRecords = maxEarlyDataReplayRecords;
+		this.ticketAgeToleranceMillis = ticketAgeToleranceMillis;
+		this.maxSessionTicketSize = maxSessionTicketSize;
+		this.maxSessionTicketsPerConnection = maxSessionTicketsPerConnection;
+		this.maxDatagramFrameSize = maxDatagramFrameSize;
+		this.maxOutboundDatagrams = maxOutboundDatagrams;
 	}
 
 	public static QuicConnectionSettings create() {
@@ -178,6 +246,25 @@ public final class QuicConnectionSettings {
 	 */
 	public static long initialCongestionWindowFor(int maxDatagramSize) {
 		return Math.min(10L * maxDatagramSize, Math.max(14720L, 2L * maxDatagramSize));
+	}
+
+	/**
+	 * The largest DATAGRAM frame that still fits one packet at {@code maxDatagramSize} (RFC 9221 §3) —
+	 * what {@code max_datagram_frame_size} should be set to when a consumer enables datagrams without
+	 * naming a size (FR-089).
+	 * <p>
+	 * RFC 9221 §3 measures the parameter over the <b>whole frame</b> — the type byte, the optional
+	 * length field and the payload — so the derivation is the datagram allowance minus what a 1-RTT
+	 * packet costs around its frames. That cost is taken at its widest, for the same reason the stream
+	 * layer takes it that way: advertising a frame size a real packet cannot carry turns into a send
+	 * refused at run time, whereas under-advertising costs a few bytes per datagram.
+	 * <p>
+	 * Floored at {@code 0}, which is the RFC 9221 §3 encoding of "DATAGRAM not supported".
+	 *
+	 * @see <a href="https://www.rfc-editor.org/rfc/rfc9221#section-3">RFC 9221 §3 — max_datagram_frame_size</a>
+	 */
+	public static long maxDatagramFrameSizeFor(int maxDatagramSize) {
+		return Math.max(0L, (long) maxDatagramSize - MAX_SHORT_HEADER_PACKET_OVERHEAD);
 	}
 
 	public static final class Builder extends AbstractBuilder<Builder, QuicConnectionSettings> {
@@ -202,6 +289,16 @@ public final class QuicConnectionSettings {
 		private long maxOutstandingStreamBytes = DEFAULT_MAX_OUTSTANDING_STREAM_BYTES.toLong();
 		private int maxReceiveRangesPerStream = DEFAULT_MAX_RECEIVE_RANGES_PER_STREAM;
 		private int maxPendingStreamOpens = DEFAULT_MAX_PENDING_STREAM_OPENS;
+		private long sessionTicketLifetimeMillis = DEFAULT_SESSION_TICKET_LIFETIME.toMillis();
+		private long sessionTicketKeyRotationMillis = DEFAULT_SESSION_TICKET_KEY_ROTATION.toMillis();
+		private int sessionTicketsPerHandshake = DEFAULT_SESSION_TICKETS_PER_HANDSHAKE;
+		private int maxSessionTickets = DEFAULT_MAX_SESSION_TICKETS;
+		private int maxEarlyDataReplayRecords = DEFAULT_MAX_EARLY_DATA_REPLAY_RECORDS;
+		private long ticketAgeToleranceMillis = DEFAULT_TICKET_AGE_TOLERANCE.toMillis();
+		private long maxSessionTicketSize = DEFAULT_MAX_SESSION_TICKET_SIZE.toLong();
+		private int maxSessionTicketsPerConnection = DEFAULT_MAX_SESSION_TICKETS_PER_CONNECTION;
+		private long maxDatagramFrameSize = DEFAULT_MAX_DATAGRAM_FRAME_SIZE.toLong();
+		private int maxOutboundDatagrams = DEFAULT_MAX_OUTBOUND_DATAGRAMS;
 
 		private Builder() {}
 
@@ -338,6 +435,91 @@ public final class QuicConnectionSettings {
 			return this;
 		}
 
+		/**
+		 * Local only: how long a session ticket this endpoint issues stays usable for resumption
+		 * (RFC 8446 §4.6.1, which caps it at 7 days). Bounds the replay window a ticket opens.
+		 */
+		public Builder withSessionTicketLifetime(Duration sessionTicketLifetime) {
+			checkNotBuilt(this);
+			this.sessionTicketLifetimeMillis = sessionTicketLifetime.toMillis();
+			return this;
+		}
+
+		/**
+		 * Local only: how often the key sealing issued tickets (RFC 8446 §4.6.1) is replaced. Two keys are
+		 * retained, so this must be at least half of {@code sessionTicketLifetime} — see the
+		 * {@link #doBuild()} check.
+		 */
+		public Builder withSessionTicketKeyRotation(Duration sessionTicketKeyRotation) {
+			checkNotBuilt(this);
+			this.sessionTicketKeyRotationMillis = sessionTicketKeyRotation.toMillis();
+			return this;
+		}
+
+		/** Local only: how many NewSessionTicket messages this endpoint issues per handshake (RFC 8446 §4.6.1); 0 issues none. */
+		public Builder withSessionTicketsPerHandshake(int sessionTicketsPerHandshake) {
+			checkNotBuilt(this);
+			this.sessionTicketsPerHandshake = sessionTicketsPerHandshake;
+			return this;
+		}
+
+		/** Local only: the entries this endpoint's client-side ticket cache holds before evicting the least recently used (RFC 8446 §4.6.1). */
+		public Builder withMaxSessionTickets(int maxSessionTickets) {
+			checkNotBuilt(this);
+			this.maxSessionTickets = maxSessionTickets;
+			return this;
+		}
+
+		/**
+		 * Local only: the entries the single-use register guarding early-data replay holds (RFC 8446 §8).
+		 * An evicted record is treated as <i>used</i>, so the bound refuses early data rather than admitting a replay.
+		 */
+		public Builder withMaxEarlyDataReplayRecords(int maxEarlyDataReplayRecords) {
+			checkNotBuilt(this);
+			this.maxEarlyDataReplayRecords = maxEarlyDataReplayRecords;
+			return this;
+		}
+
+		/** Local only: the clock-skew allowance on the obfuscated ticket-age check (RFC 8446 §4.2.10); 0 allows none. */
+		public Builder withTicketAgeTolerance(Duration ticketAgeTolerance) {
+			checkNotBuilt(this);
+			this.ticketAgeToleranceMillis = ticketAgeTolerance.toMillis();
+			return this;
+		}
+
+		/** Local only: the bound on one sealed session ticket (RFC 8446 §4.6.1), checked before anything is allocated for it. */
+		public Builder withMaxSessionTicketSize(MemSize maxSessionTicketSize) {
+			checkNotBuilt(this);
+			this.maxSessionTicketSize = maxSessionTicketSize.toLong();
+			return this;
+		}
+
+		/** Local only: the post-handshake NewSessionTicket messages one connection may deliver before it is a protocol error (RFC 8446 §4.6.1). */
+		public Builder withMaxSessionTicketsPerConnection(int maxSessionTicketsPerConnection) {
+			checkNotBuilt(this);
+			this.maxSessionTicketsPerConnection = maxSessionTicketsPerConnection;
+			return this;
+		}
+
+		/**
+		 * The largest DATAGRAM frame this endpoint is willing to receive, advertised as
+		 * {@code max_datagram_frame_size} (RFC 9221 §3). 0 — the default — means DATAGRAM is not supported
+		 * and the parameter is not advertised at all. {@link #maxDatagramFrameSizeFor(int)} derives the
+		 * largest value that still fits one packet.
+		 */
+		public Builder withMaxDatagramFrameSize(MemSize maxDatagramFrameSize) {
+			checkNotBuilt(this);
+			this.maxDatagramFrameSize = maxDatagramFrameSize.toLong();
+			return this;
+		}
+
+		/** Local only: the outbound datagrams that may await a packet before a send is refused rather than queued (RFC 9221 §5). */
+		public Builder withMaxOutboundDatagrams(int maxOutboundDatagrams) {
+			checkNotBuilt(this);
+			this.maxOutboundDatagrams = maxOutboundDatagrams;
+			return this;
+		}
+
 		@Override
 		protected QuicConnectionSettings doBuild() {
 			if (maxDatagramSize < MIN_MAX_DATAGRAM_SIZE || maxDatagramSize > MAX_MAX_DATAGRAM_SIZE) {
@@ -435,13 +617,76 @@ public final class QuicConnectionSettings {
 					(2L * maxDatagramSize) + "), the RFC 9002 §7.2 minimum window");
 			}
 
+			if (sessionTicketLifetimeMillis <= 0) {
+				throw new IllegalArgumentException(
+					"sessionTicketLifetime (" + sessionTicketLifetimeMillis + " ms) must be positive");
+			}
+			if (sessionTicketKeyRotationMillis <= 0) {
+				throw new IllegalArgumentException(
+					"sessionTicketKeyRotation (" + sessionTicketKeyRotationMillis + " ms) must be positive");
+			}
+			if (ticketAgeToleranceMillis < 0) {
+				throw new IllegalArgumentException("ticketAgeTolerance (" + ticketAgeToleranceMillis +
+					" ms) must not be negative; 0 allows no clock skew (RFC 8446 §4.2.10)");
+			}
+			if (sessionTicketsPerHandshake < 0) {
+				throw new IllegalArgumentException("sessionTicketsPerHandshake (" + sessionTicketsPerHandshake +
+					") must not be negative; 0 issues no ticket (RFC 8446 §4.6.1)");
+			}
+			if (maxSessionTickets < 0) {
+				throw new IllegalArgumentException("maxSessionTickets (" + maxSessionTickets +
+					") must not be negative; 0 caches none");
+			}
+			if (maxEarlyDataReplayRecords < 1) {
+				throw new IllegalArgumentException("maxEarlyDataReplayRecords (" + maxEarlyDataReplayRecords +
+					") must be at least 1 — the register fails closed, so an empty one refuses every early-data " +
+					"attempt rather than admitting one");
+			}
+			if (maxSessionTicketsPerConnection < 0) {
+				throw new IllegalArgumentException(
+					"maxSessionTicketsPerConnection (" + maxSessionTicketsPerConnection + ") must not be negative");
+			}
+			// A peer-declared ticket length is checked against this before anything is allocated for it (SI-4),
+			// and that check is against an int, so a bound above Integer.MAX_VALUE could never be reached.
+			if (maxSessionTicketSize < 1 || maxSessionTicketSize > Integer.MAX_VALUE) {
+				throw new IllegalArgumentException(
+					"maxSessionTicketSize (" + maxSessionTicketSize + ") must be between 1 and " +
+					Integer.MAX_VALUE + " bytes");
+			}
+			// Two keys are retained across one rotation, which is what keeps a ticket sealed under the
+			// previous key openable (data-model.md §2, QuicTicketKeys). Rotating faster than half the
+			// lifetime therefore strands live tickets under a key that no longer exists, and each of them
+			// silently degrades to a full handshake — refused here rather than warned about, like the other
+			// configurations in this class that cannot work. The subtraction, rather than 2 × rotation,
+			// keeps the comparison from overflowing on an absurd Duration.
+			if (sessionTicketKeyRotationMillis < sessionTicketLifetimeMillis - sessionTicketKeyRotationMillis) {
+				throw new IllegalArgumentException(
+					"sessionTicketKeyRotation (" + sessionTicketKeyRotationMillis + " ms) must be at least half " +
+					"of sessionTicketLifetime (" + sessionTicketLifetimeMillis + " ms), i.e. " +
+					((sessionTicketLifetimeMillis + 1) / 2) + " ms, or a ticket outlives the two keys retained " +
+					"across one rotation and can no longer be opened by the endpoint that issued it");
+			}
+
+			if (maxDatagramFrameSize < 0 || maxDatagramFrameSize > MAX_MAX_DATAGRAM_SIZE) {
+				throw new IllegalArgumentException(
+					"maxDatagramFrameSize (" + maxDatagramFrameSize + ") must be between 0 and " +
+					MAX_MAX_DATAGRAM_SIZE + " bytes; 0 means DATAGRAM is not supported (RFC 9221 §3)");
+			}
+			if (maxOutboundDatagrams < 0) {
+				throw new IllegalArgumentException(
+					"maxOutboundDatagrams (" + maxOutboundDatagrams + ") must not be negative");
+			}
+
 			return new QuicConnectionSettings(
 				maxDatagramSize, maxIdleTimeoutMillis, handshakeTimeoutMillis, maxAckRanges,
 				maxCryptoBufferBytes, maxSendQueueBytes, cwnd, maxBufferedDatagramsAwaitingKeys,
 				connectionIdLength, keepAliveIntervalMillis, initialMaxData, initialMaxStreamDataBidiLocal,
 				initialMaxStreamDataBidiRemote, initialMaxStreamDataUni, initialMaxStreamsBidi,
 				initialMaxStreamsUni, maxOutstandingStreamBytes, maxReceiveRangesPerStream,
-				maxPendingStreamOpens);
+				maxPendingStreamOpens, sessionTicketLifetimeMillis, sessionTicketKeyRotationMillis,
+				sessionTicketsPerHandshake, maxSessionTickets, maxEarlyDataReplayRecords,
+				ticketAgeToleranceMillis, maxSessionTicketSize, maxSessionTicketsPerConnection,
+				maxDatagramFrameSize, maxOutboundDatagrams);
 		}
 	}
 
@@ -535,6 +780,59 @@ public final class QuicConnectionSettings {
 		return maxPendingStreamOpens;
 	}
 
+	/** Local only: how long an issued session ticket stays usable for resumption (RFC 8446 §4.6.1). */
+	public long sessionTicketLifetimeMillis() {
+		return sessionTicketLifetimeMillis;
+	}
+
+	/** Local only: how often the ticket-sealing key is replaced. Always at least half {@link #sessionTicketLifetimeMillis()}. */
+	public long sessionTicketKeyRotationMillis() {
+		return sessionTicketKeyRotationMillis;
+	}
+
+	/** Local only: the NewSessionTicket messages issued per handshake (RFC 8446 §4.6.1); 0 issues none. */
+	public int sessionTicketsPerHandshake() {
+		return sessionTicketsPerHandshake;
+	}
+
+	/** Local only: the entries the client-side ticket cache holds before evicting the least recently used. */
+	public int maxSessionTickets() {
+		return maxSessionTickets;
+	}
+
+	/** Local only: the entries the fail-closed early-data replay register holds (RFC 8446 §8). */
+	public int maxEarlyDataReplayRecords() {
+		return maxEarlyDataReplayRecords;
+	}
+
+	/** Local only: the clock-skew allowance on the obfuscated ticket-age check (RFC 8446 §4.2.10); 0 allows none. */
+	public long ticketAgeToleranceMillis() {
+		return ticketAgeToleranceMillis;
+	}
+
+	/** Local only: the bound on one sealed session ticket, checked before it is allocated for (SI-4). */
+	public long maxSessionTicketSize() {
+		return maxSessionTicketSize;
+	}
+
+	/** Local only: the post-handshake NewSessionTicket messages one connection may deliver. */
+	public int maxSessionTicketsPerConnection() {
+		return maxSessionTicketsPerConnection;
+	}
+
+	/**
+	 * Advertised as {@code max_datagram_frame_size} (RFC 9221 §3). 0 means DATAGRAM is not supported and
+	 * the parameter is not advertised at all.
+	 */
+	public long maxDatagramFrameSize() {
+		return maxDatagramFrameSize;
+	}
+
+	/** Local only: the outbound datagrams that may await a packet before a send is refused (RFC 9221 §5). */
+	public int maxOutboundDatagrams() {
+		return maxOutboundDatagrams;
+	}
+
 	@Override
 	public String toString() {
 		return "QuicConnectionSettings{" +
@@ -557,6 +855,16 @@ public final class QuicConnectionSettings {
 			", maxOutstandingStreamBytes=" + maxOutstandingStreamBytes +
 			", maxReceiveRangesPerStream=" + maxReceiveRangesPerStream +
 			", maxPendingStreamOpens=" + maxPendingStreamOpens +
+			", sessionTicketLifetime=" + sessionTicketLifetimeMillis + "ms" +
+			", sessionTicketKeyRotation=" + sessionTicketKeyRotationMillis + "ms" +
+			", sessionTicketsPerHandshake=" + sessionTicketsPerHandshake +
+			", maxSessionTickets=" + maxSessionTickets +
+			", maxEarlyDataReplayRecords=" + maxEarlyDataReplayRecords +
+			", ticketAgeTolerance=" + ticketAgeToleranceMillis + "ms" +
+			", maxSessionTicketSize=" + maxSessionTicketSize +
+			", maxSessionTicketsPerConnection=" + maxSessionTicketsPerConnection +
+			", maxDatagramFrameSize=" + maxDatagramFrameSize +
+			", maxOutboundDatagrams=" + maxOutboundDatagrams +
 			'}';
 	}
 }

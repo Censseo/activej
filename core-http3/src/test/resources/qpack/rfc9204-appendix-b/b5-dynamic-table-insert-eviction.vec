@@ -1,0 +1,56 @@
+# RFC 9204 Appendix B.5 -- Dynamic Table Insert, Eviction
+#
+# "The encoder inserts another header into the dynamic table, which evicts the oldest
+#  entry.  The encoder does not send any encoded field sections."
+#
+# Transcribed byte-for-byte from https://www.rfc-editor.org/rfc/rfc9204.txt (2026-08-04).
+# See ./README.md for the file format.
+#
+# The eviction is the point of this example: inserting (custom-key=custom-value2), size
+# 10 + 13 + 32 = 55, would take the table to 217 + 55 = 272 over a capacity of 220, so the
+# oldest entry (abs 0, size 57) is evicted first, leaving 215. Absolute index 0 is gone but
+# insertCount keeps counting -- abs 1..4 keep their indices.
+
+name: B.5
+title: Dynamic Table Insert, Eviction
+rfc: RFC 9204 Appendix B.5
+continues-from: B.4
+stream: none
+
+max-table-capacity: 220
+table-capacity-before: 220
+table-capacity-after: 220
+max-entries: 6
+blocked-streams: 0
+delivery-order: encoder-stream
+
+[encoder-stream]
+# Insert With Name Reference, Dynamic Table, Relative Index = 1
+#  Absolute Index = Insert Count(4) - Index(1) - 1 = 2  (custom-key)
+# 0x81 = 1000_0001 -> pattern 1, T=0 (dynamic), 6-bit prefix index = 1
+# 0x0d = H=0, value length 13
+81 0d
+# "custom-value2"
+63 75 73 74 6f 6d 2d 76 61 6c 75 65 32
+
+[field-section]
+# empty -- this example sends no encoded field section
+
+[expected-fields]
+# empty
+
+[decoder-stream]
+# empty -- the RFC shows no decoder instruction for this example
+
+# abs 0 (:authority=www.example.com) has been evicted to make room.
+[expected-table]
+# abs ref name value
+1 0 :path /sample/path
+2 0 custom-key custom-value
+3 0 :authority www.example.com
+4 0 custom-key custom-value2
+
+[expected-state]
+insert-count: 5
+known-received-count: 3
+size: 215

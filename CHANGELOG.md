@@ -100,6 +100,36 @@ explicitly.
   setting — 64 pieces per permitted range sits an order of magnitude above the
   ~220 pieces a full 256 KiB window of MTU-sized frames behind one gap produces,
   so ordinary loss and reordering never approach it.
+- **`Http3Settings` QPACK constants replaced.** The `public static final int`
+  constants `Http3Settings.QPACK_MAX_TABLE_CAPACITY` and
+  `Http3Settings.QPACK_BLOCKED_STREAMS`, each fixed at `0`, are removed and
+  replaced by the `ApplicationSettings`-backed
+  `Http3Settings.DEFAULT_QPACK_MAX_TABLE_CAPACITY` and
+  `Http3Settings.DEFAULT_QPACK_BLOCKED_STREAMS`, read per endpoint through the
+  accessors `qpackMaxTableCapacity()` / `qpackBlockedStreams()` and set through
+  the builder methods `withQpackMaxTableCapacity(...)` /
+  `withQpackBlockedStreams(...)`.
+
+  A `public static final int` is inlined into consumer bytecode by the Java
+  compiler, so replacing one is ordinarily a binary break that recompiling this
+  module cannot repair. It is safe here for one reason only: `activej-http3` has
+  never appeared in a published release — every `core-http3` entry in this file
+  is under **Unreleased** — so no consumer bytecode can be holding the old
+  values. Keeping the removed constants beside the new accessors would have left
+  two sources of truth for one number, with the fixed one reading as the
+  authoritative pair.
+
+  Both keys resolve against `Http3Settings`, so the fully qualified and the
+  short form work alike:
+  `-Dio.activej.http3.Http3Settings.qpackMaxTableCapacity=<value>` or
+  `-DHttp3Settings.qpackMaxTableCapacity=<value>`, and
+  `-Dio.activej.http3.Http3Settings.qpackBlockedStreams=<value>` or
+  `-DHttp3Settings.qpackBlockedStreams=<value>`.
+
+  **Nothing moved on the wire.** Both new constants resolve to the same `0` the
+  removed ones held, so the QPACK dynamic table stays disabled by default and
+  the SETTINGS frame a default `Http3Settings` produces is byte-for-byte what it
+  was. This entry records an API change and no behaviour change.
 
 ### Notable fixes
 
@@ -112,6 +142,19 @@ explicitly.
   `content-type` and was normalised instead of refused. The QPACK decoder — the
   last place holding the received octets — now reports what they said, so the
   rule holds for the ~150 registered names and not only for unregistered ones.
+- **HTTP/3 QPACK: the static encoder now lowercases a field name it writes as a
+  literal**, per RFC 9114 §4.1.1. The send-side mirror of the fix above, and it
+  had the same cause: outbound names are lowercased into a `String`, then
+  re-interned through `HttpHeaders`, whose case-insensitive registry hands back
+  its own canonically-cased token — so `accept-charset` became `Accept-Charset`
+  again and the encoder copied those octets onto the wire. It never showed for
+  the 99 QPACK static-table names, which are sent as an index and never as
+  literal octets, so it bit only legal names absent from that table but present
+  in the registry (`Accept-Charset`, `Proxy-Authorization`, …). The lowercasing
+  now happens in `QpackField.lowercaseNameBytes()`, the one funnel every
+  `QpackEncoder` takes literal name octets from, so a future dynamic-table
+  encoder cannot reintroduce it. Static-table lookups are unaffected
+  (`HttpHeader` equality is already case-insensitive).
 - **HTTP/3 client: a `Content-Length` that disagrees with the body now fails
   with `MalformedHttpException`**, like every other malformed response, instead
   of a raw `Http3Exception`. The mismatch is only detectable once the body ends,
@@ -333,6 +376,49 @@ explicitly.
   a direction: no inspector call, log line, counter or exception message ever
   carries a field value, a body byte, a cookie, an authorization credential or
   key material. `core-http3` gains no `activej-jmxapi` edge for this.
+
+- **HTTP/3 QPACK dynamic table, configured but off by default.** `core-http3`
+  gains the RFC 9204 §3.2 dynamic table on both sides — the encoder inserts,
+  references and duplicates entries on its QPACK encoder stream, the decoder
+  applies a peer's insertions and answers on its decoder stream — so a repeated
+  field costs an index rather than its bytes. **Nothing changes for an existing
+  consumer**: the capacity default is `0`, which opens no QPACK stream, emits no
+  instruction, references nothing dynamic and produces the byte-for-byte SETTINGS
+  frame and field sections of the static-table implementation in the entry above.
+  One builder call enables it:
+  `Http3Settings.builder().withQpackMaxTableCapacity(MemSize.kilobytes(4))`. The
+  two `Http3Settings` constants that moved to make the capacity configurable are
+  recorded under **Breaking changes**.
+
+  All five settings are `ApplicationSettings` keys resolved against
+  `Http3Settings`, so the fully qualified and the short spelling work alike —
+  `-Dio.activej.http3.Http3Settings.qpackMaxTableCapacity=4kb` or
+  `-DHttp3Settings.qpackMaxTableCapacity=4kb`, and likewise for the other four.
+
+  | Setting | Default | What it does | Opt out with |
+  |---|---|---|---|
+  | `qpackMaxTableCapacity` | `0` (disabled) | advertised `SETTINGS_QPACK_MAX_TABLE_CAPACITY`; a non-zero value is the single switch that enables the table, per direction per connection | `…qpackMaxTableCapacity=0` / `withQpackMaxTableCapacity(MemSize.ZERO)` |
+  | `qpackBlockedStreams` | `16` | request streams this endpoint would permit to be blocked on an unreceived insertion; bounds `qpackBlockedStreams × maxFieldSectionSize` = 1 MB of held sections at the defaults | `…qpackBlockedStreams=0` / `withQpackBlockedStreams(0)` |
+  | `qpackNeverIndexedFields` | `authorization,proxy-authorization,set-cookie` | field names the encoder never indexes, emitting the RFC 9204 §7.1 never-indexed literal instead. **`cookie` is deliberately absent** — it is the largest repeated field in browser traffic and the main reason the table pays for itself; a deployment with a compression-oracle threat model adds it | `…qpackNeverIndexedFields=authorization,proxy-authorization,set-cookie,cookie` / `withQpackNeverIndexedFields(Set.of(…))` |
+  | `qpackMaxInstructionSize` | `16kb` | bounds one buffered encoder- or decoder-stream instruction, which arrives a few bytes at a time; past it the connection closes with `QPACK_ENCODER_STREAM_ERROR` (0x0201) or `QPACK_DECODER_STREAM_ERROR` (0x0202), whichever stream it was, rather than buffering on | `…qpackMaxInstructionSize=64kb` / `withQpackMaxInstructionSize(…)` |
+  | `qpackBlockedStreamTimeout` | `10s` | how long a field section blocked on an unreceived insertion is held before the connection closes with `QPACK_DECOMPRESSION_FAILED` (0x0200); `0` disables the timeout | `…qpackBlockedStreamTimeout=0s` / `withQpackBlockedStreamTimeout(Duration.ZERO)` |
+
+  Each of the last four is inert while the capacity is `0`: nothing is inserted,
+  so nothing is indexed, no instruction is buffered and no section can block.
+  `SETTINGS_QPACK_BLOCKED_STREAMS` is advertised as `0` whatever
+  `qpackBlockedStreams` says for as long as a blocked section has nowhere to
+  wait — a permission this endpoint cannot honour would cost conformance, while
+  advertising `0` costs only compression. `initial_max_streams_uni` stays `3`:
+  control plus both QPACK streams was always the right number, and the streams
+  being used now does not make them more numerous.
+
+  Three counters join each `Inspector`, **as defaulted methods**, so no existing
+  implementation breaks: `onQpackInsertions` and `onQpackEvictions` (which of
+  the connection's two tables, how many entries, and its RFC 9204 §3.2.1 size
+  afterwards) and `onQpackFieldSectionEncoded` (field lines and how many of them
+  came out of the table — the two numbers a hit rate is computed from, reported
+  per section so a consumer picks its own window). Every parameter is a number
+  or which-table: a field name or a field value has no way to reach an inspector.
 
 - **QUIC connection layer.** A new `io.activej.quic.connection` package in
   `core-quic` turns the wire codec and the TLS engines into a working transport:
