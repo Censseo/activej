@@ -225,6 +225,13 @@ public final class Http3RequestStream extends AbstractReactive {
 	private @Nullable InboundBodySupplier bodySupplier;
 	private @Nullable Exception terminalException;
 
+	/**
+	 * The RFC 9297 datagram handle bound to this exchange, or {@code null} when
+	 * {@link Http3Settings#datagramsEnabled()} is off — which is the default, and which is why an ordinary
+	 * exchange allocates no datagram queue at all (FR-086).
+	 */
+	private @Nullable Http3DatagramChannel datagramChannel;
+
 	private Http3RequestStream(Reactor reactor, QuicStream stream) {
 		super(reactor);
 		this.stream = stream;
@@ -308,6 +315,21 @@ public final class Http3RequestStream extends AbstractReactive {
 			return this;
 		}
 
+		/**
+		 * The RFC 9297 datagram handle bound to this exchange, set by {@code Http3Connection} only when
+		 * {@link Http3Settings#datagramsEnabled()}. Package-private, because only a connection can bind a
+		 * transport to a request stream.
+		 * <p>
+		 * The ownership split is that the <b>channel</b> owns the queue — it is what an application polls —
+		 * and this <b>stream</b> owns the channel's lifecycle, because it is what knows when the exchange
+		 * ends.
+		 */
+		Builder withDatagramChannel(Http3DatagramChannel datagramChannel) {
+			checkNotBuilt(this);
+			Http3RequestStream.this.datagramChannel = datagramChannel;
+			return this;
+		}
+
 		@Override
 		protected Http3RequestStream doBuild() {
 			if (qpackDecoder == null) {
@@ -352,6 +374,62 @@ public final class Http3RequestStream extends AbstractReactive {
 	public QuicStream quicStream() {
 		checkInReactorThread(this);
 		return stream;
+	}
+
+	// ---------------------------------------------------------------- HTTP/3 datagrams (RFC 9297)
+
+	/**
+	 * Whether an inbound HTTP/3 datagram routed here would be delivered rather than dropped: this exchange
+	 * has a channel and has not ended.
+	 * <p>
+	 * Read by {@code Http3Connection} <b>before</b> it slices the borrowed DATAGRAM frame, so a datagram for
+	 * a finished exchange — normal on an unreliable channel, FR-082 — costs no allocation.
+	 */
+	boolean acceptsDatagrams() {
+		Http3DatagramChannel channel = datagramChannel;
+		return channel != null && !channel.isClosed();
+	}
+
+	/** One inbound HTTP/3 datagram for this exchange; <b>ownership passes in</b> on every path. */
+	void onDatagram(ByteBuf owned) {
+		checkInReactorThread(this);
+		Http3DatagramChannel channel = datagramChannel;
+		if (channel == null) {
+			owned.recycle();
+			return;
+		}
+		channel.onDatagram(owned);
+	}
+
+	/**
+	 * The exchange has ended: whatever it never polled is drained and recycled (FR-085), and nothing
+	 * further is accepted or sent. Idempotent.
+	 * <p>
+	 * Reached from the continuation {@code Http3Connection} registers on {@code QuicStream.whenClosed()},
+	 * which covers every terminal path of one exchange — a clean completion, a local or peer abort, and an
+	 * early-data discard ({@code QuicStreamManager.discardStream} fails {@code whenClosed()} rather than
+	 * completing it) — and, separately, from the connection's own close. That second site is not redundant:
+	 * a locally-aborted stream closes only once the peer has answered its {@code RESET_STREAM}, which is
+	 * after the connection that was waiting for it is gone.
+	 * <p>
+	 * Deliberately <b>not</b> called from {@link #receiveFinished()}: the peer FINing the receive direction
+	 * is not the exchange ending, and an application that has not polled yet would lose datagrams it is
+	 * still owed.
+	 */
+	void closeDatagrams() {
+		checkInReactorThread(this);
+		Http3DatagramChannel channel = datagramChannel;
+		if (channel != null) channel.close();
+	}
+
+	/**
+	 * Binds this exchange's datagram channel to {@code message}, so a caller reaches it through
+	 * {@link Http3Datagrams#of} on the message it already holds (FR-084) — a servlet on the request it is
+	 * serving, a client on the request it issued and on the response it received.
+	 */
+	private void attachDatagrams(HttpMessage message) {
+		Http3DatagramChannel channel = datagramChannel;
+		if (channel != null) Http3Datagrams.set(message, channel);
 	}
 
 	/** Whether this exchange has reached {@link State#COMPLETE} or {@link State#RESET}. */
@@ -582,6 +660,7 @@ public final class Http3RequestStream extends AbstractReactive {
 			// one path that owns it rather than through a second, parallel one.
 			HttpRequest request = builder.build();
 			inboundMessage = request;
+			attachDatagrams(request);
 			readDeclaredContentLength(request);
 			state = State.HEADERS_DONE;
 			return request;
@@ -617,6 +696,7 @@ public final class Http3RequestStream extends AbstractReactive {
 			builder.withMaxBodySize((int) Math.min(Integer.MAX_VALUE, settings.maxBodySize()));
 			HttpResponse response = builder.build();
 			inboundMessage = response;
+			attachDatagrams(response);
 			readDeclaredContentLength(response);
 			state = State.HEADERS_DONE;
 			return response;
@@ -757,6 +837,7 @@ public final class Http3RequestStream extends AbstractReactive {
 	public Promise<Void> sendRequest(HttpRequest request) {
 		checkInReactorThread(this);
 		beginSend(request, "request");
+		attachDatagrams(request);
 		return sendMessage(request, Http3Headers.fromRequest(request));
 	}
 

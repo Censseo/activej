@@ -234,7 +234,9 @@ public final class Http3TestServer implements AutoCloseable {
 			.withEarlyDataPolicy(earlyDataPolicy)
 			.withRequestStreamListener(this::serve)
 			.build()
-			.startAndGetStreamManager();
+			// Not startAndGetStreamManager(): with Http3Settings.datagramsEnabled() the stream manager alone
+			// is not the frame handler, and this fixture is configured by whatever test builds it.
+			.startAndGetFrameHandler();
 	}
 
 	private void serve(Http3RequestStream requestStream) {

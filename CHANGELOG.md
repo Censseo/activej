@@ -577,6 +577,78 @@ explicitly.
   counts the replays *this instance* caught, and is not a count of the replays
   aimed at the deployment.
 
+- **HTTP/3 datagrams, off by default.** `core-quic` gains the RFC 9221 DATAGRAM
+  frame's semantics — the `max_datagram_frame_size` transport parameter (0x20), a
+  bounded outbound queue, and the per-encryption-level legality that keeps a
+  DATAGRAM out of Initial and Handshake packets — and `core-http3` gains RFC 9297
+  on top of it: `SETTINGS_H3_DATAGRAM` (0x33), the quarter-stream-ID payload
+  encoding, and `H3_DATAGRAM_ERROR` (0x33) on `Http3Errors`. (Setting identifier
+  `0x33` and error code `0x33` are two independent registries; the numeric
+  coincidence means nothing.) **Nothing changes for an existing consumer**:
+  `datagramsEnabled` defaults to `false` on both endpoints, which advertises no
+  transport parameter, sends no `SETTINGS_H3_DATAGRAM`, allocates no queue and
+  produces the byte-for-byte phase-1 connection.
+
+  One builder call on each endpoint turns it on —
+  `withSettings(Http3Settings.builder().withDatagramsEnabled(true).build())` — and
+  `Http3Server` / `Http3Client` derive the transport parameter from
+  `maxDatagramSize` themselves, so there is nothing else to configure.
+
+  The developer-facing surface is a **per-exchange handle** on the existing
+  `HttpMessage` attachment mechanism — the seam HTTP/3 trailers already use, so
+  **`core-http` is unchanged**. A servlet reaches it from the request it is
+  serving, a client caller from the request it issued or the response it received:
+  `Http3DatagramChannel datagrams = Http3Datagrams.of(message)`, `null` when
+  datagrams are off or the message is not an HTTP/3 one. It exposes
+  `isAvailable()` (queryable *before* the first send), `maxPayloadSize()`,
+  `send(ByteBuf)`, `poll()`, `setReceiveHandler(…)` and four counters. **No QUIC
+  stream ID appears anywhere in it**; the quarter stream ID is an internal
+  encoding detail.
+
+  `send` **takes ownership of the payload on every path, refusals included** — it
+  is recycled before the checked `Http3DatagramException` is thrown, and recycling
+  it again at the call site is a double free. The four refusal reasons are
+  `NOT_NEGOTIATED`, `OVERSIZE`, `QUEUE_FULL` and `EXCHANGE_ENDED`; none is a
+  protocol violation and none closes anything. An oversize payload is refused
+  **whole** rather than truncated or split, because RFC 9221 §3 permits neither. A
+  datagram is deliberately **not** a CSP channel: CSP promises a producer that a
+  withheld promise means "wait", and on a channel with no retransmission there is
+  nothing to wait for.
+
+  | Setting | Default | What it does | Change it with |
+  |---|---|---|---|
+  | `datagramsEnabled` | `false` | the outer switch, per HTTP/3 endpoint. Off: nothing advertised, nothing sent, no queue allocated, phase-1 bytes | `-DHttp3Settings.datagramsEnabled=true` / `withDatagramsEnabled(true)` |
+  | `maxInboundDatagramsPerStream` | `32` | the bounded per-exchange inbound queue. At the bound the **oldest** queued datagram is dropped and counted — never the connection, never unbounded growth. `0` accepts none | `-DHttp3Settings.maxInboundDatagramsPerStream=8` / `withMaxInboundDatagramsPerStream(8)` |
+  | `maxDatagramFrameSize` | `0` (disabled) | the RFC 9221 §3 transport parameter. `0` means *not supported* and is not advertised at all; an `Http3Server`/`Http3Client` with datagrams on sets it to the largest frame that fits `maxDatagramSize`, which is 1309 bytes at the 1350-byte default | `-DQuicConnection.maxDatagramFrameSize=1200` |
+  | `maxOutboundDatagrams` | `64` | the bounded outbound queue. At the bound the send is **refused** rather than queued, and a datagram that cannot be placed in the next packet within its bound is dropped and counted rather than held indefinitely | `-DQuicConnection.maxOutboundDatagrams=256` |
+
+  The two HTTP/3 settings resolve against `Http3Settings` and the two QUIC ones
+  against `QuicConnection`, so the fully qualified and the short spelling work
+  alike — `-Dio.activej.http3.Http3Settings.datagramsEnabled=true` or
+  `-DHttp3Settings.datagramsEnabled=true`, and likewise for the rest.
+
+  A lost DATAGRAM frame is **released, never retransmitted** (RFC 9221 §5), which
+  is what the existing `QuicFrameHandler.onFrameLost` default already did. A
+  datagram whose quarter stream ID names an exchange that has completed, been
+  reset or not yet been opened is **dropped silently and counted** — reordering
+  makes that normal on an unreliable channel, and it is not an error. What *is* an
+  error, closing the connection with `H3_DATAGRAM_ERROR`, is a quarter stream ID
+  that maps to a stream which is not client-initiated bidirectional, one whose
+  `× 4` would exceed 2^62−1, and a truncated varint; a `SETTINGS_H3_DATAGRAM`
+  value other than `0` or `1`, and a peer sending `1` without
+  `max_datagram_frame_size`, close with `H3_SETTINGS_ERROR` (0x0109) instead.
+
+  Five counters join each `Inspector`, **as defaulted methods**, so no existing
+  implementation breaks: `onDatagramSent`, `onDatagramReceived`,
+  `onDatagramDroppedByQueue`, `onDatagramDroppedByLoss` and
+  `onDatagramRefusedOversize`. Every parameter is a stream id, a size or a running
+  total — a payload byte has no way to reach an inspector, a log line or an
+  exception message.
+
+  RFC 9220 Extended CONNECT stays **refused** exactly as before: datagrams here
+  bind to ordinary request/response exchanges only, and WebTransport and MASQUE
+  remain out of scope.
+
 - **QUIC connection layer.** A new `io.activej.quic.connection` package in
   `core-quic` turns the wire codec and the TLS engines into a working transport:
   `QuicConnection` (the reactor-confined state machine — handshake, ACK

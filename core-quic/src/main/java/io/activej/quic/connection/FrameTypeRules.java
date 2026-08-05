@@ -29,6 +29,9 @@ import java.util.List;
  * Initial and Handshake packets carry only CRYPTO, ACK, CONNECTION_CLOSE (transport form) and PADDING —
  * and PING. Everything else is 1-RTT only. HANDSHAKE_DONE is further restricted: only a server sends it.
  * <p>
+ * DATAGRAM (RFC 9221 §5) follows the same "1-RTT and 0-RTT only" rule, and is the one frame type here
+ * whose table row comes from an extension rather than from RFC 9000 §12.4.
+ * <p>
  * A decrypted payload must also contain at least one frame; an empty payload is a
  * {@code PROTOCOL_VIOLATION} (RFC 9000 §12.4).
  *
@@ -58,6 +61,12 @@ public final class FrameTypeRules {
 			// RFC 9000 §12.4: only the transport form (0x1c) is allowed at Initial/Handshake; the
 			// application form (0x1d) requires 1-RTT keys.
 			return !handshakeLevel || !close.isApplication;
+		}
+		if (frame instanceof DatagramFrame) {
+			// RFC 9221 §5: 0-RTT and 1-RTT only — 0-RTT is answered above, by DatagramFrame's absence from
+			// isAllowedInZeroRtt's denial list. Written out rather than left to the fall-through below,
+			// because this method's contract is that a frame type is classified explicitly.
+			return !handshakeLevel;
 		}
 		// Everything below is 1-RTT only.
 		return !handshakeLevel;

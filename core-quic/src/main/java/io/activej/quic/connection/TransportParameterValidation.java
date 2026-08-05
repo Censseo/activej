@@ -69,11 +69,12 @@ public final class TransportParameterValidation {
 		QuicTransportParameters.DEFAULT_MAX_ACK_DELAY,
 		false, null,
 		QuicTransportParameters.DEFAULT_ACTIVE_CONNECTION_ID_LIMIT,
-		null, null);
+		null, null, 0);
 
 	/**
 	 * RFC 9000 §7.4.1: a server resuming a session may <b>raise</b> the seven limits below, never lower
-	 * them beneath the values it issued with the ticket (spec FR-054).
+	 * them beneath the values it issued with the ticket (spec FR-054). {@code max_datagram_frame_size} is
+	 * checked alongside them under RFC 9221 §3's own rule, which exists for the same reason.
 	 * <p>
 	 * The rule exists because 0-RTT data is already on the wire by the time these parameters arrive.
 	 * The client sent it against what it remembered; a server that then advertised less would have
@@ -95,6 +96,7 @@ public final class TransportParameterValidation {
 	 * @param actual     the parameters this handshake delivered
 	 * @throws QuicTransportException {@code PROTOCOL_VIOLATION}, naming the parameter, the value that
 	 *                                was promised and the value that replaced it
+	 * @see <a href="https://www.rfc-editor.org/rfc/rfc9221#section-3">RFC 9221 §3 — max_datagram_frame_size</a>
 	 */
 	public static void validateNonReduction(QuicTransportParameters remembered, QuicTransportParameters actual)
 		throws QuicTransportException {
@@ -112,6 +114,11 @@ public final class TransportParameterValidation {
 			remembered.initialMaxStreamsBidi(), actual.initialMaxStreamsBidi());
 		checkNotReduced("initial_max_streams_uni",
 			remembered.initialMaxStreamsUni(), actual.initialMaxStreamsUni());
+		// RFC 9221 §3, not RFC 9000 §7.4.1: a client that remembered a non-zero value may have put a
+		// DATAGRAM frame in early data against it, and the same "the bytes cannot be un-sent" argument
+		// applies. Reported with the same code, since the remedy is identical.
+		checkNotReduced("max_datagram_frame_size",
+			remembered.maxDatagramFrameSize(), actual.maxDatagramFrameSize());
 	}
 
 	private static void checkNotReduced(String parameter, long remembered, long actual)
@@ -238,7 +245,8 @@ public final class TransportParameterValidation {
 			null,                                        // preferred_address: out of scope
 			QuicTransportParameters.DEFAULT_ACTIVE_CONNECTION_ID_LIMIT,
 			localConnectionId.bytes(),
-			null);                                       // retry_source_connection_id: set by a Retry-issuing server
+			null,                                        // retry_source_connection_id: set by a Retry-issuing server
+			settings.maxDatagramFrameSize());            // 0 — the default — is not encoded at all (RFC 9221 §3)
 	}
 
 	private static QuicTransportException error(String message) {

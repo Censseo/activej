@@ -208,7 +208,9 @@ public final class QuicSessionTicket {
 	 * {@code ack_delay_exponent}, {@code max_ack_delay} (returned to their RFC 9000 §18.2 defaults).
 	 * <p>
 	 * Everything else is preserved, {@code disable_active_migration},
-	 * {@code active_connection_id_limit} and {@code max_udp_payload_size} included.
+	 * {@code active_connection_id_limit}, {@code max_udp_payload_size} and
+	 * {@code max_datagram_frame_size} included — RFC 9221 §3 explicitly lets a client remember the last
+	 * of those, which is what makes a DATAGRAM frame in early data reachable at all.
 	 */
 	public static QuicTransportParameters rememberableParameters(QuicTransportParameters parameters) {
 		return new QuicTransportParameters(
@@ -228,7 +230,8 @@ public final class QuicSessionTicket {
 			null,
 			parameters.activeConnectionIdLimit(),
 			null,
-			null);
+			null,
+			parameters.maxDatagramFrameSize());
 	}
 
 	@Override

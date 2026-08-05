@@ -54,12 +54,19 @@ import io.activej.http3.qpack.QpackStaticEncoder;
 import io.activej.promise.Promise;
 import io.activej.promise.Promises;
 import io.activej.promise.SettablePromise;
+import io.activej.quic.codec.DatagramFrame;
+import io.activej.quic.codec.QuicFrame;
 import io.activej.quic.codec.QuicVarInts;
 import io.activej.quic.connection.QuicConnection;
 import io.activej.quic.connection.QuicConnection.Role;
+import io.activej.quic.connection.QuicDatagramException;
+import io.activej.quic.connection.QuicFrameHandler;
+import io.activej.quic.connection.QuicTransportException;
 import io.activej.quic.stream.QuicStream;
 import io.activej.quic.stream.QuicStreamManager;
 import io.activej.quic.stream.StreamIds;
+import io.activej.quic.tls.EncryptionLevel;
+import io.activej.quic.tls.QuicTransportParameters;
 import io.activej.reactor.AbstractReactive;
 import io.activej.reactor.Reactor;
 import io.activej.reactor.schedule.ScheduledRunnable;
@@ -84,16 +91,18 @@ import static io.activej.reactor.Reactive.checkInReactorThread;
  * and what may travel on them.
  *
  * <h2>Wiring</h2>
- * One {@code Http3Connection} owns one {@link QuicStreamManager}, and that manager <i>is</i> the
+ * One {@code Http3Connection} owns one {@link QuicStreamManager}, and that manager is the
  * {@code QuicFrameHandler} the transport wants — so a server or client attaches through feature 03's
- * per-connection factory seam and hands back {@link #streamManager()}:
+ * per-connection factory seam and hands back {@link #startAndGetFrameHandler()}, which is that manager
+ * unless {@link Http3Settings#datagramsEnabled()} adds RFC 9221 DATAGRAM frames to what this layer
+ * answers for:
  * <pre>{@code
  * QuicEndpoint.builder(reactor, socket)
  *     .withFrameHandlerFactory(connection -> Http3Connection.builder(reactor, connection)
  *         .withSettings(settings)
  *         .withRequestStreamListener(this::serve)
  *         .build()
- *         .startAndGetStreamManager())
+ *         .startAndGetFrameHandler())
  *     .build();
  * }</pre>
  * {@link #start()} is separate from {@code build()} because it originates traffic — it opens the
@@ -454,12 +463,33 @@ public final class Http3Connection extends AbstractReactive {
 	 */
 	private long lastRequestStreamAccepted = NO_REQUEST_STREAM;
 
+	/**
+	 * The composite {@link QuicFrameHandler} of {@link #startAndGetFrameHandler()}, or {@code null} when
+	 * datagrams are off — in which case the frame handler is the bare {@link #streamManager}, object for
+	 * object what phase 1 registered (SC-011).
+	 */
+	private @Nullable DatagramRoutingFrameHandler datagramFrameHandler;
+
 	private long peerUnidirectionalStreamsAccepted;
 	private long requestStreamsRejected;
 	private long unidirectionalStreamsAbandoned;
 	private long controlFramesReceived;
 	private long controlFramesDiscarded;
 	private long connectionErrors;
+
+	private long datagramsSent;
+	private long datagramsReceived;
+	private long datagramsDropped;
+
+	/**
+	 * The half of {@link #datagramsDropped} that is loss rather than an exchange that has gone. Kept apart
+	 * because the two are different failures and only one of them is the network's.
+	 */
+	private long datagramsDroppedByLoss;
+
+	/** Reported by the per-exchange channels through {@link Http3DatagramTransport}, whose bounds they are. */
+	private long datagramsDroppedByQueue;
+	private long datagramsRefusedOversize;
 
 	private Http3Connection(Reactor reactor, QuicConnection quicConnection) {
 		super(reactor);
@@ -604,6 +634,12 @@ public final class Http3Connection extends AbstractReactive {
 			// this is the correct encoder until SETTINGS arrive, not a placeholder for one. It stays the
 			// encoder for the life of a connection whose peer advertises 0 (FR-019, FR-040).
 			qpackEncoder = new QpackStaticEncoder();
+			// Built here rather than lazily, so that what startAndGetFrameHandler() returns is decided once,
+			// before any frame can arrive: with datagrams off there is no composite at all and the transport
+			// is handed the same QuicStreamManager phase 1 handed it.
+			if (settings.datagramsEnabled()) {
+				datagramFrameHandler = new DatagramRoutingFrameHandler();
+			}
 			return Http3Connection.this;
 		}
 	}
@@ -644,9 +680,46 @@ public final class Http3Connection extends AbstractReactive {
 		return starting;
 	}
 
-	/** {@link #start()} then {@link #streamManager()} — the one-liner a frame-handler factory wants. */
+	/**
+	 * {@link #start()} then the {@link QuicFrameHandler} this connection is the HTTP/3 layer of — the
+	 * one-liner a frame-handler factory wants.
+	 * <p>
+	 * With datagrams off that handler <b>is</b> {@link #streamManager()}, object for object what phase 1
+	 * registered. With them on it is a composite that intercepts DATAGRAM frames and delegates every other
+	 * frame and every other callback to the manager unchanged, because
+	 * {@code QuicStreamManager.routeFrame} answers any frame it has no semantics for with
+	 * {@code PROTOCOL_VIOLATION} — correctly, since a DATAGRAM frame is not a stream frame and nothing in
+	 * the stream layer could act on one.
+	 * <p>
+	 * Note that a datagram-enabled connection therefore does <b>not</b> hand back a
+	 * {@code QuicStreamManager}, so a test fixture that captures one by {@code instanceof} — as
+	 * {@code Http3WirePair} does for {@code serverStreams()}/{@code clientStreams()} — has nothing to
+	 * report and throws. That is correct, and only reachable in a test that asks for both the HTTP/3 layer
+	 * and the stream layer underneath it.
+	 */
+	public QuicFrameHandler startAndGetFrameHandler() {
+		checkInReactorThread(this);
+		start();
+		DatagramRoutingFrameHandler handler = datagramFrameHandler;
+		return handler != null ? handler : streamManager;
+	}
+
+	/**
+	 * {@link #start()} then {@link #streamManager()}.
+	 *
+	 * @throws IllegalStateException when {@link Http3Settings#datagramsEnabled()} is on, where the stream
+	 *                               manager alone is <b>not</b> the right frame handler — an inbound
+	 *                               DATAGRAM frame would reach it and close the connection with
+	 *                               {@code PROTOCOL_VIOLATION}. Use {@link #startAndGetFrameHandler()},
+	 *                               which is that answer for both configurations
+	 */
 	public QuicStreamManager startAndGetStreamManager() {
 		checkInReactorThread(this);
+		if (datagramFrameHandler != null) {
+			throw new IllegalStateException(
+				"With HTTP/3 datagrams enabled the QuicStreamManager is not the frame handler on its own" +
+				" — call startAndGetFrameHandler()");
+		}
 		start();
 		return streamManager;
 	}
@@ -689,7 +762,7 @@ public final class Http3Connection extends AbstractReactive {
 
 	private Http3RequestStream adoptRequestStream(QuicStream stream) {
 		long id = stream.id();
-		Http3RequestStream requestStream = Http3RequestStream.builder(reactor, stream)
+		Http3RequestStream.Builder builder = Http3RequestStream.builder(reactor, stream)
 			.withSettings(settings)
 			// Wrapped unconditionally, capacity 0 included: the views delegate to the static codecs
 			// byte-for-byte there, and one code path is worth more than the indirection it costs.
@@ -701,10 +774,22 @@ public final class Http3Connection extends AbstractReactive {
 			// request stream at all (FR-024, FR-025). Everything it refuses about the message itself stays
 			// on its own stream (FR-037).
 			.withConnectionErrorListener(this::closeWithError)
-			.withEventListener(requestStreamEventListener)
-			.build();
+			.withEventListener(requestStreamEventListener);
+		// Only when datagrams are enabled: with them off no channel and no queue exist for any exchange,
+		// which is the whole of FR-086's "allocates no queue".
+		if (settings.datagramsEnabled()) {
+			builder.withDatagramChannel(new Http3DatagramChannel(reactor,
+				new StreamDatagramTransport(id), settings.maxInboundDatagramsPerStream()));
+		}
+		Http3RequestStream requestStream = builder.build();
 		requestStreams.put(id, requestStream);
-		stream.whenClosed().whenComplete(($, e) -> requestStreams.remove(id));
+		stream.whenClosed().whenComplete(($, e) -> {
+			requestStreams.remove(id);
+			// The exchange is over however it ended, so whatever it never polled is released here (FR-085).
+			// Idempotent, and it also covers the connection-close path, which reaches every stream through
+			// abortOwnedStreams rather than through this continuation.
+			requestStream.closeDatagrams();
+		});
 		return requestStream;
 	}
 
@@ -835,6 +920,55 @@ public final class Http3Connection extends AbstractReactive {
 	public long peerMaxFieldSectionSize() {
 		checkInReactorThread(this);
 		return peerSetting(SettingsFrame.MAX_FIELD_SECTION_SIZE, Long.MAX_VALUE);
+	}
+
+	/**
+	 * Whether an HTTP/3 datagram sent right now would be carried (RFC 9297 §2.1.1, spec FR-083): this
+	 * endpoint advertised {@code max_datagram_frame_size} and {@code SETTINGS_H3_DATAGRAM = 1}, the peer's
+	 * own SETTINGS have arrived saying the same, its {@code max_datagram_frame_size} is non-zero, and this
+	 * connection is not closed.
+	 * <p>
+	 * Reads the peer's <b>actual</b> SETTINGS, deliberately — not {@link #peerSetting}, which falls back to
+	 * the {@linkplain #rememberedSettings() remembered} ones on a resumed connection. Remembered SETTINGS
+	 * are what RFC 9114 §7.2.4.2 lets a client <i>encode</i> against before the server has spoken; they are
+	 * not a statement that this connection's peer offers datagrams, and treating them as one would send an
+	 * HTTP/3 datagram into a connection whose peer may have withdrawn the offer.
+	 */
+	public boolean datagramsAvailable() {
+		checkInReactorThread(this);
+		if (state == State.CLOSED || !settingsSent || !advertisesDatagrams()) return false;
+		SettingsFrame peer = peerSettings;
+		if (peer == null) return false;
+		return Http3RememberedSettings.valueOf(peer, SettingsFrame.H3_DATAGRAM, 0) == 1
+			&& peerMaxDatagramFrameSize() > 0;
+	}
+
+	/**
+	 * The peer's RFC 9221 §3 {@code max_datagram_frame_size}, or {@code 0} when it advertised none — which
+	 * RFC 9221 §3 defines as "DATAGRAM frames are not supported".
+	 * <p>
+	 * Read through the same funnel {@code QuicConnection} uses for its own limit check: the handshake's
+	 * parameters once they exist, the early-data ones before that. A server processing early data has been
+	 * told nothing yet and correctly answers {@code 0}.
+	 */
+	public long peerMaxDatagramFrameSize() {
+		checkInReactorThread(this);
+		QuicTransportParameters peer = quicConnection.peerTransportParameters();
+		if (peer != null) return peer.maxDatagramFrameSize();
+		QuicTransportParameters early = quicConnection.earlyTransportParameters();
+		return early == null ? 0 : early.maxDatagramFrameSize();
+	}
+
+	/**
+	 * Whether this endpoint offers HTTP/3 datagrams: the H3 switch is on <b>and</b> the transport is
+	 * actually advertising {@code max_datagram_frame_size}.
+	 * <p>
+	 * Reading the transport setting rather than re-deriving from {@link Http3Settings#datagramsEnabled()}
+	 * alone is what makes "{@code SETTINGS_H3_DATAGRAM = 1} without {@code max_datagram_frame_size}" —
+	 * the very thing FR-079 makes a peer an error for — structurally unreachable on our own side.
+	 */
+	private boolean advertisesDatagrams() {
+		return settings.datagramsEnabled() && quicConnection.settings().maxDatagramFrameSize() > 0;
 	}
 
 	/**
@@ -1042,6 +1176,32 @@ public final class Http3Connection extends AbstractReactive {
 		return connectionErrors;
 	}
 
+	/** HTTP/3 datagrams handed to the transport on this connection, across every exchange (SI-6: a count). */
+	public long datagramsSent() {
+		checkInReactorThread(this);
+		return datagramsSent;
+	}
+
+	/** HTTP/3 datagrams routed to an exchange on this connection. */
+	public long datagramsReceived() {
+		checkInReactorThread(this);
+		return datagramsReceived;
+	}
+
+	/**
+	 * HTTP/3 datagrams this connection dropped: one whose quarter stream ID named a stream that has
+	 * completed, been reset or not yet been opened (FR-082 — reordering makes that normal on an unreliable
+	 * channel, and it is not an error), and one whose DATAGRAM frame was declared lost, which RFC 9221 §5
+	 * forbids retransmitting.
+	 * <p>
+	 * Does <b>not</b> include a datagram dropped by a full per-exchange queue; that is
+	 * {@link Http3DatagramChannel#datagramsDropped()}, which is per exchange because the bound is.
+	 */
+	public long datagramsDropped() {
+		checkInReactorThread(this);
+		return datagramsDropped;
+	}
+
 	// ---------------------------------------------------------------- state
 
 	/** The sole writer of {@link #state}, so no transition can escape its debug line. */
@@ -1083,18 +1243,39 @@ public final class Http3Connection extends AbstractReactive {
 	 * blocked-stream permission meaningless without a table), while a configured capacity advertises the
 	 * limit the decoder was built with and {@link QpackBlockedSections} sized itself from — one value,
 	 * three consumers, no drift.
+	 * <p>
+	 * A fourth pair, {@code SETTINGS_H3_DATAGRAM = 1}, appears only when {@link #advertisesDatagrams()} —
+	 * which requires the transport to be advertising {@code max_datagram_frame_size}, so RFC 9297 §2.1.1's
+	 * "1 without the transport parameter" cannot be produced here. With datagrams off the identifier is
+	 * absent entirely rather than sent as 0, which is what keeps this frame byte-for-byte phase 1's
+	 * (SC-011).
 	 */
 	private SettingsFrame localSettingsFrame() {
 		QpackDynamicDecoder decoder = qpackDynamicDecoder;
+		long qpackCapacity = decoder == null ? 0 : decoder.maxCapacity();
+		long qpackBlockedStreams = decoder == null ? 0 : decoder.blockedStreams();
+		if (!advertisesDatagrams()) {
+			return new SettingsFrame(
+				new long[]{
+					SettingsFrame.QPACK_MAX_TABLE_CAPACITY,
+					SettingsFrame.MAX_FIELD_SECTION_SIZE,
+					SettingsFrame.QPACK_BLOCKED_STREAMS},
+				new long[]{
+					qpackCapacity,
+					settings.maxFieldSectionSize(),
+					qpackBlockedStreams});
+		}
 		return new SettingsFrame(
 			new long[]{
 				SettingsFrame.QPACK_MAX_TABLE_CAPACITY,
 				SettingsFrame.MAX_FIELD_SECTION_SIZE,
-				SettingsFrame.QPACK_BLOCKED_STREAMS},
+				SettingsFrame.QPACK_BLOCKED_STREAMS,
+				SettingsFrame.H3_DATAGRAM},
 			new long[]{
-				decoder == null ? 0 : decoder.maxCapacity(),
+				qpackCapacity,
 				settings.maxFieldSectionSize(),
-				decoder == null ? 0 : decoder.blockedStreams()});
+				qpackBlockedStreams,
+				1});
 	}
 
 	// ---------------------------------------------------------------- peer-opened streams
@@ -1259,6 +1440,7 @@ public final class Http3Connection extends AbstractReactive {
 					"The first control-stream frame was type 0x" + Long.toHexString(frame.type()) + ", not SETTINGS");
 			}
 			validatePeerSettings(settingsFrame);
+			validatePeerDatagramSetting(settingsFrame);
 			Http3RememberedSettings.validateNoReduction(rememberedSettings, settingsFrame);
 			peerSettings = settingsFrame;
 			updateState();
@@ -1352,6 +1534,57 @@ public final class Http3Connection extends AbstractReactive {
 				throw new Http3Exception(Http3Errors.H3_SETTINGS_ERROR,
 					"Duplicated SETTINGS identifier 0x" + Long.toHexString(identifier));
 			}
+		}
+	}
+
+	/**
+	 * FR-079, RFC 9297 §2.1.1: the two ways a peer's {@code SETTINGS_H3_DATAGRAM} can be wrong, both
+	 * {@code H3_SETTINGS_ERROR}.
+	 * <p>
+	 * A separate method rather than a branch inside {@link #validatePeerSettings}, which is static, is
+	 * about the whole frame's syntax and is shared with the QPACK and 0-RTT paths — this one needs the
+	 * <i>connection</i>, because RFC 9297 §2.1.1's second rule is a cross-check against a value that
+	 * arrived in the handshake rather than in this frame.
+	 * <p>
+	 * <b>Deferral.</b> A server processing early data has no peer transport parameters yet — they are
+	 * assigned when the handshake completes — so the cross-check is skipped and re-run from
+	 * {@link #onQuicEstablished()}. With datagrams off no composite frame handler exists and that hook
+	 * never fires, so the deferral simply lapses; harmless, because nothing then uses datagrams and the
+	 * peer's offer is moot.
+	 */
+	private void validatePeerDatagramSetting(SettingsFrame frame) throws Http3Exception {
+		long value = Http3RememberedSettings.valueOf(frame, SettingsFrame.H3_DATAGRAM, 0);
+		if (!SettingsFrame.isValidH3DatagramValue(value)) {
+			throw new Http3Exception(Http3Errors.H3_SETTINGS_ERROR,
+				"SETTINGS_H3_DATAGRAM was " + value + ", which is neither 0 nor 1 (RFC 9297 §2.1.1)");
+		}
+		if (quicConnection.peerTransportParameters() == null) return;
+		checkDatagramSettingConsistent(value);
+	}
+
+	/** The second half of FR-079, delegated to the predicate that owns the rule rather than re-derived. */
+	private void checkDatagramSettingConsistent(long value) throws Http3Exception {
+		if (SettingsFrame.isH3DatagramSettingConsistent(value, peerMaxDatagramFrameSize())) return;
+		throw new Http3Exception(Http3Errors.H3_SETTINGS_ERROR,
+			"SETTINGS_H3_DATAGRAM was 1 without a max_datagram_frame_size transport parameter, so there is" +
+			" no DATAGRAM frame to carry an HTTP/3 datagram in (RFC 9297 §2.1.1)");
+	}
+
+	/**
+	 * The QUIC handshake completed, so the peer's transport parameters exist and any cross-check
+	 * {@link #validatePeerDatagramSetting} had to defer can run. Reached only through the composite frame
+	 * handler, which exists only when datagrams are enabled.
+	 */
+	private void onQuicEstablished() {
+		if (state == State.CLOSED) return;
+		SettingsFrame peer = peerSettings;
+		// Still nothing to check: validatePeerDatagramSetting will run in full when they land, since by
+		// then the parameters are already here.
+		if (peer == null) return;
+		try {
+			checkDatagramSettingConsistent(Http3RememberedSettings.valueOf(peer, SettingsFrame.H3_DATAGRAM, 0));
+		} catch (Http3Exception e) {
+			closeWithError(e);
 		}
 	}
 
@@ -1910,6 +2143,11 @@ public final class Http3Connection extends AbstractReactive {
 		// it (FR-057a) instead of surviving the connection that produced it.
 		for (Http3RequestStream requestStream : new ArrayList<>(requestStreams.values())) {
 			requestStream.abort(errorCode, "The HTTP/3 connection is closing");
+			// Here rather than left to the whenClosed() continuation adoptRequestStream registers: an abort
+			// closes the QUIC stream only once the peer has answered the RESET_STREAM, and by then this
+			// connection is gone. "Recycled at close" has to mean at this statement, not eventually.
+			// Idempotent, so the continuation firing afterwards finds an empty queue.
+			requestStream.closeDatagrams();
 		}
 		requestStreams.clear();
 		// The third terminal path into the release bookkeeping (research D-3), and the only one that
@@ -2118,6 +2356,216 @@ public final class Http3Connection extends AbstractReactive {
 				return Promise.ofException(e);
 			}
 		}
+	}
+
+	// ---------------------------------------------------------------- HTTP/3 datagrams (RFC 9297)
+
+	/**
+	 * The {@link QuicFrameHandler} a datagram-enabled connection registers: DATAGRAM frames are HTTP/3's,
+	 * everything else is the stream layer's, unchanged.
+	 * <p>
+	 * A composite rather than an extension of {@code QuicStreamManager} because the two answer different
+	 * protocols — and it is <b>required</b>, not merely tidy: {@code QuicStreamManager.routeFrame} closes
+	 * the connection with {@code PROTOCOL_VIOLATION} for any frame it has no semantics for, which a
+	 * DATAGRAM frame is.
+	 * <p>
+	 * The loss and acknowledgement callbacks spell out for DATAGRAM exactly what
+	 * {@link QuicFrameHandler#onFrameLost}'s default already does — recycle, never retransmit (RFC 9221 §5,
+	 * research D-7). Delegating them to the manager instead would also be leak-free, but it would put the
+	 * decision in the layer that does not own it, and it would leave the dropped-by-loss count with nowhere
+	 * to live.
+	 */
+	private final class DatagramRoutingFrameHandler implements QuicFrameHandler {
+		@Override
+		public void onFrame(QuicConnection connection, EncryptionLevel level, QuicFrame frame)
+			throws QuicTransportException {
+			if (frame instanceof DatagramFrame datagram) {
+				onDatagramFrame(datagram);
+				return;
+			}
+			streamManager.onFrame(connection, level, frame);
+		}
+
+		@Override
+		public void onFrameAcknowledged(QuicConnection connection, QuicFrame frame) {
+			if (frame instanceof DatagramFrame) {
+				Recyclers.recycle(frame);
+				return;
+			}
+			streamManager.onFrameAcknowledged(connection, frame);
+		}
+
+		@Override
+		public void onFrameLost(QuicConnection connection, QuicFrame frame) {
+			if (frame instanceof DatagramFrame) {
+				// RFC 9221 §5: a datagram's value has expired by the time its loss is known, so it is
+				// released rather than requeued. This is the one place the connection can count that.
+				datagramsDropped++;
+				datagramsDroppedByLoss++;
+				eventListener.onDatagramDroppedByLoss(datagramsDroppedByLoss);
+				Recyclers.recycle(frame);
+				return;
+			}
+			streamManager.onFrameLost(connection, frame);
+		}
+
+		@Override
+		public void onEstablished(QuicConnection connection) {
+			streamManager.onEstablished(connection);
+			onQuicEstablished();
+		}
+
+		@Override
+		public void onEarlyDataRejected(QuicConnection connection) {
+			streamManager.onEarlyDataRejected(connection);
+		}
+
+		@Override
+		public void onClosed(QuicConnection connection) {
+			streamManager.onClosed(connection);
+		}
+	}
+
+	/**
+	 * One inbound HTTP/3 datagram (RFC 9297 §2.1). The frame is <b>borrowed</b>: what must outlive this
+	 * call is {@code slice()}d, and only on the delivery path, so a drop costs no allocation at all.
+	 * <p>
+	 * A malformed quarter stream ID is reported through {@link #closeWithError} and <b>never</b> rethrown
+	 * as a {@code QuicTransportException} (FR-061): {@code H3_DATAGRAM_ERROR} is 0x33, and 0x33 in a
+	 * transport {@code 0x1c} CONNECTION_CLOSE is a different code space entirely.
+	 * <p>
+	 * A datagram for a stream that has completed, been reset or not yet been opened is dropped and counted
+	 * rather than treated as an error — reordering makes that normal on an unreliable channel (FR-082).
+	 */
+	private void onDatagramFrame(DatagramFrame datagram) {
+		long streamId;
+		try {
+			streamId = Http3QuarterStreamId.read(datagram.payload);
+		} catch (Http3Exception e) {
+			closeWithError(e);
+			return;
+		}
+		Http3RequestStream requestStream = requestStreams.get(streamId);
+		if (requestStream == null || !requestStream.acceptsDatagrams()) {
+			datagramsDropped++;
+			return;
+		}
+		datagramsReceived++;
+		int payloadBytes = datagram.payload.readRemaining();
+		eventListener.onDatagramReceived(streamId, payloadBytes, datagramsReceived);
+		requestStream.onDatagram(datagram.payload.slice());
+	}
+
+	/**
+	 * The per-request-stream {@link Http3DatagramTransport} view, and the only object in the datagram path
+	 * that knows a QUIC stream ID — which is what keeps one out of {@link Http3DatagramChannel}'s API
+	 * entirely (FR-084). A deliberate sibling of {@link StreamQpackEncoder} and {@link StreamQpackDecoder},
+	 * which are the same shape for the same reason.
+	 */
+	private final class StreamDatagramTransport implements Http3DatagramTransport {
+		private final long streamId;
+
+		private StreamDatagramTransport(long streamId) {
+			this.streamId = streamId;
+		}
+
+		@Override
+		public boolean isAvailable() {
+			return datagramsAvailable();
+		}
+
+		/**
+		 * The largest application payload whose whole DATAGRAM frame — type code, Length field, quarter
+		 * stream ID and payload — still fits the peer's {@code max_datagram_frame_size}.
+		 * <p>
+		 * Corrected downwards rather than computed in one step because the Length field is itself a varint
+		 * over a value this arithmetic is solving for. {@code encodedLength(len) + len} is non-decreasing in
+		 * {@code len}, so scanning down from the largest conceivable value finds the true maximum, and the
+		 * scan is at most a handful of steps: the length varint can only shrink.
+		 */
+		@Override
+		public long maxPayloadSize() {
+			if (!datagramsAvailable()) return 0;
+			int quarterLength = quarterStreamIdLength();
+			if (quarterLength == 0) return 0;
+			// What is left for the Length varint plus the frame's data, after the type code.
+			long available = peerMaxDatagramFrameSize() - QuicVarInts.encodedLength(DatagramFrame.TYPE_WITH_LENGTH);
+			long len = available - 1;
+			while (len > 0 && QuicVarInts.encodedLength(len) + len > available) {
+				len--;
+			}
+			return Math.max(0, len - quarterLength);
+		}
+
+		@Override
+		public void send(ByteBuf payload) throws Http3DatagramException {
+			int quarterLength = quarterStreamIdLength();
+			if (quarterLength == 0) {
+				payload.recycle();
+				throw new Http3DatagramException(Http3DatagramException.Reason.NOT_NEGOTIATED,
+					"this exchange runs on a stream that has no quarter stream ID (RFC 9297 §2.1)");
+			}
+			int payloadBytes = payload.readRemaining();
+			// One buffer, because a DATAGRAM frame holds exactly one and no composite form exists — so the
+			// payload is copied behind the quarter stream ID. It is bounded by maxPayloadSize(), which is at
+			// most one UDP datagram's worth.
+			ByteBuf buf = ByteBufPool.allocate(quarterLength + payloadBytes);
+			try {
+				Http3QuarterStreamId.write(buf, streamId);
+			} catch (Http3Exception e) {
+				// Unreachable: quarterStreamIdLength() has already accepted this stream id.
+				buf.recycle();
+				payload.recycle();
+				throw new Http3DatagramException(Http3DatagramException.Reason.NOT_NEGOTIATED, e.reason());
+			}
+			buf.put(payload);
+			payload.recycle();
+			try {
+				// Owns buf on every path, this throw included.
+				quicConnection.sendDatagramFrame(buf);
+			} catch (QuicDatagramException e) {
+				throw new Http3DatagramException(reasonOf(e), e.getMessage(), e);
+			}
+			datagramsSent++;
+			eventListener.onDatagramSent(streamId, payloadBytes, datagramsSent);
+			quicConnection.requestSend();
+		}
+
+		@Override
+		public void onDroppedByQueue() {
+			datagramsDroppedByQueue++;
+			eventListener.onDatagramDroppedByQueue(streamId, datagramsDroppedByQueue);
+		}
+
+		@Override
+		public void onRefusedOversize(int payloadBytes, long maxPayloadBytes) {
+			datagramsRefusedOversize++;
+			eventListener.onDatagramRefusedOversize(
+				streamId, payloadBytes, maxPayloadBytes, datagramsRefusedOversize);
+		}
+
+		/** The quarter stream ID's encoded length, or {@code 0} for a stream that has none. */
+		private int quarterStreamIdLength() {
+			try {
+				return Http3QuarterStreamId.encodedLength(streamId);
+			} catch (Http3Exception e) {
+				return 0;
+			}
+		}
+	}
+
+	/**
+	 * A transport refusal in HTTP-level terms. {@code CONNECTION_CLOSED} becomes
+	 * {@code EXCHANGE_ENDED} because that is what it means to the one exchange asking: a connection that
+	 * will send nothing further has ended every exchange on it.
+	 */
+	private static Http3DatagramException.Reason reasonOf(QuicDatagramException e) {
+		return switch (e.reason()) {
+			case NOT_NEGOTIATED -> Http3DatagramException.Reason.NOT_NEGOTIATED;
+			case OVERSIZE -> Http3DatagramException.Reason.OVERSIZE;
+			case QUEUE_FULL -> Http3DatagramException.Reason.QUEUE_FULL;
+			case CONNECTION_CLOSED -> Http3DatagramException.Reason.EXCHANGE_ENDED;
+		};
 	}
 
 	/**

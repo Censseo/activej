@@ -48,6 +48,16 @@ public final class SettingsFrame extends Http3Frame {
 	/** {@code SETTINGS_QPACK_BLOCKED_STREAMS} (RFC 9204 §5). */
 	public static final long QPACK_BLOCKED_STREAMS = 0x07;
 
+	/**
+	 * {@code SETTINGS_H3_DATAGRAM} (RFC 9297 §2.1.1): 1 offers HTTP/3 datagrams, 0 (and absence)
+	 * declines them. Any other value is malformed — {@link #isValidH3DatagramValue}.
+	 * <p>
+	 * This is <b>setting identifier</b> 0x33, which is not
+	 * {@link io.activej.http3.Http3Errors#H3_DATAGRAM_ERROR} — <b>error code</b> 0x33. RFC 9297
+	 * assigns the two in independent registries and the numeric coincidence means nothing.
+	 */
+	public static final long H3_DATAGRAM = 0x33;
+
 	/** The RFC 9114 §7.2.4.1 HTTP/2 SETTINGS identifiers, reserved and rejected in HTTP/3. */
 	public static final Set<Long> RESERVED_IDENTIFIERS = Set.of(0x02L, 0x03L, 0x04L, 0x05L);
 
@@ -130,6 +140,31 @@ public final class SettingsFrame extends Http3Frame {
 			pairCount++;
 		}
 		return new SettingsFrame(Arrays.copyOf(ids, pairCount), Arrays.copyOf(vals, pairCount));
+	}
+
+	/**
+	 * Whether {@code value} is one of the two {@link #H3_DATAGRAM} values RFC 9297 §2.1.1 defines.
+	 * <p>
+	 * A predicate rather than a throwing check, because {@link #read} deliberately does not act on
+	 * identifiers whose meaning is a connection-level concern: an endpoint that never enabled datagrams
+	 * treats 0x33 as any other unknown identifier. The connection layer calls this on a received value
+	 * and closes with {@code H3_SETTINGS_ERROR} (0x0109) when it is false.
+	 */
+	public static boolean isValidH3DatagramValue(long value) {
+		return value == 0 || value == 1;
+	}
+
+	/**
+	 * RFC 9297 §2.1.1's cross-check between the two halves of the same offer: a peer that sends
+	 * {@link #H3_DATAGRAM} = 1 must also have advertised the RFC 9221 §3
+	 * {@code max_datagram_frame_size} transport parameter, since without it there is no frame to carry
+	 * an HTTP/3 datagram in. False is {@code H3_SETTINGS_ERROR} (0x0109) at the connection layer.
+	 *
+	 * @param h3DatagramValue       the peer's {@link #H3_DATAGRAM} value; 0 when it sent none
+	 * @param maxDatagramFrameSize  the peer's advertised {@code max_datagram_frame_size}; 0 when absent
+	 */
+	public static boolean isH3DatagramSettingConsistent(long h3DatagramValue, long maxDatagramFrameSize) {
+		return h3DatagramValue != 1 || maxDatagramFrameSize > 0;
 	}
 
 	@Override

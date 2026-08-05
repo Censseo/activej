@@ -24,8 +24,8 @@ import io.activej.http3.Http3Connection.QpackTable;
  * The module-internal seam through which an {@link Http3Connection} and the
  * {@link Http3RequestStream}s it owns report the events an {@link Http3Server.Inspector} or an
  * {@link Http3Client.Inspector} publishes but neither a server nor a client can see for itself
- * (FR-062) — the four of phase 1, the three QPACK dynamic-table counters of FR-018, and the three
- * blocked-section ones of FR-033 to FR-036.
+ * (FR-062) — the four of phase 1, the three QPACK dynamic-table counters of FR-018, the three
+ * blocked-section ones of FR-033 to FR-036, and the five datagram ones of FR-079 to FR-085.
  * <p>
  * Deliberately <b>not public</b>: a connection is built by the server or the client that owns it, and
  * this is how that owner is told what happened underneath it. The public observability surface is the
@@ -123,4 +123,49 @@ interface Http3EventListener {
 	 * {@code that count × maxFieldSectionSize} mean the byte bound.
 	 */
 	default void onQpackBlockedSectionRefused(long streamId, int blockedStreams, long heldBytes) {}
+
+	/**
+	 * One HTTP/3 datagram was handed to the transport for the exchange on {@code streamId} (FR-079).
+	 *
+	 * @param payloadBytes the application payload's length, quarter stream ID and framing excluded
+	 * @param sent         datagrams sent over this connection, this one included
+	 */
+	default void onDatagramSent(long streamId, int payloadBytes, long sent) {}
+
+	/**
+	 * One HTTP/3 datagram arrived for the exchange on {@code streamId} and was routed to it. A datagram
+	 * whose quarter stream ID named no live exchange never reaches here — it is a drop (FR-082).
+	 *
+	 * @param payloadBytes the application payload's length, quarter stream ID excluded
+	 * @param received     datagrams routed over this connection, this one included
+	 */
+	default void onDatagramReceived(long streamId, int payloadBytes, long received) {}
+
+	/**
+	 * An exchange's inbound queue was at {@code maxInboundDatagramsPerStream}, so its <b>oldest</b>
+	 * datagram was dropped to make room (FR-085). The bound is per exchange; this total is the
+	 * connection's, which is what says whether one exchange or all of them are behind.
+	 *
+	 * @param droppedByQueue queue drops over this connection, this one included
+	 */
+	default void onDatagramDroppedByQueue(long streamId, long droppedByQueue) {}
+
+	/**
+	 * A DATAGRAM frame carrying an HTTP/3 datagram was declared lost. RFC 9221 §5 forbids retransmitting
+	 * it, so it is released — this is the only signal that it existed. No stream id: loss is known of the
+	 * frame, and the exchange it belonged to is not re-derived from a payload already released.
+	 *
+	 * @param droppedByLoss loss drops over this connection, this one included
+	 */
+	default void onDatagramDroppedByLoss(long droppedByLoss) {}
+
+	/**
+	 * A send was refused because the payload exceeded what the peer's {@code max_datagram_frame_size}
+	 * leaves for one — RFC 9221 §3 forbids splitting it and truncating would corrupt it, so it is refused
+	 * whole and the payload recycled. Both sizes are carried, since the refusal is the difference.
+	 *
+	 * @param refusedOversize oversize refusals over this connection, this one included
+	 */
+	default void onDatagramRefusedOversize(
+		long streamId, int payloadBytes, long maxPayloadBytes, long refusedOversize) {}
 }

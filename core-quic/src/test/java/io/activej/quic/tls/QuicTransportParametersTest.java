@@ -25,7 +25,9 @@ import io.activej.test.rules.ByteBufRule;
 import org.junit.ClassRule;
 import org.junit.Test;
 
+import java.util.HashSet;
 import java.util.Random;
+import java.util.Set;
 
 import static org.junit.Assert.*;
 
@@ -37,6 +39,9 @@ public class QuicTransportParametersTest {
 
 	@ClassRule
 	public static final ByteBufRule byteBufRule = new ByteBufRule();
+
+	/** RFC 9221 §3. Spelled out here rather than exported, so the test asserts the number the RFC gives. */
+	private static final long ID_MAX_DATAGRAM_FRAME_SIZE = 0x20;
 
 	private final Random random = new Random(9000);
 
@@ -59,7 +64,8 @@ public class QuicTransportParametersTest {
 			randomBytes(41),            // preferredAddress
 			8,                          // activeConnectionIdLimit
 			randomBytes(8),             // initialSourceConnectionId
-			randomBytes(6));            // retrySourceConnectionId
+			randomBytes(6),             // retrySourceConnectionId
+			1200);                      // maxDatagramFrameSize
 		assertRoundTrip(parameters, true);
 	}
 
@@ -67,7 +73,7 @@ public class QuicTransportParametersTest {
 	public void roundTripsClientParameterSet() throws Exception {
 		QuicTransportParameters parameters = new QuicTransportParameters(
 			null, 0, null, 65527, 5_000_000, 1_000_000, 1_000_000, 1_000_000, 16, 16,
-			3, 25, false, null, 2, randomBytes(8), null);
+			3, 25, false, null, 2, randomBytes(8), null, 0);
 		assertRoundTrip(parameters, false);
 	}
 
@@ -95,6 +101,91 @@ public class QuicTransportParametersTest {
 		assertEquals(2, parameters.activeConnectionIdLimit());
 		assertNull(parameters.initialSourceConnectionId());
 		assertNull(parameters.retrySourceConnectionId());
+		// RFC 9221 §3: absent means the endpoint does not support DATAGRAM frames at all.
+		assertEquals(0, parameters.maxDatagramFrameSize());
+	}
+
+	// ---- max_datagram_frame_size (0x20, RFC 9221 §3) ----
+
+	@Test
+	public void maxDatagramFrameSizeRoundTripsWhenNonZero() throws Exception {
+		QuicTransportParameters parameters = new QuicTransportParameters(
+			null, 0, null, 65527, 0, 0, 0, 0, 0, 0, 3, 25, false, null, 2, randomBytes(8), null, 1252);
+
+		ByteBuf buf = ByteBufPool.allocate(parameters.encodedLength());
+		try {
+			parameters.writeTo(buf, false);
+			assertTrue("the parameter must actually be on the wire",
+				encodedParameterIds(buf).contains(ID_MAX_DATAGRAM_FRAME_SIZE));
+			assertEquals(1252, QuicTransportParameters.read(buf).maxDatagramFrameSize());
+		} finally {
+			buf.recycle();
+		}
+	}
+
+	@Test
+	public void aZeroMaxDatagramFrameSizeIsNotEmittedAtAll() throws Exception {
+		// The one varint parameter written conditionally: RFC 9221 §3 encodes "unsupported" as absence,
+		// and emitting an explicit 0 would change the bytes of every connection that never asked for
+		// datagrams. Asserted structurally rather than by scanning for a 0x20 byte, which a connection ID
+		// could contain by chance.
+		QuicTransportParameters off = new QuicTransportParameters(
+			null, 0, null, 65527, 0, 0, 0, 0, 0, 0, 3, 25, false, null, 2, randomBytes(8), null, 0);
+
+		ByteBuf buf = ByteBufPool.allocate(off.encodedLength());
+		try {
+			off.writeTo(buf, false);
+			assertEquals("encodedLength() must agree with what writeTo emitted",
+				off.encodedLength(), buf.readRemaining());
+			assertFalse(encodedParameterIds(buf).contains(ID_MAX_DATAGRAM_FRAME_SIZE));
+		} finally {
+			buf.recycle();
+		}
+	}
+
+	@Test
+	public void aPeersExplicitZeroDecodesAsUnsupported() throws Exception {
+		// A conforming peer may write the parameter with value 0, which means exactly what absence means.
+		ByteBuf buf = ByteBufPool.allocate(8);
+		QuicVarInts.write(buf, ID_MAX_DATAGRAM_FRAME_SIZE);
+		QuicVarInts.write(buf, 1);
+		QuicVarInts.write(buf, 0);
+		try {
+			assertEquals(0, QuicTransportParameters.read(buf).maxDatagramFrameSize());
+		} finally {
+			buf.recycle();
+		}
+	}
+
+	@Test
+	public void theIdsBetweenRetrySourceConnectionIdAndMaxDatagramFrameSizeAreStillSkipped() throws Exception {
+		// 0x11..0x1f sit inside the widened known-id range, so the decode guard must not mistake one for a
+		// parameter it knows (RFC 9000 §18.1: unknown ids are tolerated and skipped).
+		ByteBuf buf = ByteBufPool.allocate(64);
+		for (long id = 0x11; id <= 0x1f; id++) {
+			QuicVarInts.write(buf, id);
+			QuicVarInts.write(buf, 1);
+			QuicVarInts.write(buf, 7);
+		}
+		QuicVarInts.write(buf, ID_MAX_DATAGRAM_FRAME_SIZE);
+		QuicVarInts.write(buf, 2);
+		QuicVarInts.write(buf, 1252);
+		try {
+			QuicTransportParameters parameters = QuicTransportParameters.read(buf);
+			assertFalse(buf.canRead());
+			assertEquals(1252, parameters.maxDatagramFrameSize());
+		} finally {
+			buf.recycle();
+		}
+	}
+
+	@Test
+	public void maxDatagramFrameSizeOutOfVarIntRangeIsRefused() {
+		assertThrows(IllegalArgumentException.class, () -> new QuicTransportParameters(
+			null, 0, null, 65527, 0, 0, 0, 0, 0, 0, 3, 25, false, null, 2, null, null, -1));
+		assertThrows(IllegalArgumentException.class, () -> new QuicTransportParameters(
+			null, 0, null, 65527, 0, 0, 0, 0, 0, 0, 3, 25, false, null, 2, null, null,
+			QuicVarInts.MAX_VALUE + 1));
 	}
 
 	@Test
@@ -265,5 +356,21 @@ public class QuicTransportParametersTest {
 		byte[] bytes = new byte[length];
 		random.nextBytes(bytes);
 		return bytes;
+	}
+
+	/**
+	 * The parameter ids present in {@code encoded}, read by walking the (id, length, value) triples.
+	 * Leaves the buffer readable from where it started, so the caller can still decode it.
+	 */
+	private static Set<Long> encodedParameterIds(ByteBuf encoded) throws MalformedDataException {
+		ByteBuf view = ByteBuf.wrapForReading(encoded.array());
+		view.head(encoded.head());
+		view.tail(encoded.tail());
+		Set<Long> ids = new HashSet<>();
+		while (view.canRead()) {
+			ids.add(QuicVarInts.read(view));
+			view.moveHead((int) QuicVarInts.read(view));
+		}
+		return ids;
 	}
 }

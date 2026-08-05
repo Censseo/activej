@@ -288,7 +288,7 @@ public final class QuicHandshakeTest {
 			params.initialMaxStreamsBidi(), params.initialMaxStreamsUni(), params.ackDelayExponent(),
 			params.maxAckDelay(), params.disableActiveMigration(), params.preferredAddress(),
 			params.activeConnectionIdLimit(), new byte[]{9, 9, 9, 9, 9, 9, 9, 9},
-			params.retrySourceConnectionId()));
+			params.retrySourceConnectionId(), params.maxDatagramFrameSize()));
 		pump();
 
 		QuicTransportException e = causeOf(clientDone);
@@ -309,7 +309,7 @@ public final class QuicHandshakeTest {
 			params.initialMaxStreamsBidi(), params.initialMaxStreamsUni(), params.ackDelayExponent(),
 			params.maxAckDelay(), params.disableActiveMigration(), params.preferredAddress(),
 			params.activeConnectionIdLimit(), params.initialSourceConnectionId(),
-			params.retrySourceConnectionId()));
+			params.retrySourceConnectionId(), params.maxDatagramFrameSize()));
 		pump();
 
 		QuicTransportException e = causeOf(clientDone);

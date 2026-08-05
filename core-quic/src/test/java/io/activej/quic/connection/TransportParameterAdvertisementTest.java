@@ -167,6 +167,65 @@ public final class TransportParameterAdvertisementTest {
 		assertNull(params.retrySourceConnectionId());
 	}
 
+	// ---- max_datagram_frame_size: advertised only when the consumer enabled datagrams (FR-073) ----
+
+	@Test
+	public void theDefaultSettingsAdvertiseNoMaxDatagramFrameSize() {
+		// RFC 9221 §3 encodes "DATAGRAM not supported" as absence, and datagrams are off by default, so a
+		// consumer who never asked for them must be byte-for-byte where phase 1 left them.
+		QuicTransportParameters params =
+			TransportParameterValidation.local(QuicConnectionSettings.create(), LOCAL_CID, null);
+
+		assertEquals(0, params.maxDatagramFrameSize());
+	}
+
+	@Test
+	public void theConfiguredMaxDatagramFrameSizeIsAdvertised() {
+		QuicConnectionSettings settings = QuicConnectionSettings.builder()
+			.withMaxDatagramFrameSize(MemSize.bytes(1252))
+			.build();
+		QuicTransportParameters params = TransportParameterValidation.local(settings, LOCAL_CID, null);
+
+		assertEquals(1252, params.maxDatagramFrameSize());
+	}
+
+	@Test
+	public void aServerProcessingEarlyDataAdvertisesNoDatagramSupportToItself() {
+		// WITHOUT_SEND_CREDIT answers "what may I send before the handshake completes?", and until the
+		// client's parameters arrive the honest answer for DATAGRAM is the same as for everything else.
+		assertEquals(0, TransportParameterValidation.WITHOUT_SEND_CREDIT.maxDatagramFrameSize());
+	}
+
+	@Test
+	public void eachSideSeesTheOthersMaxDatagramFrameSizeAfterAHandshake() throws MalformedDataException {
+		QuicConnectionSettings clientSettings = QuicConnectionSettings.builder()
+			.withMaxDatagramFrameSize(MemSize.bytes(700))
+			.build();
+		QuicConnectionSettings serverSettings = QuicConnectionSettings.builder()
+			.withMaxDatagramFrameSize(MemSize.bytes(900))
+			.build();
+
+		wire.startClient(clientSettings);
+		wire.acceptServer(serverSettings);
+		wire.pump();
+
+		assertEquals(900, wire.client().peerTransportParameters().maxDatagramFrameSize());
+		assertEquals(700, wire.server().peerTransportParameters().maxDatagramFrameSize());
+	}
+
+	@Test
+	public void anEndpointWithDatagramsOffTellsAnEnabledPeerNothing() throws MalformedDataException {
+		// The "on ↔ off" compatibility row: the enabled side advertises, the other does not, and neither
+		// closes. The disabled side simply sees 0 and will refuse every send locally.
+		wire.startClient(QuicConnectionSettings.builder().withMaxDatagramFrameSize(MemSize.bytes(700)).build());
+		wire.acceptServer(QuicConnectionSettings.create());
+		wire.pump();
+
+		assertEquals(QuicConnectionState.ESTABLISHED, wire.client().state());
+		assertEquals(0, wire.client().peerTransportParameters().maxDatagramFrameSize());
+		assertEquals(700, wire.server().peerTransportParameters().maxDatagramFrameSize());
+	}
+
 	@Test
 	public void theAdvertisedSetStillPassesOurOwnValidator() throws Exception {
 		QuicTransportParameters params =

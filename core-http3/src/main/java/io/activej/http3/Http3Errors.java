@@ -17,7 +17,8 @@
 package io.activej.http3;
 
 /**
- * The RFC 9114 §8.1 HTTP/3 application error codes, plus the RFC 9204 §6 QPACK error codes.
+ * The RFC 9114 §8.1 HTTP/3 application error codes, plus the RFC 9204 §6 QPACK error codes and the
+ * RFC 9297 §5 HTTP/3 datagram error code.
  * <p>
  * These are the values carried by a QUIC CONNECTION_CLOSE or RESET_STREAM/STOP_SENDING frame's
  * application error code field — a third axis from {@link io.activej.http.HttpError} (a status
@@ -29,6 +30,8 @@ package io.activej.http3;
  * Codes</a>
  * @see <a href="https://www.rfc-editor.org/rfc/rfc9204#section-6">RFC 9204 §6 — QPACK Error
  * Codes</a>
+ * @see <a href="https://www.rfc-editor.org/rfc/rfc9297#section-5">RFC 9297 §5 — HTTP/3 Datagram
+ * Error Code</a>
  */
 public final class Http3Errors {
 	private Http3Errors() {}
@@ -95,4 +98,15 @@ public final class Http3Errors {
 
 	/** The peer's QPACK decoder stream carried an instruction this implementation does not accept (RFC 9204 §6). */
 	public static final long QPACK_DECODER_STREAM_ERROR = 0x0202;
+
+	/**
+	 * An HTTP/3 datagram's Quarter Stream ID did not map to a usable stream ID (RFC 9297 §2.1) — it is
+	 * not client-initiated bidirectional, its {@code × 4} would exceed 2^62−1, or its varint was
+	 * truncated.
+	 * <p>
+	 * This is <b>error code</b> 0x33, which is not
+	 * {@link io.activej.http3.frame.SettingsFrame#H3_DATAGRAM} — <b>setting identifier</b> 0x33. RFC
+	 * 9297 assigns the two in independent registries and the numeric coincidence means nothing.
+	 */
+	public static final long H3_DATAGRAM_ERROR = 0x33;
 }

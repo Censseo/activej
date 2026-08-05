@@ -79,7 +79,8 @@ public final class RememberedTransportParametersTest {
 		null,                                                    // preferred_address: excluded
 		4,                                                       // active_connection_id_limit
 		null,                                                    // initial_source_connection_id: excluded
-		null);                                                   // retry_source_connection_id: excluded
+		null,                                                    // retry_source_connection_id: excluded
+		1200);                                                   // max_datagram_frame_size (RFC 9221 §3)
 
 	// ---------------------------------------------------------------- the seven non-reducible limits
 
@@ -132,7 +133,7 @@ public final class RememberedTransportParametersTest {
 			null, 0, null, 65527,
 			2_000_000, 400_000, 600_000, 800_000, 200, 14,
 			QuicTransportParameters.DEFAULT_ACK_DELAY_EXPONENT, QuicTransportParameters.DEFAULT_MAX_ACK_DELAY,
-			false, null, 8, SCID, null);
+			false, null, 8, SCID, null, 2000);
 		TransportParameterValidation.validateNonReduction(REMEMBERED, raised);
 	}
 
@@ -160,8 +161,33 @@ public final class RememberedTransportParametersTest {
 			new byte[] {7},                                      // preferred_address
 			REMEMBERED.activeConnectionIdLimit(),
 			SCID,                                                // initial_source_connection_id
-			OTHER_SCID);                                         // retry_source_connection_id
+			OTHER_SCID,                                          // retry_source_connection_id
+			REMEMBERED.maxDatagramFrameSize());                  // covered, so held unchanged here
 		TransportParameterValidation.validateNonReduction(REMEMBERED, actual);
+	}
+
+	// ---------------------------------------------------------------- max_datagram_frame_size (RFC 9221 §3)
+
+	@Test
+	public void aReducedMaxDatagramFrameSizeIsAProtocolViolation() {
+		// RFC 9221 §3's own non-reduction rule, not RFC 9000 §7.4.1's, and it exists for the same reason:
+		// a DATAGRAM frame sized against the remembered value may already be on the wire.
+		assertReductionRefused("max_datagram_frame_size", with(p -> withMaxDatagramFrameSize(p, 1199)));
+	}
+
+	@Test
+	public void aRaisedMaxDatagramFrameSizeIsAccepted() throws QuicTransportException {
+		TransportParameterValidation.validateNonReduction(REMEMBERED,
+			withMaxDatagramFrameSize(REMEMBERED, 1300));
+	}
+
+	@Test
+	public void rememberableParametersCarriesMaxDatagramFrameSizeThrough() {
+		// RFC 9221 §3 explicitly permits remembering it, and it is what makes a DATAGRAM frame in early
+		// data reachable — clearing it would silently disable 0-RTT datagrams.
+		assertEquals(1252, QuicSessionTicket.rememberableParameters(new QuicTransportParameters(
+			OTHER_SCID, 30_000, RESET_TOKEN, 65527, 1, 2, 3, 4, 5, 6,
+			5, 50, true, new byte[] {7}, 4, SCID, OTHER_SCID, 1252)).maxDatagramFrameSize());
 	}
 
 	/**
@@ -174,7 +200,7 @@ public final class RememberedTransportParametersTest {
 		QuicTransportParameters full = new QuicTransportParameters(
 			OTHER_SCID, 30_000, RESET_TOKEN, 65527,
 			1, 2, 3, 4, 5, 6,
-			5, 50, true, new byte[] {7}, 4, SCID, OTHER_SCID);
+			5, 50, true, new byte[] {7}, 4, SCID, OTHER_SCID, 1252);
 		QuicTransportParameters remembered = QuicSessionTicket.rememberableParameters(full);
 
 		assertNull(remembered.originalDestinationConnectionId());
@@ -278,7 +304,8 @@ public final class RememberedTransportParametersTest {
 			base.initialMaxStreamDataBidiLocal(), base.initialMaxStreamDataBidiRemote(),
 			base.initialMaxStreamDataUni(), base.initialMaxStreamsBidi(), base.initialMaxStreamsUni(),
 			base.ackDelayExponent(), base.maxAckDelay(), base.disableActiveMigration(), base.preferredAddress(),
-			base.activeConnectionIdLimit(), base.initialSourceConnectionId(), base.retrySourceConnectionId());
+			base.activeConnectionIdLimit(), base.initialSourceConnectionId(), base.retrySourceConnectionId(),
+			base.maxDatagramFrameSize());
 	}
 
 	private static QuicTransportParameters withStreamData(QuicTransportParameters base, long bidiLocal,
@@ -288,7 +315,7 @@ public final class RememberedTransportParametersTest {
 			base.statelessResetToken(), base.maxUdpPayloadSize(), base.initialMaxData(), bidiLocal, bidiRemote, uni,
 			base.initialMaxStreamsBidi(), base.initialMaxStreamsUni(), base.ackDelayExponent(), base.maxAckDelay(),
 			base.disableActiveMigration(), base.preferredAddress(), base.activeConnectionIdLimit(),
-			base.initialSourceConnectionId(), base.retrySourceConnectionId());
+			base.initialSourceConnectionId(), base.retrySourceConnectionId(), base.maxDatagramFrameSize());
 	}
 
 	private static QuicTransportParameters withStreams(QuicTransportParameters base, long bidi, long uni) {
@@ -297,7 +324,17 @@ public final class RememberedTransportParametersTest {
 			base.initialMaxStreamDataBidiLocal(), base.initialMaxStreamDataBidiRemote(),
 			base.initialMaxStreamDataUni(), bidi, uni, base.ackDelayExponent(), base.maxAckDelay(),
 			base.disableActiveMigration(), base.preferredAddress(), base.activeConnectionIdLimit(),
-			base.initialSourceConnectionId(), base.retrySourceConnectionId());
+			base.initialSourceConnectionId(), base.retrySourceConnectionId(), base.maxDatagramFrameSize());
+	}
+
+	private static QuicTransportParameters withMaxDatagramFrameSize(QuicTransportParameters base, long size) {
+		return new QuicTransportParameters(base.originalDestinationConnectionId(), base.maxIdleTimeout(),
+			base.statelessResetToken(), base.maxUdpPayloadSize(), base.initialMaxData(),
+			base.initialMaxStreamDataBidiLocal(), base.initialMaxStreamDataBidiRemote(),
+			base.initialMaxStreamDataUni(), base.initialMaxStreamsBidi(), base.initialMaxStreamsUni(),
+			base.ackDelayExponent(), base.maxAckDelay(), base.disableActiveMigration(), base.preferredAddress(),
+			base.activeConnectionIdLimit(), base.initialSourceConnectionId(), base.retrySourceConnectionId(),
+			size);
 	}
 
 	private static QuicTransportParameters withActiveConnectionIdLimit(QuicTransportParameters base, long limit) {
@@ -306,6 +343,6 @@ public final class RememberedTransportParametersTest {
 			base.initialMaxStreamDataBidiLocal(), base.initialMaxStreamDataBidiRemote(),
 			base.initialMaxStreamDataUni(), base.initialMaxStreamsBidi(), base.initialMaxStreamsUni(),
 			base.ackDelayExponent(), base.maxAckDelay(), base.disableActiveMigration(), base.preferredAddress(),
-			limit, base.initialSourceConnectionId(), base.retrySourceConnectionId());
+			limit, base.initialSourceConnectionId(), base.retrySourceConnectionId(), base.maxDatagramFrameSize());
 	}
 }

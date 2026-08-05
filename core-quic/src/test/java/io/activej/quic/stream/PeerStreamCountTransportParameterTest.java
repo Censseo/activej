@@ -83,7 +83,7 @@ public final class PeerStreamCountTransportParameterTest {
 			null, 30_000, null, 1350,
 			0, 0, 0, 0, initialMaxStreamsBidi, initialMaxStreamsUni,
 			3, 25, true, null, 2,
-			new byte[]{1, 2, 3, 4, 5, 6, 7, 8}, null);
+			new byte[]{1, 2, 3, 4, 5, 6, 7, 8}, null, 0);
 	}
 
 	private void startClientOnly() {

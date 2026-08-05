@@ -204,7 +204,7 @@ public final class QuicSessionTicketTest {
 			new byte[]{1, 2, 3, 4}, 30_000, new byte[16], 1350,
 			1_000_000, 256_000, 256_001, 256_002, 100, 3,
 			7, 50, true, new byte[]{9, 9}, 4,
-			new byte[]{5, 6, 7, 8}, new byte[]{7, 7});
+			new byte[]{5, 6, 7, 8}, new byte[]{7, 7}, 1252);
 
 		QuicTransportParameters remembered = QuicSessionTicket.rememberableParameters(full);
 
@@ -234,7 +234,7 @@ public final class QuicSessionTicketTest {
 			new byte[]{1, 2, 3, 4}, 30_000, new byte[16], 1350,
 			1_000_000, 256_000, 256_001, 256_002, 100, 3,
 			7, 50, true, new byte[]{9, 9}, 4,
-			new byte[]{5, 6, 7, 8}, new byte[]{7, 7});
+			new byte[]{5, 6, 7, 8}, new byte[]{7, 7}, 1252);
 
 		QuicSessionTicket ticket = QuicSessionTicket.builder("example.com", "h3",
 				TlsCipherSuite.TLS_AES_128_GCM_SHA256, secret(32))
@@ -358,7 +358,7 @@ public final class QuicSessionTicketTest {
 			null, 0, null, 1350,
 			1_000_000, 256_000, 256_001, 256_002, 100, 3,
 			QuicTransportParameters.DEFAULT_ACK_DELAY_EXPONENT, QuicTransportParameters.DEFAULT_MAX_ACK_DELAY,
-			false, null, 4, null, null));
+			false, null, 4, null, null, 0));
 	}
 
 	static byte[] secret(int length) {

@@ -49,10 +49,11 @@ import java.time.Duration;
  * <p>
  * The eight session-resumption bounds are local state in the same sense: RFC 8446 §4.6.1 puts a
  * ticket's lifetime, the keys that seal it and the registers that bound it nowhere on the wire.
- * {@code maxDatagramFrameSize} is the one limit here destined to leave the process, as the RFC 9221 §3
- * {@code max_datagram_frame_size} transport parameter; it defaults to {@code 0}, "DATAGRAM not
- * supported", and nothing encodes it yet — a value set here advertises nothing until the datagram
- * layer is wired behind it.
+ * {@code maxDatagramFrameSize} is the seventh limit that leaves the process, as the RFC 9221 §3
+ * {@code max_datagram_frame_size} transport parameter. It defaults to {@code 0}, "DATAGRAM not
+ * supported", which is encoded as <b>absence</b> — so a connection that never enabled datagrams puts
+ * nothing extra on the wire. {@code maxOutboundDatagrams} stays local: it bounds the datagrams awaiting
+ * a packet, and the send is refused at the bound rather than queued.
  *
  * @see <a href="https://www.rfc-editor.org/rfc/rfc9000#section-14">RFC 9000 §14 — Datagram Size</a>
  * @see <a href="https://www.rfc-editor.org/rfc/rfc9000#section-10.1">RFC 9000 §10.1 — Idle Timeout</a>

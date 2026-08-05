@@ -47,7 +47,7 @@ public final class TransportParameterValidationTest {
 			null, 30_000, null, 1350,
 			0, 0, 0, 0, 0, 0,
 			3, 25, true, null, 2,
-			PEER_SCID_BYTES, null);
+			PEER_SCID_BYTES, null, 0);
 	}
 
 	private static QuicTransportParameters with(
@@ -57,7 +57,7 @@ public final class TransportParameterValidationTest {
 			null, 30_000, null, maxUdpPayloadSize,
 			0, 0, 0, 0, 0, 0,
 			ackDelayExponent, maxAckDelay, true, null, activeConnectionIdLimit,
-			PEER_SCID_BYTES, null);
+			PEER_SCID_BYTES, null, 0);
 	}
 
 	private static void expectTransportParameterError(QuicTransportParameters peer, String expectedInMessage) {
@@ -128,7 +128,7 @@ public final class TransportParameterValidationTest {
 	@Test
 	public void missingInitialSourceConnectionIdIsRejected() {
 		QuicTransportParameters peer = new QuicTransportParameters(
-			null, 30_000, null, 1350, 0, 0, 0, 0, 0, 0, 3, 25, true, null, 2, null, null);
+			null, 30_000, null, 1350, 0, 0, 0, 0, 0, 0, 3, 25, true, null, 2, null, null, 0);
 		expectTransportParameterError(peer, "initial_source_connection_id is missing");
 	}
 
@@ -136,7 +136,7 @@ public final class TransportParameterValidationTest {
 	public void initialSourceConnectionIdNotMatchingTheObservedScidIsRejected() {
 		QuicTransportParameters peer = new QuicTransportParameters(
 			null, 30_000, null, 1350, 0, 0, 0, 0, 0, 0, 3, 25, true, null, 2,
-			new byte[]{8, 7, 6, 5, 4, 3, 2, 1}, null);
+			new byte[]{8, 7, 6, 5, 4, 3, 2, 1}, null, 0);
 		expectTransportParameterError(peer, "initial_source_connection_id does not match");
 	}
 
@@ -160,7 +160,7 @@ public final class TransportParameterValidationTest {
 	public void originalDestinationConnectionIdNotMatchingTheFirstDcidIsRejected() {
 		QuicTransportParameters peer = new QuicTransportParameters(
 			new byte[]{0, 0, 0, 0, 0, 0, 0, 0}, 30_000, null, 1350, 0, 0, 0, 0, 0, 0,
-			3, 25, true, null, 2, PEER_SCID_BYTES, null);
+			3, 25, true, null, 2, PEER_SCID_BYTES, null, 0);
 		QuicTransportException e = assertThrows(QuicTransportException.class,
 			() -> TransportParameterValidation.validate(peer, PEER_SCID, CLIENT_FIRST_DCID, null));
 		assertEquals(QuicTransportErrors.TRANSPORT_PARAMETER_ERROR, e.errorCode());
@@ -171,7 +171,7 @@ public final class TransportParameterValidationTest {
 	public void matchingOriginalDestinationConnectionIdIsAccepted() throws Exception {
 		QuicTransportParameters peer = new QuicTransportParameters(
 			CLIENT_FIRST_DCID_BYTES, 30_000, null, 1350, 0, 0, 0, 0, 0, 0,
-			3, 25, true, null, 2, PEER_SCID_BYTES, null);
+			3, 25, true, null, 2, PEER_SCID_BYTES, null, 0);
 		TransportParameterValidation.validate(peer, PEER_SCID, CLIENT_FIRST_DCID, null);
 	}
 
@@ -181,7 +181,7 @@ public final class TransportParameterValidationTest {
 	public void retrySourceConnectionIdPresentWithoutARetryIsRejected() {
 		QuicTransportParameters peer = new QuicTransportParameters(
 			null, 30_000, null, 1350, 0, 0, 0, 0, 0, 0, 3, 25, true, null, 2,
-			PEER_SCID_BYTES, RETRY_SCID_BYTES);
+			PEER_SCID_BYTES, RETRY_SCID_BYTES, 0);
 		expectTransportParameterError(peer, "retry_source_connection_id is present although no Retry");
 	}
 
@@ -197,7 +197,7 @@ public final class TransportParameterValidationTest {
 	public void retrySourceConnectionIdNotMatchingTheRetryIsRejected() {
 		QuicTransportParameters peer = new QuicTransportParameters(
 			null, 30_000, null, 1350, 0, 0, 0, 0, 0, 0, 3, 25, true, null, 2,
-			PEER_SCID_BYTES, new byte[]{1, 1, 1, 1});
+			PEER_SCID_BYTES, new byte[]{1, 1, 1, 1}, 0);
 		QuicTransportException e = assertThrows(QuicTransportException.class,
 			() -> TransportParameterValidation.validate(peer, PEER_SCID, null, RETRY_SCID));
 		assertEquals(QuicTransportErrors.TRANSPORT_PARAMETER_ERROR, e.errorCode());
@@ -208,7 +208,7 @@ public final class TransportParameterValidationTest {
 	public void matchingRetrySourceConnectionIdIsAccepted() throws Exception {
 		QuicTransportParameters peer = new QuicTransportParameters(
 			null, 30_000, null, 1350, 0, 0, 0, 0, 0, 0, 3, 25, true, null, 2,
-			PEER_SCID_BYTES, RETRY_SCID_BYTES);
+			PEER_SCID_BYTES, RETRY_SCID_BYTES, 0);
 		TransportParameterValidation.validate(peer, PEER_SCID, null, RETRY_SCID);
 	}
 
@@ -222,7 +222,7 @@ public final class TransportParameterValidationTest {
 			// A minimal but well-formed preferred_address: 4-byte IPv4 + port + 16-byte IPv6 + port
 			// + CID length + CID + 16-byte reset token. Contents are irrelevant — it must simply
 			// not be rejected.
-			new byte[4 + 2 + 16 + 2 + 1 + 16], 2, PEER_SCID_BYTES, null);
+			new byte[4 + 2 + 16 + 2 + 1 + 16], 2, PEER_SCID_BYTES, null, 0);
 		TransportParameterValidation.validate(peer, PEER_SCID, null, null);
 	}
 

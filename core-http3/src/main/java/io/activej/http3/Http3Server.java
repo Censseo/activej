@@ -283,6 +283,56 @@ public final class Http3Server extends AbstractNioReactive implements AutoClosea
 		 * @param refusals refusals for <i>this reason</i> over this server's life, this one included
 		 */
 		default void onEarlyDataRefused(Http3Server server, EarlyDataRefusal reason, long refusals) {}
+
+		/**
+		 * An HTTP/3 datagram was handed to the transport for the exchange on {@code streamId} (FR-079).
+		 * Silent with {@link Http3Settings#datagramsEnabled()} off, which is the default and sends none.
+		 * <p>
+		 * "Sent" is not "delivered" and cannot be: RFC 9221 §5 neither retransmits a lost DATAGRAM frame
+		 * nor acknowledges it usefully, so {@link #onDatagramDroppedByLoss} is the only negative signal
+		 * there is, and even it is silent about a datagram lost without being noticed.
+		 *
+		 * @param payloadBytes the application payload's length — a size, never a byte of it (SI-6)
+		 * @param sent         datagrams sent over the connection carrying this exchange, this one included
+		 */
+		default void onDatagramSent(Http3Server server, long streamId, int payloadBytes, long sent) {}
+
+		/**
+		 * An HTTP/3 datagram arrived for the exchange on {@code streamId} and was routed to it. One whose
+		 * quarter stream ID named no live exchange is dropped rather than routed (FR-082) and is not
+		 * counted here.
+		 *
+		 * @param received datagrams routed over the connection carrying this exchange, this one included
+		 */
+		default void onDatagramReceived(Http3Server server, long streamId, int payloadBytes, long received) {}
+
+		/**
+		 * An exchange's inbound queue was at {@link Http3Settings#maxInboundDatagramsPerStream()}, so its
+		 * <b>oldest</b> datagram was dropped to make room (FR-085) — a reader falling behind, never a
+		 * protocol error and never a connection closing.
+		 *
+		 * @param droppedByQueue queue drops over that connection, this one included
+		 */
+		default void onDatagramDroppedByQueue(Http3Server server, long streamId, long droppedByQueue) {}
+
+		/**
+		 * A DATAGRAM frame carrying an HTTP/3 datagram was declared lost and released rather than
+		 * retransmitted (RFC 9221 §5). Carries no stream id: what is known lost is the frame, and its
+		 * payload is gone by the time anything could re-derive the exchange from it.
+		 *
+		 * @param droppedByLoss loss drops over that connection, this one included
+		 */
+		default void onDatagramDroppedByLoss(Http3Server server, long droppedByLoss) {}
+
+		/**
+		 * A send was refused whole because its payload exceeded what the peer's
+		 * {@code max_datagram_frame_size} leaves — RFC 9221 §3 forbids splitting a datagram, so truncating
+		 * it is not an option. The two sizes are the refusal.
+		 *
+		 * @param refusedOversize oversize refusals over that connection, this one included
+		 */
+		default void onDatagramRefusedOversize(
+			Http3Server server, long streamId, int payloadBytes, long maxPayloadBytes, long refusedOversize) {}
 	}
 
 	private final AsyncServlet servlet;
@@ -387,6 +437,36 @@ public final class Http3Server extends AbstractNioReactive implements AutoClosea
 		public void onQpackBlockedSectionRefused(long streamId, int blockedStreams, long heldBytes) {
 			if (inspector != null) {
 				inspector.onQpackBlockedSectionRefused(Http3Server.this, streamId, blockedStreams, heldBytes);
+			}
+		}
+
+		@Override
+		public void onDatagramSent(long streamId, int payloadBytes, long sent) {
+			if (inspector != null) inspector.onDatagramSent(Http3Server.this, streamId, payloadBytes, sent);
+		}
+
+		@Override
+		public void onDatagramReceived(long streamId, int payloadBytes, long received) {
+			if (inspector != null) inspector.onDatagramReceived(Http3Server.this, streamId, payloadBytes, received);
+		}
+
+		@Override
+		public void onDatagramDroppedByQueue(long streamId, long droppedByQueue) {
+			if (inspector != null) inspector.onDatagramDroppedByQueue(Http3Server.this, streamId, droppedByQueue);
+		}
+
+		@Override
+		public void onDatagramDroppedByLoss(long droppedByLoss) {
+			if (inspector != null) inspector.onDatagramDroppedByLoss(Http3Server.this, droppedByLoss);
+		}
+
+		@Override
+		public void onDatagramRefusedOversize(
+			long streamId, int payloadBytes, long maxPayloadBytes, long refusedOversize
+		) {
+			if (inspector != null) {
+				inspector.onDatagramRefusedOversize(
+					Http3Server.this, streamId, payloadBytes, maxPayloadBytes, refusedOversize);
 			}
 		}
 	};
@@ -775,8 +855,9 @@ public final class Http3Server extends AbstractNioReactive implements AutoClosea
 	// ---------------------------------------------------------------- serving
 
 	/**
-	 * One {@link Http3Connection} per accepted QUIC connection; its {@code QuicStreamManager} is the
-	 * frame handler the transport asked for (FR-058a).
+	 * One {@link Http3Connection} per accepted QUIC connection, which answers with the frame handler the
+	 * transport asked for (FR-058a) — its {@code QuicStreamManager} alone, or, with
+	 * {@link Http3Settings#datagramsEnabled()}, a composite that also routes RFC 9221 DATAGRAM frames.
 	 */
 	private QuicFrameHandler onConnection(QuicConnection quicConnection) {
 		connectionsAccepted++;
@@ -792,7 +873,7 @@ public final class Http3Server extends AbstractNioReactive implements AutoClosea
 			.build();
 		connections.add(h3);
 		quicConnection.whenEstablished().whenResult(this::onHandshakeComplete);
-		QuicFrameHandler handler = h3.startAndGetStreamManager();
+		QuicFrameHandler handler = h3.startAndGetFrameHandler();
 		// A connection admitted while this server is draining is told so at once: it will be given no
 		// request, and every stream it opens is refused with H3_REQUEST_REJECTED (RFC 9114 §5.2).
 		if (closed) h3.goAway();

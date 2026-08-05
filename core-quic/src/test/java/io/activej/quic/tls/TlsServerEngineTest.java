@@ -58,7 +58,7 @@ public class TlsServerEngineTest {
 		1 << 20, 1 << 16, 1 << 16, 1 << 16, 100, 100,
 		QuicTransportParameters.DEFAULT_ACK_DELAY_EXPONENT, QuicTransportParameters.DEFAULT_MAX_ACK_DELAY,
 		false, null, QuicTransportParameters.DEFAULT_ACTIVE_CONNECTION_ID_LIMIT,
-		new byte[] {5, 6, 7, 8}, null);
+		new byte[] {5, 6, 7, 8}, null, 0);
 
 	// ---- the full scripted handshake (acceptance scenarios 1 + 2) ----
 

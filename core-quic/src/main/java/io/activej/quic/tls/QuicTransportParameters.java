@@ -41,6 +41,12 @@ import java.util.Set;
  * {@link #writeTo(ByteBuf, boolean)} fails fast when they are absent. Semantic value checks
  * (minimums, connection-ID equality with packet headers) are the connection layer's, per the
  * syntax/semantics split of the codec layer.
+ * <p>
+ * One parameter outside RFC 9000 is carried here: {@code max_datagram_frame_size} (0x20,
+ * RFC 9221 §3), which is also the only varint parameter written <b>conditionally</b> — see
+ * {@link #writeTo(ByteBuf)}.
+ *
+ * @see <a href="https://www.rfc-editor.org/rfc/rfc9221#section-3">RFC 9221 §3 — max_datagram_frame_size</a>
  */
 public record QuicTransportParameters(
 	@Nullable byte[] originalDestinationConnectionId,
@@ -59,7 +65,8 @@ public record QuicTransportParameters(
 	@Nullable byte[] preferredAddress,
 	long activeConnectionIdLimit,
 	@Nullable byte[] initialSourceConnectionId,
-	@Nullable byte[] retrySourceConnectionId) {
+	@Nullable byte[] retrySourceConnectionId,
+	long maxDatagramFrameSize) {
 
 	// RFC 9000 §18.2 parameter identifiers
 	private static final long ID_ORIGINAL_DESTINATION_CONNECTION_ID = 0x00;
@@ -79,6 +86,8 @@ public record QuicTransportParameters(
 	private static final long ID_ACTIVE_CONNECTION_ID_LIMIT = 0x0e;
 	private static final long ID_INITIAL_SOURCE_CONNECTION_ID = 0x0f;
 	private static final long ID_RETRY_SOURCE_CONNECTION_ID = 0x10;
+	/** RFC 9221 §3, outside the RFC 9000 §18.2 block and the highest id encoded here. */
+	private static final long ID_MAX_DATAGRAM_FRAME_SIZE = 0x20;
 
 	// RFC 9000 §18.2 defaults for absent parameters
 	public static final long DEFAULT_MAX_UDP_PAYLOAD_SIZE = 65527;
@@ -96,7 +105,7 @@ public record QuicTransportParameters(
 		return new QuicTransportParameters(
 			null, 0, null, DEFAULT_MAX_UDP_PAYLOAD_SIZE, 0, 0, 0, 0, 0, 0,
 			DEFAULT_ACK_DELAY_EXPONENT, DEFAULT_MAX_ACK_DELAY, false, null,
-			DEFAULT_ACTIVE_CONNECTION_ID_LIMIT, initialSourceConnectionId, null);
+			DEFAULT_ACTIVE_CONNECTION_ID_LIMIT, initialSourceConnectionId, null, 0);
 	}
 
 	/**
@@ -124,6 +133,7 @@ public record QuicTransportParameters(
 		checkVarIntRange("ack_delay_exponent", ackDelayExponent);
 		checkVarIntRange("max_ack_delay", maxAckDelay);
 		checkVarIntRange("active_connection_id_limit", activeConnectionIdLimit);
+		checkVarIntRange("max_datagram_frame_size", maxDatagramFrameSize);
 	}
 
 	@Override
@@ -173,6 +183,9 @@ public record QuicTransportParameters(
 		length += encodedVarIntParameterLength(ID_ACTIVE_CONNECTION_ID_LIMIT, activeConnectionIdLimit);
 		length += encodedBytesParameterLength(ID_INITIAL_SOURCE_CONNECTION_ID, initialSourceConnectionId);
 		length += encodedBytesParameterLength(ID_RETRY_SOURCE_CONNECTION_ID, retrySourceConnectionId);
+		if (maxDatagramFrameSize > 0) {
+			length += encodedVarIntParameterLength(ID_MAX_DATAGRAM_FRAME_SIZE, maxDatagramFrameSize);
+		}
 		return length;
 	}
 
@@ -180,6 +193,11 @@ public record QuicTransportParameters(
 	 * Writes all present parameters in ascending-id order, without role validation.
 	 * The extension wrapper ({@link QuicTransportParametersExt}) uses this form; engines use
 	 * {@link #writeTo(ByteBuf, boolean)} so mandatory parameters are enforced per role.
+	 * <p>
+	 * {@code max_datagram_frame_size} is the one varint parameter written <b>conditionally</b>, unlike
+	 * every other one here. RFC 9221 §3 gives absence and 0 the same meaning — "DATAGRAM frames are not
+	 * supported" — so a 0 is omitted rather than emitted, which is what leaves an endpoint that never
+	 * enabled datagrams byte-for-byte where it was before the parameter existed.
 	 */
 	public void writeTo(ByteBuf out) {
 		writeBytesParameter(out, ID_ORIGINAL_DESTINATION_CONNECTION_ID, originalDestinationConnectionId);
@@ -202,6 +220,9 @@ public record QuicTransportParameters(
 		writeVarIntParameter(out, ID_ACTIVE_CONNECTION_ID_LIMIT, activeConnectionIdLimit);
 		writeBytesParameter(out, ID_INITIAL_SOURCE_CONNECTION_ID, initialSourceConnectionId);
 		writeBytesParameter(out, ID_RETRY_SOURCE_CONNECTION_ID, retrySourceConnectionId);
+		if (maxDatagramFrameSize > 0) {
+			writeVarIntParameter(out, ID_MAX_DATAGRAM_FRAME_SIZE, maxDatagramFrameSize);
+		}
 	}
 
 	/**
@@ -252,6 +273,7 @@ public record QuicTransportParameters(
 		long activeConnectionIdLimit = DEFAULT_ACTIVE_CONNECTION_ID_LIMIT;
 		byte[] initialSourceConnectionId = null;
 		byte[] retrySourceConnectionId = null;
+		long maxDatagramFrameSize = 0;
 
 		Set<Long> seen = new HashSet<>();
 		while (in.canRead()) {
@@ -266,7 +288,7 @@ public record QuicTransportParameters(
 				throw new DuplicateTransportParameterException(id);
 			}
 			int len = (int) valueLength;
-			int knownId = id <= ID_RETRY_SOURCE_CONNECTION_ID ? (int) id : -1;
+			int knownId = id <= ID_MAX_DATAGRAM_FRAME_SIZE ? (int) id : -1;
 			switch (knownId) {
 				case (int) ID_ORIGINAL_DESTINATION_CONNECTION_ID -> originalDestinationConnectionId = readBytes(in, len);
 				case (int) ID_MAX_IDLE_TIMEOUT -> maxIdleTimeout = readVarIntValue(in, len, id);
@@ -296,6 +318,7 @@ public record QuicTransportParameters(
 				case (int) ID_ACTIVE_CONNECTION_ID_LIMIT -> activeConnectionIdLimit = readVarIntValue(in, len, id);
 				case (int) ID_INITIAL_SOURCE_CONNECTION_ID -> initialSourceConnectionId = readBytes(in, len);
 				case (int) ID_RETRY_SOURCE_CONNECTION_ID -> retrySourceConnectionId = readBytes(in, len);
+				case (int) ID_MAX_DATAGRAM_FRAME_SIZE -> maxDatagramFrameSize = readVarIntValue(in, len, id);
 				default -> in.moveHead(len); // unknown id: tolerated, skipped (RFC 9000 §18.1)
 			}
 		}
@@ -304,7 +327,7 @@ public record QuicTransportParameters(
 			initialMaxData, initialMaxStreamDataBidiLocal, initialMaxStreamDataBidiRemote, initialMaxStreamDataUni,
 			initialMaxStreamsBidi, initialMaxStreamsUni, ackDelayExponent, maxAckDelay,
 			disableActiveMigration, preferredAddress, activeConnectionIdLimit,
-			initialSourceConnectionId, retrySourceConnectionId);
+			initialSourceConnectionId, retrySourceConnectionId, maxDatagramFrameSize);
 	}
 
 	@Override
@@ -323,6 +346,7 @@ public record QuicTransportParameters(
 			&& maxAckDelay == other.maxAckDelay
 			&& disableActiveMigration == other.disableActiveMigration
 			&& activeConnectionIdLimit == other.activeConnectionIdLimit
+			&& maxDatagramFrameSize == other.maxDatagramFrameSize
 			&& Arrays.equals(originalDestinationConnectionId, other.originalDestinationConnectionId)
 			&& Arrays.equals(statelessResetToken, other.statelessResetToken)
 			&& Arrays.equals(preferredAddress, other.preferredAddress)
@@ -336,7 +360,7 @@ public record QuicTransportParameters(
 			maxIdleTimeout, maxUdpPayloadSize, initialMaxData,
 			initialMaxStreamDataBidiLocal, initialMaxStreamDataBidiRemote, initialMaxStreamDataUni,
 			initialMaxStreamsBidi, initialMaxStreamsUni, ackDelayExponent, maxAckDelay,
-			disableActiveMigration, activeConnectionIdLimit)
+			disableActiveMigration, activeConnectionIdLimit, maxDatagramFrameSize)
 			+ Arrays.hashCode(originalDestinationConnectionId)
 			+ Arrays.hashCode(statelessResetToken)
 			+ Arrays.hashCode(preferredAddress)

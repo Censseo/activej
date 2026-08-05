@@ -44,6 +44,7 @@ import org.slf4j.LoggerFactory;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.EnumSet;
@@ -345,8 +346,26 @@ public final class QuicConnection extends AbstractReactive {
 	 */
 	private boolean ackElicitingSentSinceReceive;
 
+	/**
+	 * RFC 9221 DATAGRAM frames waiting for a packet, deliberately <b>not</b> in {@link #sendQueue}.
+	 * <p>
+	 * Three reasons, each of which would otherwise be a defect. RFC 9221 §3 bounds unreliable sends by a
+	 * <i>count</i> while the send queue's bound is global and in bytes. {@code SendQueue.pollUpTo} leaves
+	 * a frame that does not fit at the front and never looks past it, which for a DATAGRAM is exactly the
+	 * indefinite hold FR-078 forbids — and it would head-of-line-block the stream frames behind it. And
+	 * refusal at the bound must not be {@code INTERNAL_ERROR}: refusing an unreliable send is normal.
+	 * <p>
+	 * Not per level either, so the 0-RTT → 1-RTT re-levelling has nothing to move: the queue is drained
+	 * at whatever {@link #applicationSendLevel()} says at flush time.
+	 */
+	private final ArrayDeque<DatagramFrame> outboundDatagrams = new ArrayDeque<>();
+
 	private long datagramsSent;
 	private long datagramsReceived;
+	private long datagramFramesSent;
+	private long datagramFramesReceived;
+	private long datagramFramesDropped;
+	private long datagramFramesRefused;
 	private long packetsDropped;
 	private long packetsLost;
 	private long probesSent;
@@ -1143,6 +1162,10 @@ public final class QuicConnection extends AbstractReactive {
 			// Nothing beyond the ack-eliciting accounting already done.
 			return;
 		}
+		if (frame instanceof DatagramFrame datagram) {
+			handleDatagramFrame(level, datagram);
+			return;
+		}
 		if (isToleratedTransportFrame(frame)) {
 			// Frames that concern paths and connection IDs we do not use. RFC 9000 §12.4 permits ignoring
 			// them, and a real peer sends several of them unprompted — NEW_CONNECTION_ID in particular — so
@@ -1157,6 +1180,51 @@ public final class QuicConnection extends AbstractReactive {
 			return;
 		}
 		routeToHandler(level, frame);
+	}
+
+	/**
+	 * One received RFC 9221 DATAGRAM frame, classified totally and in this order (FR-074, FR-077).
+	 * <p>
+	 * The "advertised nothing" test comes <b>first</b>: a limit of 0 is RFC 9221 §3's encoding of "not
+	 * supported", so measuring against it would report every frame as a size problem when the real one is
+	 * that the peer sent something this endpoint never offered to receive.
+	 * <p>
+	 * <b>The size is measured against the frame's minimal wire form</b>, {@code 1 + payload}, not against
+	 * {@link DatagramFrame#encodedLength()}. RFC 9221 §3's parameter covers type, optional length field
+	 * and payload, but a frame that arrived in the 0x30 form carries no length field and
+	 * {@link DatagramFrame} does not record which form it arrived in — {@code encodedLength()} always
+	 * reports the wider 0x31 form. Measuring with that would close the connection over a frame a
+	 * conforming peer was entitled to send. The send path is the strict half of that asymmetry: it
+	 * measures with {@code encodedLength()}, which there <i>is</i> exact, because {@code writeTo} always
+	 * emits 0x31.
+	 * <p>
+	 * With no handler registered the frame is dropped and counted rather than treated as an error. This
+	 * endpoint advertised support and then attached nothing to deliver to, which is its own configuration
+	 * — the same asymmetry {@link #isStreamCreditFrame} already documents for FR-039.
+	 * <p>
+	 * The frame is <b>borrowed</b> throughout; {@code openAndHandle}'s sweep owns it.
+	 *
+	 * @see <a href="https://www.rfc-editor.org/rfc/rfc9221#section-3">RFC 9221 §3 — max_datagram_frame_size</a>
+	 */
+	private void handleDatagramFrame(EncryptionLevel level, DatagramFrame datagram) throws QuicTransportException {
+		long limit = settings.maxDatagramFrameSize();
+		if (limit == 0) {
+			throw new QuicTransportException(QuicTransportErrors.PROTOCOL_VIOLATION,
+				"Received a DATAGRAM frame, but this endpoint advertised no max_datagram_frame_size");
+		}
+		long minimalWireSize =
+			QuicVarInts.encodedLength(DatagramFrame.TYPE_WITHOUT_LENGTH) + datagram.payload.readRemaining();
+		if (minimalWireSize > limit) {
+			throw new QuicTransportException(QuicTransportErrors.FRAME_ENCODING_ERROR,
+				"Received a DATAGRAM frame of " + minimalWireSize + " bytes, over the advertised " +
+				"max_datagram_frame_size of " + limit);
+		}
+		if (frameHandler == null) {
+			datagramFramesDropped++;
+			return;
+		}
+		datagramFramesReceived++;
+		routeToHandler(level, datagram);
 	}
 
 	/**
@@ -1639,7 +1707,7 @@ public final class QuicConnection extends AbstractReactive {
 
 		if (role == Role.SERVER) {
 			// FR-005: the server signals confirmation to the client, and confirms itself once the frame
-			// is actually on the wire (see sendDatagram).
+			// is actually on the wire (see sendOneUdpDatagram).
 			sendQueue.enqueue(EncryptionLevel.ONE_RTT, HandshakeDoneFrame.INSTANCE, false);
 			// RFC 9001 §4.9.3: the handshake is done, so nothing may arrive at 0-RTT that matters. The
 			// permitted 3×PTO retention for reordered packets is deliberately not taken (see the
@@ -1709,7 +1777,7 @@ public final class QuicConnection extends AbstractReactive {
 		}
 		try {
 			for (int i = 0; i < MAX_DATAGRAMS_PER_FLUSH; i++) {
-				if (!sendDatagram()) {
+				if (!sendOneUdpDatagram()) {
 					rearmTimers();
 					return;
 				}
@@ -1721,8 +1789,12 @@ public final class QuicConnection extends AbstractReactive {
 		}
 	}
 
-	/** Builds and sends at most one datagram; returns whether anything is still pending afterwards. */
-	private boolean sendDatagram() throws QuicTransportException {
+	/**
+	 * Builds and sends at most one <b>UDP datagram</b>; returns whether anything is still pending
+	 * afterwards. Named for the UDP datagram it produces, which is a different thing from the RFC 9221
+	 * DATAGRAM frames {@link #sendDatagramFrame} queues — several of those can share one of these.
+	 */
+	private boolean sendOneUdpDatagram() throws QuicTransportException {
 		int limit = (int) Math.min(settings.maxDatagramSize(), amplification.remaining());
 		if (limit <= 0) {
 			// The server is at its 3× anti-amplification limit and must wait to be validated (FR-018).
@@ -1823,6 +1895,9 @@ public final class QuicConnection extends AbstractReactive {
 		}
 		if (!congestionLimited) {
 			frameBytes += sendQueue.pollUpTo(level, allowance - frameBytes, frames::add);
+			if (level == applicationSendLevel()) {
+				frameBytes += drainOutboundDatagrams(allowance - frameBytes, frames);
+			}
 		}
 		if (frames.isEmpty()) return;
 
@@ -1857,6 +1932,38 @@ public final class QuicConnection extends AbstractReactive {
 		onPacketSentEvent(sent);
 	}
 
+	/**
+	 * Offers every queued RFC 9221 DATAGRAM frame to the packet being built, exactly <b>once</b> each
+	 * (FR-078).
+	 * <p>
+	 * One attempt, not "the next flush", is what makes "never held indefinitely" unambiguous: a frame
+	 * that does not fit is recycled and counted here rather than left to compete with newer ones on some
+	 * later packet, and the queue is therefore empty again by the time this returns. A datagram whose
+	 * value has expired is the whole premise of the extension — holding one would be the defect.
+	 * <p>
+	 * The loop keeps offering after a frame has been refused, deliberately: the frames are independent
+	 * and a smaller one behind a large one is not blocked by it, which is precisely what
+	 * {@code SendQueue.pollUpTo}'s head-of-line rule would have done instead.
+	 *
+	 * @return the bytes added to {@code frames}
+	 */
+	private int drainOutboundDatagrams(int allowance, List<QuicFrame> frames) {
+		int used = 0;
+		DatagramFrame datagram;
+		while ((datagram = outboundDatagrams.poll()) != null) {
+			int size = datagram.encodedLength();
+			if (size <= allowance - used) {
+				frames.add(datagram);
+				used += size;
+				datagramFramesSent++;
+			} else {
+				datagram.recycle();
+				datagramFramesDropped++;
+			}
+		}
+		return used;
+	}
+
 	private static boolean containsHandshakeDone(List<QuicFrame> frames) {
 		for (QuicFrame frame : frames) {
 			if (frame instanceof HandshakeDoneFrame) return true;
@@ -1866,6 +1973,12 @@ public final class QuicConnection extends AbstractReactive {
 
 	private boolean hasPendingWork() {
 		boolean congestionLimited = congestion.isBlocked() && !bypassCongestionWindow;
+		if (!congestionLimited && !outboundDatagrams.isEmpty()
+			&& keys.get(applicationSendLevel()).acceptsSend()) {
+			// Without this a flush carrying nothing but DATAGRAM frames would report "nothing pending".
+			// The key test keeps a queue that no level can yet carry from spinning the flush loop.
+			return true;
+		}
 		for (EncryptionLevel level : LEVEL_ORDER) {
 			if (!keys.get(level).acceptsSend()) continue;
 			// Queued data over the window is not "pending" for this flush: claiming it were would spin the
@@ -2473,6 +2586,12 @@ public final class QuicConnection extends AbstractReactive {
 			assembler.close();
 		}
 		sendQueue.drop();
+		// The datagram queue is not part of the send queue, so it needs its own release right here — the
+		// contract is that every queued payload, inbound and outbound, is recycled exactly once on close.
+		DatagramFrame datagram;
+		while ((datagram = outboundDatagrams.poll()) != null) {
+			datagram.recycle();
+		}
 		for (ProtectedPacket packet : awaitingKeys) {
 			packet.bytes().recycle();
 		}
@@ -2632,6 +2751,8 @@ public final class QuicConnection extends AbstractReactive {
 	 *
 	 * @throws QuicTransportException {@code INTERNAL_ERROR} when the send queue's byte bound would be
 	 *                                exceeded (FR-040) — back-pressure, not a wire error
+	 * @see #sendDatagramFrame(ByteBuf) for RFC 9221 DATAGRAM frames, which carry a policy this raw seam
+	 * deliberately does not apply
 	 */
 	public void enqueueFrame(QuicFrame frame) throws QuicTransportException {
 		checkInReactorThread(this);
@@ -2707,6 +2828,81 @@ public final class QuicConnection extends AbstractReactive {
 	public int dropQueuedFrames(Predicate<QuicFrame> filter) {
 		checkInReactorThread(this);
 		return sendQueue.removeIf(filter);
+	}
+
+	/**
+	 * Queues one RFC 9221 DATAGRAM frame carrying {@code payload}, to leave in the next packet this
+	 * connection builds (FR-075, FR-078).
+	 * <p>
+	 * <b>Takes ownership of {@code payload} on every path, refusals included</b> — it is recycled before
+	 * this throws, and recycling it again at the call site is a double free. Does not send: call
+	 * {@link #requestSend()} when a batch is ready, exactly as {@link #enqueueFrame} requires.
+	 * <p>
+	 * This is the entry point that carries the RFC 9221 policy. {@link #enqueueFrame} remains the raw
+	 * seam and applies none of it, which is what leaves a test able to inject an illegal frame; a caller
+	 * that means to send an unreliable datagram wants this one. No {@link QuicFrameHandler} is required:
+	 * a DATAGRAM frame with no handler registered is recycled by the transport when its packet is
+	 * acknowledged or declared lost, exactly as one with a handler is recycled by the handler.
+	 * <p>
+	 * The four refusals are resolved in a fixed order, and the peer's limit is read through the same
+	 * 0-RTT funnel everything else uses ({@link #earlyTransportParameters()}), so a client may send a
+	 * datagram in early data against the limit it remembered, and a server — which has been told nothing
+	 * yet — correctly refuses until the handshake completes.
+	 *
+	 * @throws QuicDatagramException with {@link QuicDatagramException.Reason#CONNECTION_CLOSED},
+	 *                               {@link QuicDatagramException.Reason#NOT_NEGOTIATED},
+	 *                               {@link QuicDatagramException.Reason#OVERSIZE} or
+	 *                               {@link QuicDatagramException.Reason#QUEUE_FULL}. Never a connection
+	 *                               error: none of the four is the peer's fault, and none of the four
+	 *                               closes anything
+	 * @see <a href="https://www.rfc-editor.org/rfc/rfc9221#section-5">RFC 9221 §5 — Behavior and Usage</a>
+	 */
+	public void sendDatagramFrame(ByteBuf payload) throws QuicDatagramException {
+		checkInReactorThread(this);
+		DatagramFrame frame = new DatagramFrame(payload);
+		if (state.isTerminating() || sendQueue.isDropped()) {
+			throw refuseDatagram(frame, QuicDatagramException.Reason.CONNECTION_CLOSED,
+				"the connection is " + state + ", so nothing further will be sent");
+		}
+		long peerLimit = peerMaxDatagramFrameSize();
+		if (peerLimit == 0) {
+			throw refuseDatagram(frame, QuicDatagramException.Reason.NOT_NEGOTIATED,
+				"the peer advertised no max_datagram_frame_size, so it supports no DATAGRAM frame at all");
+		}
+		int size = frame.encodedLength();
+		if (size > peerLimit) {
+			throw refuseDatagram(frame, QuicDatagramException.Reason.OVERSIZE,
+				"a DATAGRAM frame of " + size + " bytes exceeds the peer's max_datagram_frame_size of " +
+				peerLimit + "; RFC 9221 §3 forbids truncating it");
+		}
+		if (outboundDatagrams.size() >= settings.maxOutboundDatagrams()) {
+			throw refuseDatagram(frame, QuicDatagramException.Reason.QUEUE_FULL,
+				"maxOutboundDatagrams (" + settings.maxOutboundDatagrams() + ") datagrams are already " +
+				"waiting for a packet");
+		}
+		outboundDatagrams.add(frame);
+	}
+
+	/**
+	 * Releases {@code frame} and builds the refusal. Returned rather than thrown so the call site reads
+	 * as a {@code throw}, which is what keeps the "every path recycles" rule visible where it applies.
+	 */
+	private QuicDatagramException refuseDatagram(DatagramFrame frame, QuicDatagramException.Reason reason,
+		String message
+	) {
+		frame.recycle();
+		datagramFramesRefused++;
+		return new QuicDatagramException(reason, message);
+	}
+
+	/**
+	 * The largest DATAGRAM frame the peer said it would accept (RFC 9221 §3), or 0 for "none" — which is
+	 * also the answer before either parameter set exists.
+	 */
+	private long peerMaxDatagramFrameSize() {
+		if (peerTransportParameters != null) return peerTransportParameters.maxDatagramFrameSize();
+		QuicTransportParameters early = earlyTransportParameters();
+		return early == null ? 0 : early.maxDatagramFrameSize();
 	}
 
 	/** Flushes whatever is queued. Safe to call when nothing is queued, and safe to call repeatedly. */
@@ -2974,14 +3170,43 @@ public final class QuicConnection extends AbstractReactive {
 		return keys.get(level).isEitherDirectionInstalled();
 	}
 
+	/** <b>UDP datagrams</b> put on the socket — never RFC 9221 DATAGRAM frames, which are counted apart. */
 	public long datagramsSent() {
 		checkInReactorThread(this);
 		return datagramsSent;
 	}
 
+	/** <b>UDP datagrams</b> taken off the socket, several QUIC packets each at most. */
 	public long datagramsReceived() {
 		checkInReactorThread(this);
 		return datagramsReceived;
+	}
+
+	/** RFC 9221 DATAGRAM <b>frames</b> placed in a packet. Several may share one UDP datagram. */
+	public long datagramFramesSent() {
+		checkInReactorThread(this);
+		return datagramFramesSent;
+	}
+
+	/** RFC 9221 DATAGRAM <b>frames</b> accepted and routed to the frame handler. */
+	public long datagramFramesReceived() {
+		checkInReactorThread(this);
+		return datagramFramesReceived;
+	}
+
+	/**
+	 * RFC 9221 DATAGRAM <b>frames</b> dropped without an error: queued but unplaceable in the packet they
+	 * were offered to (FR-078), or received with no frame handler to deliver them to.
+	 */
+	public long datagramFramesDropped() {
+		checkInReactorThread(this);
+		return datagramFramesDropped;
+	}
+
+	/** Sends refused by {@link #sendDatagramFrame(ByteBuf)} — not negotiated, oversize, or queue full. */
+	public long datagramFramesRefused() {
+		checkInReactorThread(this);
+		return datagramFramesRefused;
 	}
 
 	/** Packets discarded without becoming a connection error: bad AEAD, unknown level, over the bound. */
