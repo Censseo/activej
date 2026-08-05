@@ -85,6 +85,31 @@ public interface QuicFrameHandler {
 	default void onEstablished(QuicConnection connection) {
 	}
 
+	/**
+	 * The early data this client sent was <b>refused</b> (RFC 8446 §4.2.10, spec FR-055): the server
+	 * accepted the pre-shared key but omitted {@code early_data}, so every 0-RTT packet already sent was
+	 * dropped undecrypted and nothing in it will ever be processed.
+	 * <p>
+	 * Fired at most once, on a <b>client</b> only, and only after this connection's own state has moved:
+	 * the 0-RTT keys are discarded and {@link QuicConnection#isSendingEarlyData()} is already false, so
+	 * anything a handler enqueues from inside this call is queued for 1-RTT. That ordering is the whole
+	 * point of the callback — a handler is expected to tear down the work it created in early data and
+	 * re-create it, and it must not be able to re-create it into a packet the peer has said it will not
+	 * read.
+	 * <p>
+	 * The transport discards <b>no stream state of its own</b> here, deliberately. Which of the streams
+	 * created in early data may be re-created, and which must survive and simply be retransmitted at
+	 * 1-RTT, is a question only the application protocol above can answer; a transport that guessed would
+	 * be wrong for one of the two.
+	 * <p>
+	 * Never fired for a refusal that is not one: a full handshake, a resumption that offered no early
+	 * data, or an offer that was accepted.
+	 *
+	 * @see <a href="https://www.rfc-editor.org/rfc/rfc8446#section-4.2.10">RFC 8446 §4.2.10 — Early Data Indication</a>
+	 */
+	default void onEarlyDataRejected(QuicConnection connection) {
+	}
+
 	/** The connection has ended. Called once, whatever ended it. */
 	default void onClosed(QuicConnection connection) {
 	}

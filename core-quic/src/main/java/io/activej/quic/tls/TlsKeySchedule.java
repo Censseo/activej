@@ -56,24 +56,40 @@ public final class TlsKeySchedule {
 	private byte @Nullable [] handshakeSecret;
 	private byte @Nullable [] masterSecret;
 
-	private TlsKeySchedule(TlsCipherSuite suite) {
+	private TlsKeySchedule(TlsCipherSuite suite, byte @Nullable [] psk) {
 		this.suite = suite;
 		this.hkdfHash = suite.quicCipherSuite().hkdfHash();
 		MessageDigest digest = newDigest(suite);
 		this.hashLength = digest.getDigestLength();
 		this.emptyHash = digest.digest();
 
-		// RFC 8446 §7.1: early secret with a zero PSK — Extract(salt = 0, IKM = zeros(HashLen)).
-		// Hkdf.extract substitutes a zeros(HashLen) salt for an empty one (RFC 5869 §2.2).
-		this.earlySecret = Hkdf.extract(hkdfHash, new byte[0], new byte[hashLength]);
+		// RFC 8446 §7.1: early secret = Extract(salt = 0, IKM = PSK), with IKM = zeros(HashLen) when
+		// no PSK is in play. Hkdf.extract substitutes a zeros(HashLen) salt for an empty one (RFC 5869 §2.2).
+		this.earlySecret = Hkdf.extract(hkdfHash, new byte[0], psk != null ? psk : new byte[hashLength]);
 	}
 
 	/**
-	 * Starts the schedule for the negotiated suite with the all-zero PSK (this profile negotiates
-	 * no PSKs — RFC 8446 §7.1 with IKM = zeros(HashLen)).
+	 * Starts the schedule for the negotiated suite with the all-zero PSK — the full-handshake form
+	 * (RFC 8446 §7.1 with IKM = zeros(HashLen)).
 	 */
 	public static TlsKeySchedule start(TlsCipherSuite suite) {
-		return new TlsKeySchedule(suite);
+		return new TlsKeySchedule(suite, null);
+	}
+
+	/**
+	 * Starts the schedule seeded with a resumption PSK (RFC 8446 §7.1: early secret =
+	 * {@code Extract(salt = 0, IKM = psk)}), the branch that makes {@link #resumptionBinderKey()} and
+	 * {@link #clientEarlyTrafficSecret(byte[])} meaningful.
+	 * <p>
+	 * The {@code suite} is the one the ticket was issued under, which the server must select a suite
+	 * with the same hash as (RFC 8446 §4.6.1). {@code psk} is <b>secret material</b> and is not
+	 * retained: it is consumed into the early secret here.
+	 */
+	public static TlsKeySchedule startWithPsk(TlsCipherSuite suite, byte[] psk) {
+		if (psk.length == 0) {
+			throw new IllegalArgumentException("The resumption PSK must not be empty");
+		}
+		return new TlsKeySchedule(suite, psk);
 	}
 
 	/**
@@ -96,6 +112,68 @@ public final class TlsKeySchedule {
 	public byte[] derivedSecret() {
 		checkState(State.EARLY, "the early secret has already been mixed with the ECDHE shared secret");
 		return deriveSecret(earlySecret, "derived", emptyHash);
+	}
+
+	/**
+	 * {@code binder_key} — Derive-Secret(early secret, {@code "res binder"}, "") (RFC 8446 §7.1), the
+	 * base key of the PSK binder HMAC.
+	 * <p>
+	 * Callable in the EARLY state only: {@link #mixEcdhe(byte[])} zeroes the early secret, so the
+	 * binder must be computed before the ServerHello's key share is agreed — which is the natural
+	 * order anyway, since the binder is part of the ClientHello.
+	 *
+	 * @throws IllegalStateException once the ECDHE secret has been mixed in
+	 */
+	public byte[] resumptionBinderKey() {
+		checkState(State.EARLY, "the binder key must be derived before the ECDHE shared secret is mixed in");
+		return deriveSecret(earlySecret, "res binder", emptyHash);
+	}
+
+	/**
+	 * {@code client_early_traffic_secret} — Derive-Secret(early secret, {@code "c e traffic"},
+	 * ClientHello) (RFC 8446 §7.1), the secret the 0-RTT packet protection keys are derived from via
+	 * RFC 9001 §5.1.
+	 * <p>
+	 * The transcript hash is over the <b>complete</b> ClientHello, binder included — unlike the
+	 * binder's own, which is over the truncated message. Callable in the EARLY state only, for the
+	 * same reason as {@link #resumptionBinderKey()}.
+	 *
+	 * @throws IllegalStateException once the ECDHE secret has been mixed in
+	 */
+	public byte[] clientEarlyTrafficSecret(byte[] clientHelloTranscriptHash) {
+		checkState(State.EARLY, "the client early traffic secret must be derived before the ECDHE shared secret is mixed in");
+		return deriveSecret(earlySecret, "c e traffic", clientHelloTranscriptHash);
+	}
+
+	/**
+	 * The PSK binder (RFC 8446 §4.2.11.2): {@code HMAC(finished key of the binder key, truncated
+	 * ClientHello hash)} — computed exactly like a Finished {@code verify_data}, but over the
+	 * ClientHello with its binders vector removed.
+	 */
+	public byte[] pskBinder(byte[] binderKey, byte[] truncatedClientHelloHash) {
+		return verifyData(finishedKey(binderKey), truncatedClientHelloHash);
+	}
+
+	/**
+	 * The resumption PSK a {@code NewSessionTicket} names (RFC 8446 §4.6.1):
+	 * {@code HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, HashLen)}.
+	 * <p>
+	 * Deliberately <b>static</b>: a ticket arrives long after the handshake completed and the schedule
+	 * that produced the resumption master secret was destroyed, so the derivation cannot be an
+	 * instance method without keeping a whole schedule resident for it. A zero-length
+	 * {@code ticket_nonce} is legal and derives normally.
+	 */
+	public static byte[] resumptionPsk(TlsCipherSuite suite, byte[] resumptionMasterSecret, byte[] ticketNonce) {
+		return Hkdf.expandLabel(suite.quicCipherSuite().hkdfHash(), resumptionMasterSecret, "resumption",
+			ticketNonce, newDigest(suite).getDigestLength());
+	}
+
+	/**
+	 * {@link #resumptionPsk(TlsCipherSuite, byte[], byte[])} against this schedule's own suite — the
+	 * form the issuing side uses, which still holds the schedule when it seals a ticket.
+	 */
+	public byte[] resumptionPsk(byte[] resumptionMasterSecret, byte[] ticketNonce) {
+		return Hkdf.expandLabel(hkdfHash, resumptionMasterSecret, "resumption", ticketNonce, hashLength);
 	}
 
 	/**

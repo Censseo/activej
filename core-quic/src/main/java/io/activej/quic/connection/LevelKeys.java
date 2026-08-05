@@ -75,23 +75,49 @@ public final class LevelKeys {
 	}
 
 	/**
-	 * Installs both directions' keys in one step.
+	 * Installs this level's keys in one step — deliberately the only installer, so a state where the
+	 * send keys belong to one epoch and the receive keys to another cannot be reached by two calls.
 	 * <p>
-	 * Deliberately the only installer: there is no per-direction variant, because a state where the
-	 * send keys belong to one epoch and the receive keys to another must not be observable.
+	 * Either direction may be {@code null}, and exactly one level uses that: {@code ZERO_RTT} is
+	 * <b>one-directional by protocol</b>. A client protects 0-RTT packets and never opens one; a server
+	 * opens them and may never send one (RFC 9001 §4.6.1, spec FR-052). Passing {@code null} for the
+	 * unused half is what makes that a structural property rather than a rule someone has to remember.
 	 */
-	public void install(QuicKeys sendKeys, QuicKeys receiveKeys) {
+	public void install(@Nullable QuicKeys sendKeys, @Nullable QuicKeys receiveKeys) {
 		this.sendKeys = sendKeys;
 		this.receiveKeys = receiveKeys;
 	}
 
+	/** Whether <b>both</b> directions are installed — true of every bidirectional level, false of 0-RTT. */
 	public boolean isInstalled() {
 		return sendKeys != null && receiveKeys != null;
 	}
 
-	/** Whether packets at this level can currently be protected or opened. */
+	/**
+	 * Whether either direction is installed. This is what "the level exists" means for a
+	 * one-directional level, and it agrees with {@link #isInstalled()} at every other level.
+	 */
+	public boolean isEitherDirectionInstalled() {
+		return sendKeys != null || receiveKeys != null;
+	}
+
+	/**
+	 * Whether packets at this level can currently be protected <b>and</b> opened. Equivalent to
+	 * {@link #acceptsSend()} {@code &&} {@link #acceptsReceive()}; a one-directional level never
+	 * satisfies it, which is why the send and receive paths ask the direction they mean.
+	 */
 	public boolean accepts() {
-		return isInstalled() && !discarded;
+		return acceptsSend() && acceptsReceive();
+	}
+
+	/** Whether a packet at this level can currently be protected. */
+	public boolean acceptsSend() {
+		return sendKeys != null && !discarded;
+	}
+
+	/** Whether a packet at this level can currently be opened. */
+	public boolean acceptsReceive() {
+		return receiveKeys != null && !discarded;
 	}
 
 	/**

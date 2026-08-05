@@ -130,6 +130,17 @@ explicitly.
   removed ones held, so the QPACK dynamic table stays disabled by default and
   the SETTINGS frame a default `Http3Settings` produces is byte-for-byte what it
   was. This entry records an API change and no behaviour change.
+- **`io.activej.quic.tls.EncryptionLevel` gains a `ZERO_RTT` constant**, appended
+  **last** so that `INITIAL`, `HANDSHAKE` and `ONE_RTT` keep their ordinals — the
+  enum's `ordinal()` sizes arrays in `QuicConnection`, `SendQueue` and both TLS
+  engines, and reordering it would have moved every one of them. Appending is
+  still a source-compatible-only change for anything switching exhaustively over
+  the enum: an exhaustive `switch` in consumer code stops compiling until the new
+  constant is handled. `ZERO_RTT` maps to the **Application** packet-number space
+  through `EncryptionLevel.packetNumberSpace()`, shared with `ONE_RTT`
+  (RFC 9000 §12.3) —
+  there is no fourth space — and it carries no CRYPTO stream, so
+  `hasCryptoStream()` is `false` for it alone.
 
 ### Notable fixes
 
@@ -419,6 +430,152 @@ explicitly.
   came out of the table — the two numbers a hit rate is computed from, reported
   per section so a consumer picks its own window). Every parameter is a number
   or which-table: a field name or a field value has no way to reach an inspector.
+
+- **TLS 1.3 session resumption and HTTP/3 0-RTT, off by default.** `core-quic`
+  gains RFC 8446 §2.2 / §4.6.1 resumption — a server issues `NewSessionTicket`
+  messages sealed under its own `QuicTicketKeys`, a client stores them in a
+  `QuicSessionCache` and offers one back as a `pre_shared_key` — and, on top of
+  it, the RFC 9001 §4.6 0-RTT packet (long header, type `0x01`) in the
+  Application packet-number space. `core-http3` wires both together: with the
+  switch on, an `Http3Client` that has a usable ticket for an origin sends the
+  next request to it in a 0-RTT packet, a full round trip before the handshake
+  completes, and the `Http3Server` serves it there.
+  **Nothing changes for an existing consumer**: `zeroRttEnabled` defaults to
+  `false` on both endpoints, which offers no ticket, issues none, allocates no
+  ticket store and no sealing keys, and produces the byte-for-byte phase-1
+  handshake.
+
+  Two builder calls turn it on — `Http3Server.builder(…).withTicketKeys(…)` (or
+  none, letting `listen()` generate a set) and
+  `Http3Client.builder(…).withSessionCache(…)` (or none, for the bounded
+  in-memory default) — plus `withSettings(Http3Settings.builder()
+  .withZeroRttEnabled(true).build())` on each. A client that supplies its own
+  `withTlsEngineFactory` owns its `TlsClientConfig` and so opts out of resumption
+  entirely; `withTlsClientConfig(Initializer<TlsClientConfig.Builder>)` is the
+  new seam for decorating the config the client builds instead of replacing it.
+
+  **Why it is off by default, and what turning it on accepts.** Early data is
+  weaker than a fresh handshake in two ways that a deployment has to decide about
+  rather than inherit:
+
+  1. **Forward secrecy is delayed for the early data specifically.** The session
+     is resumed with `psk_dhe_ke` and never `psk_ke`, so the (EC)DHE exchange
+     always happens and the connection as a whole keeps forward secrecy — but the
+     0-RTT packets are protected under a key derived from the *stored ticket*,
+     which was derived before that exchange. Anything that recovers the ticket
+     recovers the early data with it, and the ticket sits in the client's store
+     for `sessionTicketLifetime` — longer if a consumer supplies a
+     `QuicSessionCache` that persists across restarts, which is exactly the
+     trade-off that interface exists to let them make.
+  2. **Early data is replayable, and the defence against it is a policy plus a
+     register.** An observer who captures a 0-RTT flight can send it again to the
+     same server, which has no handshake state to tell the copy from the
+     original. RFC 8470's answer is applied at the HTTP layer: a request whose
+     HEADERS arrived at `ZERO_RTT` is screened by the new `Http3EarlyDataPolicy`
+     after it is mapped and before it is dispatched, the default accepts only the
+     RFC 9110 §9.2.1 safe methods (`GET`, `HEAD`, `OPTIONS`, `TRACE`), and
+     anything else is answered `425 (Too Early)` **without the servlet being
+     invoked** — the client re-issues it once, transparently, at 1-RTT, so a
+     caller sees only the final outcome. A request the policy accepts reaches the
+     servlet carrying `Early-Data: 1` (RFC 8470 §5.1) — replacing any field of
+     that name the peer sent, so the indication is the server's verdict and not a
+     peer's claim — and application code can apply its own rule on top of it.
+     Replace the deployment-wide rule with
+     `Http3Server.builder(…).withEarlyDataPolicy(request -> …)`; an ordinary
+     1-RTT request never reaches the policy at all.
+
+     The other half — refusing a ticket that has already been used for early data
+     — is the bounded single-use register `QuicReplayGuard`, one per
+     `Http3Server`, consulted at the point the grant is actually made rather than
+     at pre-shared-key selection: a ticket is single-use for *early data*, not for
+     resumption, so a second presentation loses its early data and nothing else.
+     The pre-shared key still authenticates the connection, the certificate flight
+     is still skipped, and the handshake still completes at 1-RTT — failing it
+     instead would hand an attacker a denial-of-service primitive out of the
+     defence itself. It stores a SHA-256 digest of the sealed ticket identity, not
+     the identity, so the entry bound is a real memory bound (~4 MB at the
+     shipped 65 536) and no ticket material is held at rest; the lookup is
+     constant-time **including the not-found case**, the same
+     `MessageDigest.isEqual` primitive the PSK binder check uses. Eviction
+     **fails closed**: a live record is never dropped, so a register under
+     pressure degrades towards refusing every *new* 0-RTT grant rather than
+     towards admitting a replay — a register that treated an evicted record as
+     unseen would make its own bound the attack.
+
+     **Residual limitation, stated as one rather than dressed as a mitigation.**
+     The single-use register is **process-local** — and reactor-local: one per
+     `Http3Server` instance, not shared across workers, processes or nodes.
+     Behind a load balancer, an early-data flight replayed to a *different*
+     instance is **not caught by it**. What protects that case is the safe-method
+     default policy, which is why that default is not merely advisory and why
+     widening it widens the exposure of a whole deployment rather than of one
+     process. A deployment needing more must supply its own policy; a distributed
+     strike register is out of scope. Emptiness after a restart is not a gap:
+     `QuicTicketKeys` never persists its sealing keys, so no ticket issued before
+     a restart can be opened after one.
+
+  A request whose early data the server rejected — whether by omitting
+  `early_data` from EncryptedExtensions or by answering `425 (Too Early)` — is
+  re-issued once, transparently, on a fresh 1-RTT stream, and only the final
+  outcome reaches the caller. The retry is deliberately explicit rather than left
+  to QUIC loss recovery re-sending the frames once the 1-RTT keys exist: at most
+  one retry per request, whichever signal arrived, and it is reported through
+  `Http3Client.Inspector.onEarlyDataRetried` / `earlyDataRetried()`, which is the
+  one event that would otherwise make the fallback invisible.
+
+  The eight resumption bounds are `ApplicationSettings` keys resolved against
+  `QuicConnection`, so the fully qualified and the short spelling work alike —
+  `-Dio.activej.quic.connection.QuicConnection.sessionTicketLifetime=30m` or
+  `-DQuicConnection.sessionTicketLifetime=30m` — and the HTTP/3 switch resolves
+  against `Http3Settings` like every other one there.
+
+  | Setting | Default | What it does | Change it with |
+  |---|---|---|---|
+  | `zeroRttEnabled` | `false` | the outer switch, per HTTP/3 endpoint. Off: no ticket offered or issued, no sealing keys, no ticket store, phase-1 bytes | `-DHttp3Settings.zeroRttEnabled=true` / `withZeroRttEnabled(true)` |
+  | `sessionTicketLifetime` | `1h` | how long an issued ticket may be resumed, and how long a stored one is kept. It is also the replay window a deployment is accepting, so shortening it is the cheapest mitigation available | `-DQuicConnection.sessionTicketLifetime=15m` |
+  | `sessionTicketKeyRotation` | `6h` | how often the server generates a fresh sealing key. Two keys are retained, so `lifetime ≤ rotation` guarantees no valid ticket becomes unopenable purely because of a rotation; `QuicTicketKeys.create` refuses a pair that does not satisfy it, and `Http3Server.listen()` fails its promise with a named `IllegalStateException` rather than throwing out of a void path | `-DQuicConnection.sessionTicketKeyRotation=1h` |
+  | `sessionTicketsPerHandshake` | `2` | `NewSessionTicket` messages issued per completed handshake. More than one so a client can resume more than once without a fresh full handshake; `0` issues none | `-DQuicConnection.sessionTicketsPerHandshake=0` |
+  | `maxSessionTickets` | `256` entries | the client's bounded LRU of stored tickets, keyed by (server name, port, ALPN). Expired entries are discarded on lookup | `-DQuicConnection.maxSessionTickets=32` |
+  | `maxSessionTicketSize` | `8kb` | bounds one sealed ticket a server may send. A `NewSessionTicket` is untrusted input arriving *after* the handshake, and past this the connection closes rather than buffering on | `-DQuicConnection.maxSessionTicketSize=16kb` |
+  | `maxSessionTicketsPerConnection` | `8` | bounds how many post-handshake tickets one connection may deliver, so a server cannot buy an unbounded number of PSK derivations on the client's reactor thread | `-DQuicConnection.maxSessionTicketsPerConnection=2` |
+  | `ticketAgeTolerance` | `10s` | the window the server checks a ticket's obfuscated age against (RFC 8446 §4.2.11.1). Outside it the ticket is refused and the handshake falls back to a full one — never a failure | `-DQuicConnection.ticketAgeTolerance=30s` |
+  | `maxEarlyDataReplayRecords` | `65536` entries | ticket identities the single-use replay register holds — one register per `Http3Server`, built only when `zeroRttEnabled` is on. Eviction fails closed, so this is the point at which a saturated register starts refusing *new* 0-RTT grants (`zeroRttRefusedAtCapacity()`) rather than admitting a replay; size it against the ticket lifetime and the resumption rate | `-DQuicConnection.maxEarlyDataReplayRecords=262144` |
+
+  A ticket that cannot be opened, has expired, carries a different ALPN or server
+  name, or fails its age check produces a **full handshake**, never an error and
+  never an unauthenticated session. A server that accepts the ticket but declines
+  the early data signals that by *omitting* `early_data` from EncryptedExtensions,
+  which is likewise not a failure.
+
+  Nothing on this path reaches a log line, an exception message, a `toString()`
+  or an inspector: not a ticket byte, not a ticket identity, not a resumption
+  secret, not a PSK binder, not a sealing key. The counters that do join each
+  `Inspector` — **as defaulted methods**, so no existing implementation breaks —
+  are numbers and two enums: `onSessionTicketOffered` / `onSessionTicketStored` /
+  `onZeroRttAttempted` / `onZeroRttDecision` / `onEarlyDataRetried` on
+  `Http3Client.Inspector`, and `onSessionTicketsIssued` / `onSessionResumed` /
+  `onEarlyDataRefused` on `Http3Server.Inspector`, mirrored by the plain
+  accessors `sessionTicketsOffered()`, `sessionTicketsStored()`,
+  `zeroRttAttempted()`, `zeroRttAccepted()`, `zeroRttRejected()`,
+  `earlyDataRetried()`, `sessionTicketsIssued()`, `sessionsResumed()` and
+  `zeroRttAccepted()`.
+
+  "Why was 0-RTT refused" is deliberately four numbers rather than one, because a
+  deployment reacts to them differently. `onEarlyDataRefused` carries an
+  `Http3Connection.EarlyDataRefusal` — `REPLAYED` (the security signal: the
+  register had already granted that ticket identity a use), `AT_CAPACITY` (an
+  availability signal: `maxEarlyDataReplayRecords` is too small for the ticket
+  lifetime in force), `EXPIRED` (defence in depth; the TLS engine already skips
+  an expired ticket at pre-shared-key selection, so it stays 0) and `POLICY` (a
+  request answered `425` by the early-data policy, which under the default is
+  ordinary traffic meeting the safe-method rule). Each has its own accessor on
+  `Http3Server` — `zeroRttRefusedAsReplay()`, `zeroRttRefusedAtCapacity()`,
+  `zeroRttRefusedAsExpired()`, `earlyDataRequestsRefused()` — and those read the
+  register directly, so they are exact whether or not an inspector is attached.
+  All four stay 0 for the life of a server with `zeroRttEnabled` off. Bear the
+  process-local limit above in mind when reading `zeroRttRefusedAsReplay()`: it
+  counts the replays *this instance* caught, and is not a count of the replays
+  aimed at the deployment.
 
 - **QUIC connection layer.** A new `io.activej.quic.connection` package in
   `core-quic` turns the wire codec and the TLS engines into a working transport:

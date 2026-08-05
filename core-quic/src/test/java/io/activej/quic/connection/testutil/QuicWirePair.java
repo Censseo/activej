@@ -28,6 +28,7 @@ import io.activej.quic.connection.QuicConnection.Role;
 import io.activej.quic.connection.QuicConnectionSettings;
 import io.activej.quic.connection.QuicFrameHandler;
 import io.activej.quic.tls.QuicTls;
+import io.activej.quic.tls.QuicTransportParameters;
 import io.activej.quic.tls.TlsClientConfig;
 import io.activej.quic.tls.TlsServerConfig;
 import io.activej.quic.tls.TlsServerIdentity;
@@ -37,6 +38,7 @@ import org.jetbrains.annotations.Nullable;
 import java.net.InetSocketAddress;
 import java.util.ArrayDeque;
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
@@ -110,6 +112,9 @@ public final class QuicWirePair implements AutoCloseable {
 	private @Nullable Function<QuicConnection, QuicFrameHandler> serverFrameHandlerFactory;
 	private QuicConnection.@Nullable Inspector clientInspector;
 	private QuicConnection.@Nullable Inspector serverInspector;
+	private @Nullable Consumer<TlsClientConfig.Builder> clientTlsConfig;
+	private @Nullable Consumer<TlsServerConfig.Builder> serverTlsConfig;
+	private @Nullable QuicTransportParameters clientRememberedTransportParameters;
 
 	/** Registers the layer above the client. Must be called before {@link #startClient}. */
 	public QuicWirePair withClientFrameHandler(QuicFrameHandler handler) {
@@ -151,6 +156,31 @@ public final class QuicWirePair implements AutoCloseable {
 		return this;
 	}
 
+	/**
+	 * Customises the client's TLS configuration — a session ticket to offer, a session cache to fill,
+	 * early data. Applied after the fixture's own trust manager, so a test may override it.
+	 * Must be called before {@link #startClient}.
+	 */
+	public QuicWirePair withClientTlsConfig(Consumer<TlsClientConfig.Builder> customizer) {
+		this.clientTlsConfig = customizer;
+		return this;
+	}
+
+	/** The server's counterpart of {@link #withClientTlsConfig}: ticket keys, early data, the clock. */
+	public QuicWirePair withServerTlsConfig(Consumer<TlsServerConfig.Builder> customizer) {
+		this.serverTlsConfig = customizer;
+		return this;
+	}
+
+	/**
+	 * The transport parameters remembered from the ticket the client is about to offer (RFC 9000
+	 * §7.4.1). Must be called before {@link #startClient}.
+	 */
+	public QuicWirePair withClientRememberedTransportParameters(QuicTransportParameters remembered) {
+		this.clientRememberedTransportParameters = remembered;
+		return this;
+	}
+
 	public Wire clientWire() {
 		return clientWire;
 	}
@@ -180,12 +210,18 @@ public final class QuicWirePair implements AutoCloseable {
 		client = QuicConnection.builder(Reactor.getCurrentReactor(), Role.CLIENT, clientWire, SERVER_ADDRESS,
 				params -> QuicTls.clientEngine(TlsClientConfig.builder(serverName, params)
 					.withTrustManager(QuicTestPeers.trustingLeaf(identity.leaf()))
+					.initialize(builder -> {
+						if (clientTlsConfig != null) clientTlsConfig.accept(builder);
+					})
 					.build()))
 			.withSettings(settings)
 			.initialize(builder -> {
 				if (clientFrameHandler != null) builder.withFrameHandler(clientFrameHandler);
 				if (clientFrameHandlerFactory != null) builder.withFrameHandlerFactory(clientFrameHandlerFactory);
 				if (clientInspector != null) builder.withInspector(clientInspector);
+				if (clientRememberedTransportParameters != null) {
+					builder.withRememberedTransportParameters(clientRememberedTransportParameters);
+				}
 			})
 			.build();
 		return client.start();
@@ -216,7 +252,11 @@ public final class QuicWirePair implements AutoCloseable {
 
 		TlsServerIdentity identity = QuicTestPeers.devIdentity();
 		server = QuicConnection.builder(Reactor.getCurrentReactor(), Role.SERVER, serverWire, CLIENT_ADDRESS,
-				params -> QuicTls.serverEngine(TlsServerConfig.builder(identity, params).build()))
+				params -> QuicTls.serverEngine(TlsServerConfig.builder(identity, params)
+					.initialize(builder -> {
+						if (serverTlsConfig != null) serverTlsConfig.accept(builder);
+					})
+					.build()))
 			.withSettings(settings)
 			.withPeerConnectionId(clientScid)
 			.withOriginalDestinationConnectionId(clientDcid)

@@ -389,7 +389,15 @@ public final class Http3Settings {
 			return this;
 		}
 
-		/** Offers (client) or accepts (server) 0-RTT early data; off by default for replay risk (FR-089). */
+		/**
+		 * Offers (client) or accepts (server) 0-RTT early data; off by default for replay risk (FR-089).
+		 * <p>
+		 * Turning it on brings the server-side early-data policy with it (FR-064): a method that is not
+		 * safe per RFC 9110 §9.2.1 is answered {@code 425 (Too Early)} without ever reaching the servlet,
+		 * and a request that is accepted carries the RFC 8470 {@code Early-Data: 1} indication where the
+		 * servlet can read it. See {@code Http3Server.Builder.withEarlyDataPolicy} — including for why
+		 * that default is not merely advisory behind a load balancer.
+		 */
 		public Builder withZeroRttEnabled(boolean zeroRttEnabled) {
 			checkNotBuilt(this);
 			this.zeroRttEnabled = zeroRttEnabled;

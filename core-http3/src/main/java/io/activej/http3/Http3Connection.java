@@ -235,6 +235,55 @@ public final class Http3Connection extends AbstractReactive {
 		CLOSED,
 	}
 
+	/**
+	 * What a server decided about the early data a resumption attempt carried — what an
+	 * {@code Inspector}'s {@code onZeroRttDecision} reports. Rejection is signalled by the server
+	 * omitting {@code early_data} from EncryptedExtensions and is never a handshake failure
+	 * (RFC 8446 §4.2.10), so the two are a decision rather than a success and a failure.
+	 */
+	public enum ZeroRttOutcome {
+		/** The server echoed {@code early_data}: the 0-RTT packets already sent were taken. */
+		ACCEPTED,
+		/** The server did not echo it: the session resumed, the early data did not. */
+		REJECTED,
+	}
+
+	/**
+	 * Why a server refused early data — what an {@code Inspector}'s {@code onEarlyDataRefused} reports,
+	 * and the operational half of {@link ZeroRttOutcome#REJECTED}, which says only <i>that</i> it
+	 * happened. The four are not variations of one condition: three are the single-use replay register
+	 * (spec FR-069, FR-070) answering a resumption attempt before a single HTTP byte exists, and the
+	 * fourth is the {@linkplain Http3EarlyDataPolicy early-data policy} (spec FR-064) answering a
+	 * request that has already decoded. A deployment reacts to them differently, so nothing here folds
+	 * two of them together.
+	 */
+	public enum EarlyDataRefusal {
+		/**
+		 * The register had already granted this ticket identity a use (RFC 8446 §8) — a replayed flight,
+		 * or a client re-offering a ticket the single-use rule said it must discard. The security signal.
+		 */
+		REPLAYED,
+		/**
+		 * The register had no room: the presentation's probe window held only live records, and a live
+		 * record is never dropped (spec FR-070). Not a security event but an availability one — 0-RTT is
+		 * degrading towards refusing every <i>new</i> grant, and {@code maxEarlyDataReplayRecords} is the
+		 * knob.
+		 */
+		AT_CAPACITY,
+		/**
+		 * The register refused a ticket past its own lifetime. Defence in depth: a server built by
+		 * {@link Http3Server} never reaches it, because the TLS engine skips an expired ticket while
+		 * selecting the pre-shared key, well before the register is consulted.
+		 */
+		EXPIRED,
+		/**
+		 * The early-data policy declined a request that arrived at {@code ZERO_RTT} — answered
+		 * {@code 425 (Too Early)} (RFC 8470) without the servlet being invoked. Under the default policy
+		 * this is an unsafe method in early data, which is ordinary traffic rather than an attack.
+		 */
+		POLICY,
+	}
+
 	public enum State {
 		/** Constructed; the local control stream has not been opened yet. */
 		NEW,
@@ -254,6 +303,7 @@ public final class Http3Connection extends AbstractReactive {
 	private final Map<Long, Http3RequestStream> requestStreams = new HashMap<>();
 
 	private Http3Settings settings = Http3Settings.create();
+	private Http3EarlyDataPolicy earlyDataPolicy = Http3EarlyDataPolicy.DEFAULT_POLICY;
 	private Consumer<Http3RequestStream> requestStreamListener = stream -> {};
 	private Http3EventListener eventListener = Http3EventListener.NONE;
 	private QpackEncoder qpackEncoder;
@@ -367,6 +417,20 @@ public final class Http3Connection extends AbstractReactive {
 	private @Nullable QuicStream peerQpackEncoderStream;
 	private @Nullable QuicStream peerQpackDecoderStream;
 	private @Nullable SettingsFrame peerSettings;
+
+	/**
+	 * The SETTINGS this peer sent on the connection whose ticket was used to resume this one, decoded
+	 * from that ticket by {@link Http3Client} (FR-062). {@code null} on every connection that is not a
+	 * resumption attempt, which is every connection with 0-RTT off — the default.
+	 */
+	private @Nullable SettingsFrame rememberedSettings;
+
+	/** Where this connection reports the peer's SETTINGS once they land, so a ticket can carry them. */
+	private @Nullable Consumer<SettingsFrame> peerSettingsListener;
+
+	/** Where this connection reports that the peer refused its early data (spec FR-055, FR-067). */
+	private @Nullable Consumer<Http3Connection> earlyDataRejectionListener;
+
 	private @Nullable Http3Exception closeException;
 
 	private long goAwaySentId = NO_GOAWAY_ID;
@@ -405,6 +469,7 @@ public final class Http3Connection extends AbstractReactive {
 		// peer stream must never arrive before there is something to route it to.
 		this.streamManager = QuicStreamManager.builder(reactor, quicConnection)
 			.withStreamListener(this::onPeerStream)
+			.withEarlyDataRejectionListener(this::onEarlyDataRejected)
 			.build();
 	}
 
@@ -425,6 +490,18 @@ public final class Http3Connection extends AbstractReactive {
 		public Builder withSettings(Http3Settings settings) {
 			checkNotBuilt(this);
 			Http3Connection.this.settings = settings;
+			return this;
+		}
+
+		/**
+		 * What every request stream this connection adopts is willing to run from early data (FR-064,
+		 * FR-065). Defaults to {@link Http3EarlyDataPolicy#DEFAULT_POLICY}, so a connection wired by
+		 * hand is protected without asking; {@link Http3Server.Builder#withEarlyDataPolicy} is what a
+		 * consumer of the server normally sets.
+		 */
+		public Builder withEarlyDataPolicy(Http3EarlyDataPolicy earlyDataPolicy) {
+			checkNotBuilt(this);
+			Http3Connection.this.earlyDataPolicy = earlyDataPolicy;
 			return this;
 		}
 
@@ -455,6 +532,54 @@ public final class Http3Connection extends AbstractReactive {
 		Builder withEventListener(Http3EventListener eventListener) {
 			checkNotBuilt(this);
 			Http3Connection.this.eventListener = eventListener;
+			return this;
+		}
+
+		/**
+		 * The SETTINGS the peer sent on the connection whose ticket resumed this one (FR-062,
+		 * RFC 9114 §7.2.4.2). Setting them is what makes this connection {@linkplain #permitsEarlyData()
+		 * permit early data}, and what makes a later reduction of a relied-upon value an
+		 * {@code H3_SETTINGS_ERROR}.
+		 * <p>
+		 * Package-private, like {@link #withEventListener}: the blob these came out of is
+		 * {@link Http3Client}'s to decode, and a consumer handing a connection SETTINGS no peer ever sent
+		 * would be asserting a history that did not happen.
+		 */
+		Builder withRememberedSettings(SettingsFrame rememberedSettings) {
+			checkNotBuilt(this);
+			Http3Connection.this.rememberedSettings = rememberedSettings;
+			return this;
+		}
+
+		/**
+		 * Called once, with the peer's SETTINGS, at the moment they are applied — so that whoever built
+		 * this connection can remember them beside the session ticket the peer issues (FR-062).
+		 * <p>
+		 * It is invoked from the control-stream read path, which reports RFC 9114 §8.1 errors, so a
+		 * listener that throws is logged and the connection carries on: the only implementation writes
+		 * into a <b>consumer-supplied</b> {@code QuicSessionCache}, and a broken store must not kill a
+		 * working connection.
+		 */
+		Builder withPeerSettingsListener(Consumer<SettingsFrame> peerSettingsListener) {
+			checkNotBuilt(this);
+			Http3Connection.this.peerSettingsListener = peerSettingsListener;
+			return this;
+		}
+
+		/**
+		 * Called once, on the reactor thread, when the peer refused this connection's early data
+		 * (spec FR-055, FR-067) — after this connection has already dropped its remembered SETTINGS and
+		 * <b>before</b> it sweeps away whatever early-data request streams the listener does not claim.
+		 * <p>
+		 * That order is what makes a transparent retry possible: the listener is {@link Http3Client}'s, it
+		 * knows which of the exchanges in flight went out in early data, and it takes them back before
+		 * anything else can fail them. Package-private for the same reason
+		 * {@link #withPeerSettingsListener} is — this is how the client that <i>built</i> this connection
+		 * is told what happened underneath it.
+		 */
+		Builder withEarlyDataRejectionListener(Consumer<Http3Connection> listener) {
+			checkNotBuilt(this);
+			Http3Connection.this.earlyDataRejectionListener = listener;
 			return this;
 		}
 
@@ -570,6 +695,7 @@ public final class Http3Connection extends AbstractReactive {
 			// byte-for-byte there, and one code path is worth more than the indirection it costs.
 			.withQpackEncoder(new StreamQpackEncoder(id))
 			.withQpackFieldSectionDecoder(new StreamQpackDecoder(id))
+			.withEarlyDataPolicy(earlyDataPolicy)
 			// The two violations a request stream can observe that the *connection* owns: a PUSH_PROMISE
 			// against a push limit of 0 (FR-040), and a frame RFC 9114 §7.2's table does not permit on a
 			// request stream at all (FR-024, FR-025). Everything it refuses about the message itself stays
@@ -712,17 +838,111 @@ public final class Http3Connection extends AbstractReactive {
 	}
 
 	/**
+	 * The SETTINGS remembered from the connection whose ticket resumed this one, or {@code null} —
+	 * which is every connection that is not a resumption attempt.
+	 */
+	public @Nullable SettingsFrame rememberedSettings() {
+		checkInReactorThread(this);
+		return rememberedSettings;
+	}
+
+	/**
+	 * FR-062, RFC 9114 §7.2.4.2: no remembered SETTINGS, no early data — valid session ticket or not.
+	 * A client that sent a field section in 0-RTT without them would have encoded it against limits the
+	 * server never stated.
+	 */
+	public boolean permitsEarlyData() {
+		checkInReactorThread(this);
+		return rememberedSettings != null;
+	}
+
+	/**
+	 * Early data was rejected, so nothing in it was relied upon, and the RFC 9114 §7.2.4.2 non-reduction
+	 * rule no longer applies to this connection.
+	 * <p>
+	 * Called from {@link #onEarlyDataRejected()} and nowhere else. Until a rejection is known, the
+	 * non-reduction check applies whenever early data was <i>offered</i> rather than only when it was
+	 * <i>accepted</i> — conservative, and the only information available at the moment SETTINGS arrive.
+	 */
+	void discardRememberedSettings() {
+		checkInReactorThread(this);
+		rememberedSettings = null;
+	}
+
+	/**
+	 * The peer refused this connection's early data (spec FR-055, FR-067), in three steps whose order is
+	 * the whole substance of this method:
+	 * <ol>
+	 *   <li><b>Forget the remembered SETTINGS.</b> Nothing that was encoded against them was processed,
+	 *       so a later SETTINGS frame reducing one of their values breaks no promise — see
+	 *       {@link #discardRememberedSettings()}. Done first, because it must hold for every SETTINGS
+	 *       frame that can arrive after this point, including one already being parsed.</li>
+	 *   <li><b>Tell the listener</b>, which is the client's chance to claim the exchanges it sent in
+	 *       early data and re-issue them on fresh streams. It claims them by discarding their streams,
+	 *       so what it does not claim is still here for step three.</li>
+	 *   <li><b>Sweep.</b> Every request stream still marked as early data is discarded: it was created
+	 *       against a promise the peer did not keep, nobody is waiting for it any more, and leaving it
+	 *       would hold a {@code QuicStream} that can never complete.</li>
+	 * </ol>
+	 * The sweep walks a copy: discarding a stream fails whatever is parked on it, and those continuations
+	 * routinely re-enter this class.
+	 */
+	private void onEarlyDataRejected() {
+		checkInReactorThread(this);
+		discardRememberedSettings();
+		if (earlyDataRejectionListener != null) {
+			earlyDataRejectionListener.accept(this);
+		}
+		for (Http3RequestStream requestStream : new ArrayList<>(requestStreams.values())) {
+			if (requestStream.isEarlyData()) discardEarlyData(requestStream);
+		}
+	}
+
+	/**
+	 * Abandons {@code requestStream} <b>silently</b> because the early data it carried was refused: the
+	 * H3 half is torn down and the QUIC stream is discarded without a {@code RESET_STREAM} or a
+	 * {@code STOP_SENDING} (spec FR-055). The peer dropped this stream's 0-RTT packets undecrypted, so it
+	 * has never heard of it, and naming it now would open a request stream at the server for nothing.
+	 * <p>
+	 * Idempotent per stream: the second call finds nothing left in either half.
+	 */
+	void discardEarlyData(Http3RequestStream requestStream) {
+		checkInReactorThread(this);
+		Exception cause = earlyDataRejection();
+		long streamId = requestStream.id();
+		// Dropped from the map, the H3 half torn down and the QPACK references released *before* the QUIC
+		// stream is discarded, because that discard fails whatever is parked on this stream and those
+		// continuations re-enter here. Each of them then finds the work already done, rather than doing a
+		// second, different version of it (the registry's "move the state before the promise" rule).
+		requestStreams.remove(streamId);
+		requestStream.discardEarlyData(cause);
+		onEarlyDataStreamDiscarded(streamId, Http3Errors.H3_REQUEST_REJECTED);
+		streamManager.discardStream(streamId, cause);
+	}
+
+	/**
+	 * What a discarded early-data exchange fails with, for anything still holding one. Retryable, and
+	 * that is exactly what it says: nothing of the request was processed, because nothing of it was ever
+	 * decrypted.
+	 */
+	private static Http3Exception earlyDataRejection() {
+		return new Http3Exception(Http3Errors.H3_REQUEST_REJECTED,
+			"The server refused this connection's early data (RFC 8446 §4.2.10)", true);
+	}
+
+	/**
 	 * The value the peer advertised for {@code identifier}, or {@code defaultValue} if it advertised
 	 * none — which for every setting this connection reads is the RFC's own default for an omitted one.
+	 * <p>
+	 * Until the peer's own SETTINGS arrive, a resumed connection reads the {@linkplain
+	 * #rememberedSettings() remembered} ones instead of the default (FR-063, RFC 9114 §7.2.4.2). That
+	 * one substitution <i>is</i> "obey the remembered SETTINGS until the server's own arrive": it flows
+	 * into {@link #peerMaxFieldSectionSize()}, which is what bounds an outgoing field section.
 	 */
 	private long peerSetting(long identifier, long defaultValue) {
-		if (peerSettings == null) return defaultValue;
-		for (int i = 0; i < peerSettings.identifiers.length; i++) {
-			if (peerSettings.identifiers[i] == identifier) {
-				return peerSettings.values[i];
-			}
-		}
-		return defaultValue;
+		SettingsFrame frame = peerSettings != null ? peerSettings : rememberedSettings;
+		if (frame == null) return defaultValue;
+		return Http3RememberedSettings.valueOf(frame, identifier, defaultValue);
 	}
 
 	public QpackEncoder qpackEncoder() {
@@ -1039,9 +1259,11 @@ public final class Http3Connection extends AbstractReactive {
 					"The first control-stream frame was type 0x" + Long.toHexString(frame.type()) + ", not SETTINGS");
 			}
 			validatePeerSettings(settingsFrame);
+			Http3RememberedSettings.validateNoReduction(rememberedSettings, settingsFrame);
 			peerSettings = settingsFrame;
 			updateState();
 			onPeerSettingsApplied();
+			notifyPeerSettings(settingsFrame);
 			return;
 		}
 		if (frame instanceof SettingsFrame) {
@@ -1171,6 +1393,22 @@ public final class Http3Connection extends AbstractReactive {
 		qpackEncoder = encoder;
 		qpackDecoderStreamReader = new QpackDecoderStreamReader(encoder, settings.qpackMaxInstructionSize());
 		localQpackEncoderStream.open(instructionBuffer(encoder.drainPendingInstructions()));
+	}
+
+	/**
+	 * Reports the peer's SETTINGS to whoever built this connection, so a session ticket can carry them
+	 * (FR-062). The listener writes into a store this module does not own, so a failure there is logged
+	 * and swallowed rather than allowed to escape into the control-stream read path, where it would
+	 * close a connection that is working.
+	 */
+	private void notifyPeerSettings(SettingsFrame settingsFrame) {
+		Consumer<SettingsFrame> listener = peerSettingsListener;
+		if (listener == null) return;
+		try {
+			listener.accept(settingsFrame);
+		} catch (RuntimeException e) {
+			logger.warn("A peer-SETTINGS listener failed on {}", this, e);
+		}
 	}
 
 	private static int clampToInt(long value) {
@@ -1436,8 +1674,26 @@ public final class Http3Connection extends AbstractReactive {
 	 * pins the peer's table, so it fires on every abnormal termination.
 	 */
 	private void onRequestStreamAborted(long streamId, long errorCode) {
+		onRequestStreamEnded(streamId, errorCode, true);
+	}
+
+	/**
+	 * The same bookkeeping for a stream the peer <b>never saw</b> — an early-data exchange discarded
+	 * because the server refused the early data (spec FR-055).
+	 * <p>
+	 * Everything local still has to happen: this endpoint's encoder releases what the stream pinned, a
+	 * held section is released, a blocked waiter is failed. What must <b>not</b> happen is the
+	 * {@code Stream Cancellation}: RFC 9204 §4.4.2 has it tell the peer's encoder that a section it sent
+	 * will never be acknowledged, and the peer sent none — the stream's 0-RTT packets were dropped
+	 * undecrypted, so naming it would announce a stream that does not exist there.
+	 */
+	private void onEarlyDataStreamDiscarded(long streamId, long errorCode) {
+		onRequestStreamEnded(streamId, errorCode, false);
+	}
+
+	private void onRequestStreamEnded(long streamId, long errorCode, boolean tellThePeer) {
 		if (state == State.CLOSED) return;
-		if (qpackDynamicDecoder != null) writeDecoderInstruction(new StreamCancellation(streamId));
+		if (tellThePeer && qpackDynamicDecoder != null) writeDecoderInstruction(new StreamCancellation(streamId));
 		if (qpackDynamicEncoder != null) qpackDynamicEncoder.onStreamCancelled(streamId);
 		QpackBlockedSections sections = blockedSections;
 		// The reset path of FR-035's three: discard recycles every section held for this stream, and the

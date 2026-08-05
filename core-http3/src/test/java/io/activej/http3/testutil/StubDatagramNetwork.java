@@ -18,6 +18,7 @@ package io.activej.http3.testutil;
 
 import io.activej.bytebuf.ByteBuf;
 import io.activej.net.socket.udp.UdpPacket;
+import org.jetbrains.annotations.Nullable;
 
 import java.net.InetSocketAddress;
 import java.util.ArrayDeque;
@@ -54,13 +55,37 @@ public final class StubDatagramNetwork {
 	/** One datagram waiting for {@link #deliverDue()}. */
 	private record InFlight(InetSocketAddress from, InetSocketAddress to, ByteBuf payload) {}
 
+	/**
+	 * Sees every datagram this fabric carries, at {@link #send} and again at delivery.
+	 * <p>
+	 * The payload is handed over as a <b>copy</b>: the real buffer stays the fabric's, so an observer
+	 * cannot consume, retain or recycle what a connection is still going to read (DI-1).
+	 */
+	@FunctionalInterface
+	public interface DatagramObserver {
+		void onDatagram(Event event, InetSocketAddress from, InetSocketAddress to, byte[] datagram);
+	}
+
+	/** Which end of the wire an observed datagram was at. */
+	public enum Event {SENT, DELIVERED}
+
 	private final Map<InetSocketAddress, Consumer<UdpPacket>> receivers = new HashMap<>();
 	private final ArrayDeque<InFlight> inFlight = new ArrayDeque<>();
+
+	private @Nullable DatagramObserver observer;
 
 	private boolean closed;
 
 	private int sentCount;
 	private int deliveredCount;
+
+	/**
+	 * Installs the tap of {@link DatagramObserver}; absent otherwise, so a test that does not ask for it
+	 * pays neither the copy nor the callback. At most one — the second call replaces the first.
+	 */
+	public void observe(DatagramObserver observer) {
+		this.observer = observer;
+	}
 
 	public void bind(InetSocketAddress address, Consumer<UdpPacket> receiver) {
 		if (receivers.putIfAbsent(address, receiver) != null) {
@@ -82,7 +107,16 @@ public final class StubDatagramNetwork {
 			return;
 		}
 		sentCount++;
+		notifyObserver(Event.SENT, from, to, payload);
 		inFlight.add(new InFlight(from, to, payload));
+	}
+
+	private void notifyObserver(Event event, InetSocketAddress from, InetSocketAddress to, ByteBuf payload) {
+		DatagramObserver current = observer;
+		if (current == null) return;
+		byte[] copy = new byte[payload.readRemaining()];
+		System.arraycopy(payload.array(), payload.head(), copy, 0, copy.length);
+		current.onDatagram(event, from, to, copy);
 	}
 
 	/**
@@ -107,6 +141,7 @@ public final class StubDatagramNetwork {
 			}
 			deliveredCount++;
 			delivered++;
+			notifyObserver(Event.DELIVERED, entry.from(), entry.to(), entry.payload());
 			// The address a receiver sees is the SOURCE, matching UdpSocket's convention — this is what
 			// server dispatch keys on.
 			receiver.accept(UdpPacket.of(entry.payload(), entry.from()));

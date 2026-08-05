@@ -96,6 +96,33 @@ public class PacketAssemblerTest {
 		opened.payload.recycle();
 	}
 
+	/**
+	 * RFC 9000 §17.2.3: a 0-RTT packet is a long header of type {@code 0x1} — first byte
+	 * {@code 0b1101_00pp} before header protection — laid out like a Handshake one and carrying no
+	 * token. Both properties are asserted, the round trip through {@code open} and the type bits
+	 * themselves, because a wrong type still decrypts: it is the <i>peer's</i> dispatcher that would
+	 * misfile it, and only the bits say which level it filed it under.
+	 */
+	@Test
+	public void zeroRttPacketRoundTripsThroughOpenAndCarriesLongPacketType1() throws Exception {
+		QuicKeys keys = clientKeys();
+		List<QuicFrame> frames = List.of(PingFrame.INSTANCE);
+		PacketAssembler.PacketPlan plan =
+			new PacketAssembler.PacketPlan(EncryptionLevel.ZERO_RTT, 3, 2, frames);
+
+		ByteBuf packet = PacketAssembler.assemblePacket(plan, keys, DCID, SCID, new byte[0], VERSION, 64);
+		// Read before open(), which consumes the buffer: the fields below are not header-protected.
+		int firstByte = packet.array()[packet.head()] & 0xFF;
+		assertEquals("long header form bit", 0x80, firstByte & 0x80);
+		assertEquals("fixed bit", 0x40, firstByte & 0x40);
+		assertEquals("Long Packet Type must be 0x1", 0x1, (firstByte >> 4) & 0x3);
+
+		QuicPacketProtection.OpenResult opened = QuicPacketProtection.open(keys, 2, DCID.length(), packet);
+		assertEquals(3, opened.packetNumber);
+		assertEquals(PingFrame.INSTANCE, QuicFrames.read(opened.payload));
+		opened.payload.recycle();
+	}
+
 	@Test
 	public void shortHeaderPacketRoundTripsThroughOpen() throws Exception {
 		QuicKeys keys = serverKeys();

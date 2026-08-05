@@ -267,4 +267,96 @@ public class SendQueueTest {
 	public void rejectsNonPositiveBound() {
 		assertThrows(IllegalArgumentException.class, () -> new SendQueue(0));
 	}
+
+	/**
+	 * RFC 9001 §4.9.3: when a client installs 1-RTT keys, what it queued at 0-RTT and never sent must
+	 * still go out, at the level that now exists. Order is preserved and the 0-RTT frames go ahead of
+	 * anything already queued at 1-RTT, because they were written first.
+	 */
+	@Test
+	public void moveAllRelevelsInOrderAndAheadOfWhatIsAlreadyQueued() throws Exception {
+		SendQueue queue = new SendQueue(4096);
+		CryptoFrame early1 = crypto(0, "early-one");
+		CryptoFrame early2 = crypto(9, "early-two");
+		QuicFrame later = new MaxDataFrame(1000);
+		queue.enqueue(EncryptionLevel.ZERO_RTT, early1, true);
+		queue.enqueue(EncryptionLevel.ZERO_RTT, early2, true);
+		queue.enqueue(EncryptionLevel.ONE_RTT, later, true);
+		long queuedBefore = queue.queuedBytes();
+
+		queue.moveAll(EncryptionLevel.ZERO_RTT, EncryptionLevel.ONE_RTT);
+
+		assertEquals(0, queue.pendingCount(EncryptionLevel.ZERO_RTT));
+		assertEquals(3, queue.pendingCount(EncryptionLevel.ONE_RTT));
+		assertEquals("nothing left the queue, so nothing was freed", queuedBefore, queue.queuedBytes());
+		assertTrue("the handlerOwned flag must survive the move",
+			queue.isNextHandlerOwned(EncryptionLevel.ONE_RTT));
+		assertEquals(List.of(early1, early2, later), drain(queue, EncryptionLevel.ONE_RTT));
+		Recyclers.recycle(early1);
+		Recyclers.recycle(early2);
+	}
+
+	@Test
+	public void moveAllIsANoOpOnceTheQueueIsDropped() throws Exception {
+		SendQueue queue = new SendQueue(4096);
+		queue.enqueue(EncryptionLevel.ZERO_RTT, PingFrame.INSTANCE, true);
+		queue.drop();
+		queue.moveAll(EncryptionLevel.ZERO_RTT, EncryptionLevel.ONE_RTT);
+		assertTrue(queue.isEmpty());
+	}
+
+	// ---------------------------------------------------------------- removeIf (T093a)
+
+	/**
+	 * T093a: what {@code removeIf} takes out it also recycles, and it subtracts exactly what it took —
+	 * a drift here would silently move the {@code maxSendQueueBytes} bound.
+	 */
+	@Test
+	public void removeIfRecyclesWhatItRemovesAndSubtractsExactlyThoseBytes() throws Exception {
+		SendQueue queue = new SendQueue(4096);
+		CryptoFrame doomed = crypto(0, "discard-me");
+		CryptoFrame kept = crypto(10, "keep-me");
+		queue.enqueue(EncryptionLevel.ONE_RTT, doomed, true);
+		queue.enqueue(EncryptionLevel.ONE_RTT, kept, true);
+		long doomedBytes = doomed.encodedLength();
+		long queuedBefore = queue.queuedBytes();
+
+		assertEquals(1, queue.removeIf(frame -> frame == doomed));
+
+		assertEquals(queuedBefore - doomedBytes, queue.queuedBytes());
+		assertEquals(List.of(kept), drain(queue, EncryptionLevel.ONE_RTT));
+		assertEquals(0, queue.queuedBytes());
+		Recyclers.recycle(kept);
+	}
+
+	/** Every level is swept, so a frame re-levelled by {@link SendQueue#moveAll} is still reachable. */
+	@Test
+	public void removeIfSweepsEveryLevelAndPreservesTheOrderOfWhatItLeaves() throws Exception {
+		SendQueue queue = new SendQueue(4096);
+		CryptoFrame early = crypto(0, "early");
+		QuicFrame first = new MaxDataFrame(1);
+		QuicFrame second = new MaxDataFrame(2);
+		queue.enqueue(EncryptionLevel.ZERO_RTT, early, true);
+		queue.enqueue(EncryptionLevel.ONE_RTT, first, true);
+		queue.enqueue(EncryptionLevel.ONE_RTT, second, true);
+
+		assertEquals(1, queue.removeIf(frame -> frame instanceof CryptoFrame));
+
+		assertEquals(0, queue.pendingCount(EncryptionLevel.ZERO_RTT));
+		assertEquals(List.of(first, second), drain(queue, EncryptionLevel.ONE_RTT));
+		assertEquals(0, queue.queuedBytes());
+	}
+
+	@Test
+	public void removeIfMatchingNothingChangesNothing() throws Exception {
+		SendQueue queue = new SendQueue(4096);
+		queue.enqueue(EncryptionLevel.ONE_RTT, PingFrame.INSTANCE, true);
+		long queuedBefore = queue.queuedBytes();
+
+		assertEquals(0, queue.removeIf(frame -> false));
+
+		assertEquals(queuedBefore, queue.queuedBytes());
+		assertEquals(1, queue.pendingCount(EncryptionLevel.ONE_RTT));
+		queue.drop();
+	}
 }

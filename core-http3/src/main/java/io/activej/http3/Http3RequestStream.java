@@ -25,6 +25,7 @@ import io.activej.csp.consumer.ChannelConsumer;
 import io.activej.csp.consumer.ChannelConsumers;
 import io.activej.csp.supplier.AbstractChannelSupplier;
 import io.activej.csp.supplier.ChannelSupplier;
+import io.activej.http.HttpError;
 import io.activej.http.HttpHeaders;
 import io.activej.http.HttpMessage;
 import io.activej.http.HttpRequest;
@@ -48,6 +49,7 @@ import io.activej.promise.SettablePromise;
 import io.activej.quic.codec.QuicVarInts;
 import io.activej.quic.stream.QuicStream;
 import io.activej.quic.stream.QuicStreamException;
+import io.activej.quic.tls.EncryptionLevel;
 import io.activej.reactor.AbstractReactive;
 import io.activej.reactor.Reactor;
 import org.jetbrains.annotations.Nullable;
@@ -122,6 +124,16 @@ public final class Http3RequestStream extends AbstractReactive {
 	/** {@link #declaredContentLength} when the message declared none. */
 	private static final long NO_CONTENT_LENGTH = -1;
 
+	/**
+	 * RFC 8470 §5.1's request field and its one legal value, in the lowercase spelling RFC 9114 §4.1.1
+	 * requires on the wire — attached to a request accepted from early data (spec FR-066).
+	 */
+	private static final String EARLY_DATA_FIELD = "early-data";
+	private static final String EARLY_DATA_INDICATION = "1";
+
+	/** RFC 8470 §5.2's status for a request refused because it arrived in early data. */
+	private static final int TOO_EARLY = 425;
+
 	public enum State {
 		/** Nothing has been received on this stream yet. */
 		IDLE,
@@ -145,6 +157,13 @@ public final class Http3RequestStream extends AbstractReactive {
 	private @Nullable Http3FieldSectionDecoder fieldSectionDecoder;
 	private Consumer<Http3Exception> connectionErrorListener = e -> {};
 	private Http3EventListener eventListener = Http3EventListener.NONE;
+
+	/**
+	 * Default-deny, and deliberately defaulted <b>here</b> rather than only on {@link Http3Server}: this
+	 * is the innermost layer a request passes through, so a consumer that wires an
+	 * {@link Http3Connection} by hand gets FR-064's protection without asking for it.
+	 */
+	private Http3EarlyDataPolicy earlyDataPolicy = Http3EarlyDataPolicy.DEFAULT_POLICY;
 
 	private final Http3FrameSequence inbound = new Http3FrameSequence();
 	private final Http3FrameSequence outbound = new Http3FrameSequence();
@@ -184,6 +203,9 @@ public final class Http3RequestStream extends AbstractReactive {
 
 	/** Whatever this stream decoded from the peer's HEADERS; kept for its trailers even once handed over. */
 	private @Nullable HttpMessage inboundMessage;
+
+	/** Latched by {@link #readHeaders} off the transport; see {@link #headersArrivalLevel()}. */
+	private @Nullable EncryptionLevel headersArrivalLevel;
 
 	/**
 	 * True once {@link #receiveResponse()} delivered the inbound message to a caller who now owns it, so
@@ -250,6 +272,17 @@ public final class Http3RequestStream extends AbstractReactive {
 		Builder withQpackFieldSectionDecoder(Http3FieldSectionDecoder fieldSectionDecoder) {
 			checkNotBuilt(this);
 			Http3RequestStream.this.fieldSectionDecoder = fieldSectionDecoder;
+			return this;
+		}
+
+		/**
+		 * What this stream is willing to run from early data (FR-064, FR-065), consulted only for an
+		 * exchange whose leading HEADERS arrived at {@code ZERO_RTT}. Defaults to
+		 * {@link Http3EarlyDataPolicy#DEFAULT_POLICY} — RFC 9110 §9.2.1 safe methods and nothing else.
+		 */
+		public Builder withEarlyDataPolicy(Http3EarlyDataPolicy earlyDataPolicy) {
+			checkNotBuilt(this);
+			Http3RequestStream.this.earlyDataPolicy = earlyDataPolicy;
 			return this;
 		}
 
@@ -328,6 +361,36 @@ public final class Http3RequestStream extends AbstractReactive {
 	}
 
 	/**
+	 * Whether this exchange was opened while its bytes would have left in a 0-RTT packet — which is to
+	 * say, whether it is at risk if the server refuses the early data (spec FR-055).
+	 * <p>
+	 * Latched by the transport at the moment the stream was created and never revoked, so it stays true
+	 * after the handshake completes: it records where this exchange came from, not where it is now.
+	 */
+	public boolean isEarlyData() {
+		checkInReactorThread(this);
+		return stream.isEarlyData();
+	}
+
+	/**
+	 * The {@link EncryptionLevel} this exchange's <b>leading HEADERS</b> arrived at (spec FR-064a) —
+	 * {@code ZERO_RTT} for a message a peer sent in early data, {@code ONE_RTT} for an ordinary one, and
+	 * {@code null} until the HEADERS frame is in hand.
+	 * <p>
+	 * Latched at the moment that frame is read rather than derived on demand, because a stream outlives
+	 * its head: DATA keeps arriving afterwards, at a level of its own, and an early-data policy asked
+	 * about a request must be told where the <em>request</em> came from, not where the last body chunk
+	 * did. It is the receiving counterpart of {@link #isEarlyData()}, which reports the sending side and
+	 * is therefore always {@code false} on a server.
+	 *
+	 * @see <a href="https://www.rfc-editor.org/rfc/rfc8470">RFC 8470 — Using Early Data in HTTP</a>
+	 */
+	public @Nullable EncryptionLevel headersArrivalLevel() {
+		checkInReactorThread(this);
+		return headersArrivalLevel;
+	}
+
+	/**
 	 * Whether a consumer is still reading the message this stream received: its body supplier has been
 	 * asked for at least one chunk, and the receive direction has neither finished nor been aborted.
 	 * <p>
@@ -383,6 +446,13 @@ public final class Http3RequestStream extends AbstractReactive {
 	 * <p>
 	 * The returned message is owned by this stream (FR-057a): it is released by {@link #sendResponse} or
 	 * by {@link #abort}, so a servlet that never touches the body leaks nothing.
+	 * <p>
+	 * A request that arrived in <b>early data</b> is screened by the {@linkplain
+	 * Builder#withEarlyDataPolicy early-data policy} before it is handed over (FR-064), so a caller
+	 * cannot dispatch what the policy refused — the request never leaves this stream. Such a refusal
+	 * fails this promise with an {@link HttpError} of code {@code 425}, leaving the stream <b>intact</b>
+	 * rather than aborted: the exchange still owes the peer RFC 8470 §5.2's answer, and
+	 * {@link #sendResponse} is what writes it.
 	 *
 	 * @return a promise failing with {@link Http3Exception} on an H3 protocol violation — the stream is
 	 * aborted with its code first — or, unwrapped, with whatever the stream layer reported (FR-058c)
@@ -393,7 +463,38 @@ public final class Http3RequestStream extends AbstractReactive {
 		if (terminalException != null) return Promise.ofException(terminalException);
 		// RFC 9114 §4.1: a stream that ends before a complete request is an incomplete request, not a
 		// malformed one — the difference is whether the peer sent something wrong.
-		return readHeaders(this::buildRequest, Http3Errors.H3_REQUEST_INCOMPLETE);
+		return readHeaders(this::buildRequest, Http3Errors.H3_REQUEST_INCOMPLETE)
+			.then(this::screenEarlyData);
+	}
+
+	/**
+	 * FR-064's gate: the one place a request built from a 0-RTT flight becomes a request somebody may
+	 * dispatch. It sits after the message mapping and before the promise resolves, which is what makes
+	 * "the servlet is never invoked for a refused request" structural rather than a caller's obligation
+	 * — there is no request to invoke it with.
+	 * <p>
+	 * An ordinary 1-RTT request never reaches the policy at all: the level is the exchange's own
+	 * ({@link #headersArrivalLevel()}), not the connection's, so a request held back by a client on a
+	 * connection that <i>did</i> accept early data is judged as what it is.
+	 * <p>
+	 * A policy that throws is a refusal. Failing open on a consumer's bug would turn it into a replay
+	 * vector, which is precisely the thing this method exists to prevent.
+	 */
+	private Promise<HttpRequest> screenEarlyData(HttpRequest request) {
+		if (headersArrivalLevel != EncryptionLevel.ZERO_RTT) return Promise.of(request);
+		boolean accepted;
+		try {
+			accepted = earlyDataPolicy.acceptsInEarlyData(request);
+		} catch (RuntimeException e) {
+			logger.warn("The early-data policy failed on stream {}; refusing the request", stream.id(), e);
+			accepted = false;
+		}
+		if (accepted) return Promise.of(request);
+		logger.trace("HTTP/3 request stream {} refused: the early-data policy declined it", stream.id());
+		// The request stays this stream's (FR-057a) — sendResponse or abort releases it, exactly as for a
+		// request a servlet did receive.
+		return Promise.ofException(HttpError.ofCode(TOO_EARLY,
+			"The request arrived in early data and the early-data policy refused it (RFC 8470)"));
 	}
 
 	/**
@@ -453,6 +554,10 @@ public final class Http3RequestStream extends AbstractReactive {
 				return Promise.ofException(abortWith(new Http3Exception(Http3Errors.H3_FRAME_UNEXPECTED,
 					"A frame other than HEADERS opened the message")));
 			}
+			// Latched off the transport before the field section is decoded, and only for the frame that
+			// opens the message: an interim (1xx) response recurses through here, and the level this
+			// exchange is judged by is the one its head arrived at (FR-064a).
+			if (headersArrivalLevel == null) headersArrivalLevel = stream.arrivalLevel();
 			return message.build(headers).then(
 				built -> built == null ?
 					// An informational response: consumed, and the message it precedes is still ahead.
@@ -467,6 +572,7 @@ public final class Http3RequestStream extends AbstractReactive {
 	/** Takes ownership of {@code headers} on every path. */
 	private Promise<HttpRequest> buildRequest(HeadersFrame headers) {
 		return decodeFieldSection(headers).map(fields -> {
+			if (headersArrivalLevel == EncryptionLevel.ZERO_RTT) markEarlyData(fields);
 			HttpRequest.Builder builder = Http3Headers.toRequestBuilder(fields);
 
 			bodySupplier = new InboundBodySupplier();
@@ -515,6 +621,21 @@ public final class Http3RequestStream extends AbstractReactive {
 			state = State.HEADERS_DONE;
 			return response;
 		});
+	}
+
+	/**
+	 * FR-066: states in the message itself that this request arrived in early data, so a servlet can
+	 * apply its own rule on top of the deployment's — and so can the policy, which sees the same fields.
+	 * <p>
+	 * <b>Replaces</b> rather than appends, because the indication a servlet reads must be this server's
+	 * verdict and not a peer's claim: a client is free to send an {@code Early-Data} field of its own,
+	 * and a second field line beside ours would leave the servlet reading whichever came first. A
+	 * request arriving at any other level is left exactly as the peer sent it — RFC 8470 §5.1 has
+	 * intermediaries add this field, and removing one there would drop a hop's own statement.
+	 */
+	private static void markEarlyData(List<Field> fields) {
+		fields.removeIf(field -> field.name().equals(EARLY_DATA_FIELD));
+		fields.add(new Field(EARLY_DATA_FIELD, EARLY_DATA_INDICATION));
 	}
 
 	/** FR-039: what the message says its body will weigh, reconciled against the DATA at end of input. */
@@ -692,6 +813,37 @@ public final class Http3RequestStream extends AbstractReactive {
 	public void abort(long errorCode, String reason) {
 		checkInReactorThread(this);
 		abortWith(new Http3Exception(errorCode, reason));
+	}
+
+	/**
+	 * Abandons this exchange <b>silently</b> because the server refused the early data it went out in
+	 * (spec FR-055): every buffer this stream owns is recycled and every pending promise fails, but
+	 * <b>nothing is put on the wire</b> — no {@code RESET_STREAM}, no {@code STOP_SENDING}, and no
+	 * {@code Stream Cancellation} on the QPACK decoder stream. The peer dropped this stream's 0-RTT
+	 * packets undecrypted and has never heard of it; every one of those frames would be the first it
+	 * ever did hear, and would open a request stream at the server for nothing.
+	 * <p>
+	 * The state is moved <b>before</b> anything is failed, and that ordering is load-bearing: the QUIC
+	 * stream is discarded by the caller immediately afterwards, which fails whatever read or write is
+	 * parked on it, and those continuations re-enter here. Finding this stream already terminal is what
+	 * makes each of them a no-op rather than a second abort with a different exception.
+	 * <p>
+	 * Idempotent. Only {@link Http3Connection} calls it, and only as one half of its own discard —
+	 * this leaves the QUIC stream alive, which alone would strand it.
+	 */
+	void discardEarlyData(Exception cause) {
+		checkInReactorThread(this);
+		if (state == State.RESET) return;
+		state = State.RESET;
+		terminalException = cause;
+		pendingInput = nullify(pendingInput, ByteBuf::recycle);
+		// A stream abandoned part-way through a frame leaves its reader holding the payload it had begun
+		// filling; nothing will ever finish that frame, so this is the path that owes it a release (DI-1).
+		frameReader.recycle();
+		bodySupplier = nullify(bodySupplier, supplier -> supplier.closeEx(cause));
+		releaseInbound();
+		logger.trace("HTTP/3 request stream {} discarded: its early data was refused", stream.id());
+		receiveFinished();
 	}
 
 	// ---------------------------------------------------------------- reading frames

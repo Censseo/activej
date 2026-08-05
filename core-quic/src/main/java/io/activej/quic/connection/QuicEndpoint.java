@@ -30,6 +30,7 @@ import io.activej.quic.codec.VersionNegotiationPacket;
 import io.activej.quic.connection.CoalescedPackets.Envelope;
 import io.activej.quic.connection.QuicConnection.Role;
 import io.activej.quic.connection.QuicConnection.TlsEngineFactory;
+import io.activej.quic.tls.QuicTransportParameters;
 import io.activej.reactor.AbstractNioReactive;
 import io.activej.reactor.nio.NioReactor;
 import org.jetbrains.annotations.Nullable;
@@ -628,6 +629,20 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 	 *                            parameters it is given
 	 */
 	public Promise<QuicConnection> connectTo(InetSocketAddress address, TlsEngineFactory clientEngineFactory) {
+		return connectTo(address, clientEngineFactory, null);
+	}
+
+	/**
+	 * The same, for a <b>resumption</b> attempt: {@code rememberedTransportParameters} are the peer
+	 * parameters stored with the session ticket the TLS client config is offering (RFC 9000 §7.4.1).
+	 * <p>
+	 * They are what bounds every byte sent in 0-RTT and what the server's new parameters are checked
+	 * against for a forbidden reduction, so a caller offering a ticket without them would be offering
+	 * a resumption it has no limits for. {@code null} is the ordinary, non-resuming dial.
+	 */
+	public Promise<QuicConnection> connectTo(InetSocketAddress address, TlsEngineFactory clientEngineFactory,
+		@Nullable QuicTransportParameters rememberedTransportParameters
+	) {
 		checkInReactorThread(this);
 		if (closed) {
 			return Promise.ofException(new QuicTransportException(
@@ -648,6 +663,9 @@ public final class QuicEndpoint extends AbstractNioReactive implements AutoClose
 				.initialize(builder -> {
 					if (connectionInspector != null) builder.withInspector(connectionInspector);
 					if (frameHandlerFactory != null) builder.withFrameHandlerFactory(frameHandlerFactory);
+					if (rememberedTransportParameters != null) {
+						builder.withRememberedTransportParameters(rememberedTransportParameters);
+					}
 				})
 				.build();
 		} catch (RuntimeException e) {

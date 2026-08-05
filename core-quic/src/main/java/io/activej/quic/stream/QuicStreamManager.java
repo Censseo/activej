@@ -239,6 +239,7 @@ public final class QuicStreamManager extends AbstractReactive implements QuicFra
 	private final long maxOutstandingStreamBytes;
 
 	private @Nullable Consumer<QuicStream> streamListener;
+	private @Nullable Runnable earlyDataRejectionListener;
 	/** Absent by default (FR-044); every FR-043 counter is readable without one. */
 	private @Nullable Inspector inspector;
 
@@ -357,6 +358,21 @@ public final class QuicStreamManager extends AbstractReactive implements QuicFra
 		}
 
 		/**
+		 * Called once, on the reactor thread, when the peer refused this connection's early data
+		 * (spec FR-055) — see {@link QuicFrameHandler#onEarlyDataRejected}.
+		 * <p>
+		 * A plain {@link Runnable}, because this manager passes on <b>no</b> decision of its own with it:
+		 * it discards nothing, and the listener is expected to walk {@link #earlyDataStreams()} and call
+		 * {@link #discardStream} for the ones it will re-create. By the time it runs, the connection's
+		 * 0-RTT keys are already gone, so anything the listener opens or writes goes out at 1-RTT.
+		 */
+		public Builder withEarlyDataRejectionListener(Runnable listener) {
+			checkNotBuilt(this);
+			QuicStreamManager.this.earlyDataRejectionListener = listener;
+			return this;
+		}
+
+		/**
 		 * Attaches the optional statistics hook of FR-044, mirroring
 		 * {@code QuicConnection.Builder.withInspector}. Absent by default, and never required: every
 		 * counter of FR-043 is readable without one.
@@ -403,7 +419,7 @@ public final class QuicStreamManager extends AbstractReactive implements QuicFra
 		// several streams in a row deserves one datagram rather than one per attempt (research R-03).
 		beginBatch();
 		try {
-			if (peerParameters == null) {
+			if (peerParameters == null && !initializeFromEarlyParameters()) {
 				// FR-042: withheld, not failed. The handshake is what supplies the stream limits, and until
 				// it has there is no limit value a STREAMS_BLOCKED could truthfully carry.
 				return withholdOpen(direction);
@@ -563,11 +579,9 @@ public final class QuicStreamManager extends AbstractReactive implements QuicFra
 
 		SendPart sendPart = null;
 		if (StreamIds.canSend(streamId, role)) {
-			long window = bidirectional
-				? locallyInitiated ? peer.initialMaxStreamDataBidiRemote() : peer.initialMaxStreamDataBidiLocal()
-				: peer.initialMaxStreamDataUni();
-			sendPart = new SendPart(streamId, new StreamFlowController(window), connectionFlowControl,
-				maxFrameDataSize, sendSink);
+			sendPart = new SendPart(streamId,
+				new StreamFlowController(peerSendWindowOf(peer, streamId, locallyInitiated)),
+				connectionFlowControl, maxFrameDataSize, sendSink);
 		}
 
 		ReceivePart receivePart = null;
@@ -576,7 +590,11 @@ public final class QuicStreamManager extends AbstractReactive implements QuicFra
 				settings.maxReceiveRangesPerStream(), receiveListener);
 		}
 
-		QuicStream stream = new QuicStream(reactor, streamId, locallyInitiated, sendPart, receivePart);
+		// Latched here, at the one construction site of every stream: whether a byte written now would
+		// leave in a 0-RTT packet is a property of the moment the stream came into existence, and it stops
+		// being readable from the connection the instant the 1-RTT keys land (spec FR-055).
+		QuicStream stream = new QuicStream(reactor, streamId, locallyInitiated,
+			connection.isSendingEarlyData(), sendPart, receivePart);
 		streams.put(streamId, stream);
 		// The single construction site of every stream, local or peer-opened, so the one call here is what
 		// makes the inspector's view of "opened" complete (FR-044).
@@ -712,7 +730,7 @@ public final class QuicStreamManager extends AbstractReactive implements QuicFra
 
 	private void routeFrame(EncryptionLevel level, QuicFrame frame) throws QuicTransportException {
 		if (frame instanceof StreamFrame streamFrame) {
-			onStreamFrame(streamFrame);
+			onStreamFrame(level, streamFrame);
 			return;
 		}
 		if (frame instanceof MaxDataFrame maxData) {
@@ -917,8 +935,12 @@ public final class QuicStreamManager extends AbstractReactive implements QuicFra
 	 * </ul>
 	 * What FR-023 does require is preserved exactly: the check is still <em>before</em> the frame
 	 * reaches {@link ReceivePart}, which is the point at which a byte could be delivered.
+	 *
+	 * @param level the encryption level this frame's packet was protected at, carried forward to
+	 *              {@link QuicStream#arrivalLevel()} so the layer above can tell data a peer sent in a
+	 *              0-RTT packet — and may therefore be replaying — from ordinary data (spec FR-064a)
 	 */
-	private void onStreamFrame(StreamFrame frame) throws QuicTransportException {
+	private void onStreamFrame(EncryptionLevel level, StreamFrame frame) throws QuicTransportException {
 		long streamId = frame.streamId;
 		requirePeerParameters();
 
@@ -959,6 +981,10 @@ public final class QuicStreamManager extends AbstractReactive implements QuicFra
 			throw new QuicTransportException(QuicTransportErrors.FLOW_CONTROL_ERROR,
 				"peer sent past the advertised connection limit " + flowControl.receiveLimit());
 		}
+
+		// Recorded before the bytes are handed over, never after: ReceivePart resolves a parked read on
+		// the spot, and that continuation is where the layer above reads the arrival level (FR-064a).
+		stream.onDataArrived(level);
 
 		// slice() rather than the payload itself: the receiving part owns what it is given, while the
 		// connection still owns the frame for its own recycling sweep (FR-014).
@@ -1321,7 +1347,14 @@ public final class QuicStreamManager extends AbstractReactive implements QuicFra
 			return;
 		}
 		try {
-			initializeFrom(peer);
+			if (peerParameters == null) {
+				initializeFrom(peer);
+			} else {
+				// Already sized from the limits remembered with a session ticket (RFC 9000 §7.4.1). The
+				// handshake's are the real ones and can only be larger, so this is a widening, never a
+				// rebuild — the streams, offsets and consumed credit of the early data all stand.
+				raiseLimitsFrom(peer);
+			}
 		} catch (QuicTransportException e) {
 			// onEstablished cannot declare a checked exception (QuicFrameHandler's signature), so the
 			// standard "throw and let the caller close" pattern used everywhere else in this class is
@@ -1330,6 +1363,89 @@ public final class QuicStreamManager extends AbstractReactive implements QuicFra
 			return;
 		}
 		drainPendingOpens(null);
+	}
+
+	// ---------------------------------------------------------------- early-data rejection (FR-055)
+
+	/**
+	 * The peer refused this connection's early data. Forwarded, and nothing else.
+	 * <p>
+	 * <b>This layer discards no stream of its own here, deliberately.</b> A stream created in early data
+	 * may be work that has to be re-created on a fresh identifier — an HTTP/3 request the server never
+	 * saw — or work that merely has to be carried to 1-RTT and retransmitted, which
+	 * {@code QuicConnection} has already arranged by re-levelling the send queue. Only the application
+	 * protocol knows which of the two a given stream is, and a transport that guessed would be wrong for
+	 * the other one.
+	 */
+	@Override
+	public void onEarlyDataRejected(QuicConnection c) {
+		checkInReactorThread(this);
+		if (earlyDataRejectionListener != null) {
+			earlyDataRejectionListener.run();
+		}
+	}
+
+	/** The still-open streams that were created while application data would have left at 0-RTT. */
+	public Set<Long> earlyDataStreams() {
+		checkInReactorThread(this);
+		Set<Long> ids = new LinkedHashSet<>();
+		for (Map.Entry<Long, QuicStream> entry : streams.entrySet()) {
+			if (entry.getValue().isEarlyData()) ids.add(entry.getKey());
+		}
+		return ids;
+	}
+
+	/**
+	 * Abandons {@code streamId} <b>silently</b>: both halves become terminal, every buffer they hold is
+	 * released, everything still queued for the stream is purged, and the stream is released — with
+	 * <b>no frame of any kind on the wire</b> (spec FR-055).
+	 * <p>
+	 * That silence is the point, and it is what makes this different from {@link QuicStream#reset}. The
+	 * one caller is a peer's refusal of early data: the peer dropped the stream's 0-RTT packets
+	 * undecrypted, so it has never heard of the stream, and RFC 9000 §2.1 opens every lower-numbered
+	 * stream of a type on first mention — a {@code RESET_STREAM} naming it would <i>create</i> it at the
+	 * peer for the sole purpose of aborting it.
+	 * <p>
+	 * Idempotent, and safe for an unknown identifier. The local stream counter is <b>not</b> rewound:
+	 * identifiers are handed out once (RFC 9000 §2.1), so the work is re-created on the next one.
+	 * <p>
+	 * <b>Send-side connection credit consumed by this stream is not reclaimed</b>, matching the rule that
+	 * governs every other abandonment here: bytes given an offset stay spent, because a peer able to
+	 * reclaim its spend by abandoning a stream could buffer unboundedly at the receiver. Frames of this
+	 * stream already in flight need nothing: once it leaves {@link #streams} they find no part to go back
+	 * to, and {@link #onFrameLost} releases them.
+	 *
+	 * @param cause what the stream's pending reads, writes and {@link QuicStream#whenClosed()} fail with.
+	 *              Supplied by the caller, because the reason belongs to the protocol above this one
+	 */
+	public void discardStream(long streamId, Exception cause) {
+		checkInReactorThread(this);
+		QuicStream stream = streams.get(streamId);
+		if (stream == null) return;
+		// The order is the substance of this method, and it is the guard rail this class already follows
+		// for every other abandonment: the queue is purged, the stream leaves the map and its credit is
+		// returned FIRST, and only then is anything failed. Failing runs the application's continuation
+		// synchronously, and that continuation routinely discards, resets or closes again — each of which
+		// must find a stream that is already gone rather than one that is half gone. A second discard
+		// reaching the release bookkeeping would return the same concurrency credit twice.
+		connection.dropQueuedFrames(frame -> belongsTo(streamId, frame));
+		unregister(streamId, stream);
+		// onConnectionClosed rather than closeEx: it is also the end of any retransmission this stream
+		// would otherwise still owe, which is exactly the silence this method exists for. It is what fails
+		// the parked reads and writes, and it fails whenClosed() with `cause` — unlike a release, which
+		// completes it successfully, because this stream did not finish.
+		stream.onConnectionClosed(cause);
+		logger.trace("Discarded early-data stream {}", streamId);
+	}
+
+	/** The five frame types this layer can have queued that name one stream. */
+	private static boolean belongsTo(long streamId, QuicFrame frame) {
+		if (frame instanceof StreamFrame stream) return stream.streamId == streamId;
+		if (frame instanceof ResetStreamFrame reset) return reset.streamId == streamId;
+		if (frame instanceof StopSendingFrame stopSending) return stopSending.streamId == streamId;
+		if (frame instanceof MaxStreamDataFrame maxStreamData) return maxStreamData.streamId == streamId;
+		if (frame instanceof StreamDataBlockedFrame blocked) return blocked.streamId == streamId;
+		return false;
 	}
 
 	/**
@@ -1372,6 +1488,34 @@ public final class QuicStreamManager extends AbstractReactive implements QuicFra
 
 	// ---------------------------------------------------------------- initialisation from the handshake
 
+	/**
+	 * Sizes this manager from the limits that bind <b>early data</b>, if there are any (RFC 9000
+	 * §7.4.1, spec FR-053). Returns whether it did.
+	 * <p>
+	 * The values come from {@link QuicConnection#earlyTransportParameters()}, which is the connection's
+	 * to answer: a client obeys what it remembered with its session ticket, a server has been promised
+	 * nothing and may therefore send nothing. Once the handshake supplies the real parameters,
+	 * {@link #raiseLimitsFrom} replaces these — always upwards, because RFC 9000 §7.4.1 forbids the
+	 * reduction that would make it a retraction.
+	 * <p>
+	 * A {@link QuicTransportException} here would have to be reported from inside an {@code open()} or
+	 * a frame route, so it is deliberately impossible instead: the remembered parameters were validated
+	 * on the connection that issued them, and a client that stored something invalid has only made
+	 * itself resume nothing.
+	 */
+	private boolean initializeFromEarlyParameters() {
+		QuicTransportParameters early = connection.earlyTransportParameters();
+		if (early == null) return false;
+		try {
+			initializeFrom(early);
+		} catch (QuicTransportException e) {
+			// A remembered stream count above 2^60 is our own stored value, not the peer's word for it.
+			logger.warn("Ignoring unusable remembered transport parameters: {}", e.getMessage());
+			return false;
+		}
+		return peerParameters != null;
+	}
+
 	/** Package-private rather than {@code private} only so a test can drive it with a hand-built peer. */
 	void initializeFrom(QuicTransportParameters peer) throws QuicTransportException {
 		if (peerParameters != null) return;
@@ -1398,16 +1542,86 @@ public final class QuicStreamManager extends AbstractReactive implements QuicFra
 	}
 
 	/**
-	 * @throws QuicTransportException {@code PROTOCOL_VIOLATION} if application data arrived before the
-	 *                                handshake supplied the peer's limits — 0-RTT is not implemented,
-	 *                                so there is no legitimate way for that to happen
+	 * Replaces the limits this manager was sized from with the handshake's, and wakes everything the
+	 * increase may have unblocked (RFC 9000 §7.4.1, spec FR-053).
+	 * <p>
+	 * Only reachable on a connection that already sent or received early data. It is an <b>increase</b>
+	 * by construction, which is the whole reason it can be a widening rather than a rebuild: the
+	 * connection layer has already refused a server that reduced any of the seven limits
+	 * ({@code TransportParameterValidation.validateNonReduction}), so there is no case in which a byte
+	 * already given an offset would turn out to have been over the limit after all.
+	 * <p>
+	 * Every branch reuses the idiom its wire-frame twin uses — {@code onMaxData}, {@code onMaxStreams},
+	 * {@code raiseLimit} — including the "only an actual increase is worth a wake" rule, because a
+	 * limit raised with nobody retried is a stall rather than a wrong answer.
+	 *
+	 * @throws QuicTransportException {@code TRANSPORT_PARAMETER_ERROR} on a stream count above 2^60
+	 */
+	void raiseLimitsFrom(QuicTransportParameters peer) throws QuicTransportException {
+		if (!StreamCounter.isValidStreamCount(peer.initialMaxStreamsBidi())) {
+			throw new QuicTransportException(QuicTransportErrors.TRANSPORT_PARAMETER_ERROR,
+				"initial_max_streams_bidi (" + peer.initialMaxStreamsBidi() + ") exceeds the 2^60 maximum");
+		}
+		if (!StreamCounter.isValidStreamCount(peer.initialMaxStreamsUni())) {
+			throw new QuicTransportException(QuicTransportErrors.TRANSPORT_PARAMETER_ERROR,
+				"initial_max_streams_uni (" + peer.initialMaxStreamsUni() + ") exceeds the 2^60 maximum");
+		}
+		peerParameters = peer;
+		beginBatch();
+		try {
+			if (requireFlowControl().onMaxData(peer.initialMaxData())) {
+				retryBlockedWriters();
+			}
+			if (localBidi != null && localBidi.onMaxStreams(peer.initialMaxStreamsBidi())) {
+				drainPendingOpens(StreamDirection.BIDIRECTIONAL);
+			}
+			if (localUni != null && localUni.onMaxStreams(peer.initialMaxStreamsUni())) {
+				drainPendingOpens(StreamDirection.UNIDIRECTIONAL);
+			}
+			// A copy: a resumed write completes its promise, whose continuation runs synchronously and
+			// routinely writes again, opens a stream or releases one.
+			for (QuicStream stream : new ArrayList<>(streams.values())) {
+				SendPart sendPart = stream.sendPart();
+				if (sendPart == null) continue;
+				long window = peerSendWindowOf(peer, stream.id(), stream.isLocallyInitiated());
+				if (sendPart.flowControl().raiseLimit(window)) {
+					sendPart.pump();
+				}
+			}
+		} finally {
+			endBatch();
+		}
+	}
+
+	/**
+	 * The window the peer grants this endpoint on the sending half of {@code streamId}, per the
+	 * RFC 9000 §18.2 table in this class's Javadoc.
+	 * <p>
+	 * The single source of truth for both uses of that number — the limit a sending part starts with,
+	 * and the one a resumption's establishment raises it to — so the two cannot drift, exactly as
+	 * {@link #receiveWindowOf} is for the receive side.
+	 */
+	private static long peerSendWindowOf(QuicTransportParameters peer, long streamId, boolean locallyInitiated) {
+		if (!StreamIds.isBidirectional(streamId)) return peer.initialMaxStreamDataUni();
+		return locallyInitiated
+			? peer.initialMaxStreamDataBidiRemote()
+			: peer.initialMaxStreamDataBidiLocal();
+	}
+
+	/**
+	 * @throws QuicTransportException {@code PROTOCOL_VIOLATION} if application data arrived before
+	 *                                either the handshake or a resumption supplied the peer's limits
 	 */
 	private void requirePeerParameters() throws QuicTransportException {
 		if (peerParameters != null) return;
 		QuicTransportParameters peer = connection.peerTransportParameters();
 		if (peer == null) {
+			// 0-RTT is the one legitimate route to application data before the handshake, and it comes
+			// with its own limits (RFC 9000 §7.4.1). Anything else is a peer sending data under no
+			// limit at all.
+			if (initializeFromEarlyParameters()) return;
 			throw new QuicTransportException(QuicTransportErrors.PROTOCOL_VIOLATION,
-				"received stream data before the handshake supplied the peer's transport parameters");
+				"received stream data before the handshake or a resumption supplied the peer's limits");
 		}
 		initializeFrom(peer);
 	}
@@ -1572,6 +1786,29 @@ public final class QuicStreamManager extends AbstractReactive implements QuicFra
 	private void releaseIfTerminal(long streamId) {
 		QuicStream stream = streams.get(streamId);
 		if (stream == null || !stream.isFullyTerminal()) return;
+		release(streamId, stream);
+	}
+
+	/**
+	 * The release bookkeeping itself, with no condition in front of it — the single funnel every route
+	 * out of {@link #streams} runs through, so the concurrency credit, the connection-level fold and the
+	 * outstanding-byte settlement each happen exactly once per stream.
+	 * <p>
+	 * Two callers, and both guard it before calling: {@link #releaseIfTerminal} on the RFC 9000 §3
+	 * terminal condition, and {@link #discardStream} on a stream that is being abandoned rather than
+	 * finished. The guard differs; the bookkeeping must not. Removing the stream from the map first is
+	 * what makes the second call for the same id a no-op rather than a second grant.
+	 * <p>
+	 * The two differ only in how the stream is <i>told</i>: a released stream completes
+	 * {@link QuicStream#whenClosed()} successfully, a discarded one fails it, so
+	 * {@link QuicStream#onReleased()} belongs to the first caller alone.
+	 */
+	private void release(long streamId, QuicStream stream) {
+		unregister(streamId, stream);
+		stream.onReleased();
+	}
+
+	private void unregister(long streamId, QuicStream stream) {
 		streams.remove(streamId);
 		SendPart sendPart = stream.sendPart();
 		boolean freedOutstandingBudget = sendPart != null && sendPart.settleOutstandingOnRelease();
@@ -1609,7 +1846,6 @@ public final class QuicStreamManager extends AbstractReactive implements QuicFra
 		if (inspector != null) {
 			inspector.onStreamClosed(streamId);
 		}
-		stream.onReleased();
 	}
 
 	// ---------------------------------------------------------------- the two seams the halves emit through

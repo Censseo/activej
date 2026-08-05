@@ -46,9 +46,11 @@ import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 import static io.activej.reactor.Reactive.checkInReactorThread;
 
@@ -99,9 +101,20 @@ public final class QuicConnection extends AbstractReactive {
 	 */
 	private static final int MAX_DATAGRAMS_PER_FLUSH = 64;
 
-	/** The order packets are coalesced in: lowest level first (RFC 9000 §12.2). */
+	/**
+	 * The order packets are coalesced in: lowest level first (RFC 9000 §12.2).
+	 * <p>
+	 * An explicit array rather than {@code values()}, so that appending an encryption level cannot
+	 * start emitting packets at it by accident — which is why {@code ZERO_RTT} appears here only now
+	 * that something sends one. Its position between {@code INITIAL} and {@code HANDSHAKE} is the
+	 * RFC's: a datagram carrying a client's ClientHello and its first early data coalesces them in
+	 * that order.
+	 * <p>
+	 * Being in this list does not make a level sendable; {@link #buildPacketFor} still asks for send
+	 * keys, which a server never has at {@code ZERO_RTT} (spec FR-052).
+	 */
 	private static final EncryptionLevel[] LEVEL_ORDER = {
-		EncryptionLevel.INITIAL, EncryptionLevel.HANDSHAKE, EncryptionLevel.ONE_RTT};
+		EncryptionLevel.INITIAL, EncryptionLevel.ZERO_RTT, EncryptionLevel.HANDSHAKE, EncryptionLevel.ONE_RTT};
 
 	private static final byte[] NO_TOKEN = new byte[0];
 
@@ -252,7 +265,12 @@ public final class QuicConnection extends AbstractReactive {
 
 	private final TlsEngine tls;
 	private final EnumMap<EncryptionLevel, LevelKeys> keys = new EnumMap<>(EncryptionLevel.class);
-	private final EnumMap<EncryptionLevel, PacketNumberSpace> spaces = new EnumMap<>(EncryptionLevel.class);
+	/**
+	 * Keyed by packet number <b>space</b>, not by encryption level: there are three spaces for four
+	 * levels, because 0-RTT and 1-RTT packets are numbered and acknowledged together (RFC 9000 §12.3).
+	 * Reach one through {@link #space(EncryptionLevel)}.
+	 */
+	private final EnumMap<EncryptionLevel.Space, PacketNumberSpace> spaces = new EnumMap<>(EncryptionLevel.Space.class);
 	private final EnumMap<EncryptionLevel, CryptoStreamAssembler> cryptoIn = new EnumMap<>(EncryptionLevel.class);
 	private final EnumMap<EncryptionLevel, Long> cryptoOutOffset = new EnumMap<>(EncryptionLevel.class);
 	private final SendQueue sendQueue;
@@ -277,8 +295,25 @@ public final class QuicConnection extends AbstractReactive {
 	private QuicConnectionState state = QuicConnectionState.IDLE;
 	private @Nullable ScheduledRunnable handshakeDeadline;
 	private @Nullable QuicTransportParameters peerTransportParameters;
+	/**
+	 * The peer's parameters as they were on the connection this one resumes (RFC 9000 §7.4.1), or
+	 * {@code null} when this is not a resumption attempt. Client-only; a server remembers nothing.
+	 */
+	private final @Nullable QuicTransportParameters rememberedTransportParameters;
 	private @Nullable String negotiatedAlpn;
 	private boolean handshakeConfirmed;
+	/**
+	 * Latched from {@code TlsEngineResult.resumed()}: this handshake used a pre-shared key rather than
+	 * a certificate. Bookkeeping only — the rule it feeds, RFC 9000 §7.4.1's non-reduction check, reads
+	 * the result directly at the moment it completes.
+	 */
+	private boolean sessionResumed;
+	/**
+	 * Latched from {@code TlsEngineResult.earlyDataAccepted()}: a client's 0-RTT packets were accepted
+	 * (client side, the server echoed {@code early_data}) or are being accepted (server side). Never
+	 * revoked — RFC 8446 §4.2.10 takes the decision once.
+	 */
+	private boolean earlyDataAccepted;
 
 	private final RttEstimator rtt = new RttEstimator();
 	private final NewRenoCongestionController congestion;
@@ -331,6 +366,7 @@ public final class QuicConnection extends AbstractReactive {
 		this.sink = builder.sink;
 		this.remoteAddress = builder.remoteAddress;
 		this.settings = builder.settings;
+		this.rememberedTransportParameters = builder.rememberedTransportParameters;
 		this.version = QuicPackets.SUPPORTED_VERSION;
 
 		SecureRandom random = builder.secureRandom;
@@ -362,11 +398,29 @@ public final class QuicConnection extends AbstractReactive {
 			: AmplificationBudget.validated();
 
 		for (EncryptionLevel level : EncryptionLevel.values()) {
+			// Research D-5 audit (a) verdict, keys: ZERO_RTT belongs. A 0-RTT packet is protected with
+			// its own AEAD keys derived from the client early traffic secret (RFC 9001 §4.1.4), so the
+			// level needs a slot of its own; it simply stays uninstalled until an engine fills it.
 			keys.put(level, new LevelKeys(level));
-			spaces.put(level, new PacketNumberSpace(level, settings.maxAckRanges()));
-			cryptoIn.put(level, new CryptoStreamAssembler(settings.maxCryptoBufferBytes()));
-			cryptoOutOffset.put(level, 0L);
+			// Research D-5 audit (b) verdict, CRYPTO reassembly and CRYPTO send offset: ZERO_RTT does
+			// NOT belong. RFC 9000 §12.5 forbids a CRYPTO frame in a 0-RTT packet, so the level has no
+			// CRYPTO stream at all and a slot for it could only ever stay empty.
+			if (level.hasCryptoStream()) {
+				cryptoIn.put(level, new CryptoStreamAssembler(settings.maxCryptoBufferBytes()));
+				cryptoOutOffset.put(level, 0L);
+			}
 		}
+		// Research D-5 audit (a) verdict, packet number spaces: keyed by SPACE, not by level. 0-RTT and
+		// 1-RTT packets share the Application space (RFC 9000 §12.3); a fourth space would number a
+		// 0-RTT and a 1-RTT packet identically and leave their acknowledgements indistinguishable. The
+		// Application space is built at ONE_RTT because that is the level the recovery code recognises
+		// it by (LossDetector reads PacketNumberSpace.level()).
+		spaces.put(EncryptionLevel.Space.INITIAL,
+			new PacketNumberSpace(EncryptionLevel.INITIAL, settings.maxAckRanges()));
+		spaces.put(EncryptionLevel.Space.HANDSHAKE,
+			new PacketNumberSpace(EncryptionLevel.HANDSHAKE, settings.maxAckRanges()));
+		spaces.put(EncryptionLevel.Space.APPLICATION,
+			new PacketNumberSpace(EncryptionLevel.ONE_RTT, settings.maxAckRanges()));
 
 		InitialKeys initial = QuicKeys.initial(originalDestinationConnectionId);
 		keys.get(EncryptionLevel.INITIAL).install(
@@ -400,6 +454,7 @@ public final class QuicConnection extends AbstractReactive {
 		private @Nullable QuicFrameHandler frameHandler;
 		private @Nullable Function<QuicConnection, QuicFrameHandler> frameHandlerFactory;
 		private @Nullable Inspector inspector;
+		private @Nullable QuicTransportParameters rememberedTransportParameters;
 
 		private Builder(
 			Reactor reactor, Role role, DatagramSink sink, InetSocketAddress remoteAddress,
@@ -500,6 +555,28 @@ public final class QuicConnection extends AbstractReactive {
 			return this;
 		}
 
+		/**
+		 * The peer transport parameters remembered from the session this connection is resuming
+		 * (RFC 9000 §7.4.1, spec FR-051b) — what bounds every byte sent in 0-RTT, and what the server's
+		 * new parameters are checked against for a forbidden reduction.
+		 * <p>
+		 * They live here rather than in the TLS config because bounding 0-RTT data against them is the
+		 * connection layer's job: it owns the flow-control state, and ADR-013 puts the rule where the
+		 * state is. {@code QuicConnection.TlsEngineFactory}'s signature is untouched (research D-6).
+		 * <p>
+		 * Client-only. A server is <i>told</i> its peer's parameters by the handshake and remembers
+		 * nothing across connections, so supplying these on a server is a wiring mistake rather than a
+		 * value that would simply be ignored — refused at {@code build()}.
+		 * <p>
+		 * Supplying them does not by itself send anything in 0-RTT: that needs 0-RTT keys, which need a
+		 * ticket the TLS client config was given and a server that accepted it.
+		 */
+		public Builder withRememberedTransportParameters(QuicTransportParameters rememberedTransportParameters) {
+			checkNotBuilt(this);
+			this.rememberedTransportParameters = rememberedTransportParameters;
+			return this;
+		}
+
 		@Override
 		protected QuicConnection doBuild() {
 			if (frameHandler != null && frameHandlerFactory != null) {
@@ -511,6 +588,11 @@ public final class QuicConnection extends AbstractReactive {
 						"a connection has exactly one frame handler");
 			}
 			if (role == Role.SERVER) {
+				if (rememberedTransportParameters != null) {
+					throw new IllegalStateException(
+						"withRememberedTransportParameters(...) is client-only: a server is told its peer's " +
+							"parameters by the handshake and remembers nothing across connections (RFC 9000 §7.4.1)");
+				}
 				if (peerConnectionId == null) {
 					throw new IllegalStateException(
 						"A server connection needs the client's source connection ID: withPeerConnectionId(...)");
@@ -669,12 +751,19 @@ public final class QuicConnection extends AbstractReactive {
 			switch (packet.kind()) {
 				case VERSION_NEGOTIATION -> onVersionNegotiation(packet);
 				case RETRY -> onRetry(packet);
-				// 0-RTT is never offered by this implementation, so a 0-RTT packet cannot be ours.
 				default -> {
 					packetsDropped++;
 					packet.bytes().recycle();
 				}
 			}
+			return;
+		}
+		if (level == EncryptionLevel.ZERO_RTT && role == Role.CLIENT) {
+			// Only a client sends 0-RTT, so a client has no 0-RTT receive keys and never will. Without
+			// this the packet would go to awaitingKeys and sit there until the bound evicted it — a queue
+			// a peer could fill with packets nothing can ever open.
+			packetsDropped++;
+			packet.bytes().recycle();
 			return;
 		}
 		if (packet.kind() != Kind.ONE_RTT && role == Role.CLIENT && !peerScidAdopted) {
@@ -695,7 +784,9 @@ public final class QuicConnection extends AbstractReactive {
 			packet.bytes().recycle();
 			return;
 		}
-		if (!levelKeys.isInstalled()) {
+		if (!levelKeys.acceptsReceive()) {
+			// The receive direction specifically: a client's ZERO_RTT slot holds send keys only, and
+			// reading isInstalled() here would have buffered every level whose other half is absent.
 			bufferAwaitingKeys(packet);
 			return;
 		}
@@ -714,7 +805,7 @@ public final class QuicConnection extends AbstractReactive {
 	private boolean isBeforeAnyServerPacket() {
 		return state == QuicConnectionState.HANDSHAKING
 			&& !keys.get(EncryptionLevel.INITIAL).isDiscarded()
-			&& spaces.get(EncryptionLevel.INITIAL).largestReceived() == PacketNumberSpace.NONE;
+			&& space(EncryptionLevel.INITIAL).largestReceived() == PacketNumberSpace.NONE;
 	}
 
 	// ---------------------------------------------------------------- Version Negotiation (T070)
@@ -878,7 +969,7 @@ public final class QuicConnection extends AbstractReactive {
 		InitialKeys rederived = QuicKeys.initial(serverScid);
 		keys.get(EncryptionLevel.INITIAL).install(rederived.client(), rederived.server());
 
-		PacketNumberSpace initial = spaces.get(EncryptionLevel.INITIAL);
+		PacketNumberSpace initial = space(EncryptionLevel.INITIAL);
 		List<SentPacket> outstanding = new ArrayList<>(initial.sentPackets().values());
 		outstanding.sort((a, b) -> Long.compare(a.packetNumber, b.packetNumber));
 		try {
@@ -947,7 +1038,7 @@ public final class QuicConnection extends AbstractReactive {
 	/** Consumes {@code bytes} on every path — {@link QuicPacketProtection#open} guarantees that much. */
 	private void openAndHandle(EncryptionLevel level, LevelKeys levelKeys, ByteBuf bytes)
 		throws QuicTransportException {
-		PacketNumberSpace space = spaces.get(level);
+		PacketNumberSpace space = space(level);
 		// Captured before open(), which consumes the buffer: the protected size is what a qlog reader
 		// and a congestion controller both mean by a packet's size.
 		int sizeInBytes = bytes.readRemaining();
@@ -988,7 +1079,10 @@ public final class QuicConnection extends AbstractReactive {
 				return;
 			}
 			onPacketReceivedEvent(level, opened.packetNumber, sizeInBytes);
-			if (level == EncryptionLevel.ONE_RTT && ackEliciting) {
+			if (level.packetNumberSpace() == EncryptionLevel.Space.APPLICATION && ackEliciting) {
+				// By space, not by level: a 0-RTT packet is acknowledged in the Application space like a
+				// 1-RTT one, and keying this on ONE_RTT alone would leave a lone 0-RTT packet unscheduled
+				// for acknowledgement — the client would sit out a probe timeout for nothing.
 				armAckTimer(space);
 			}
 			if (level == EncryptionLevel.HANDSHAKE) {
@@ -1183,7 +1277,7 @@ public final class QuicConnection extends AbstractReactive {
 	// ---------------------------------------------------------------- ACK processing
 
 	private void processAck(EncryptionLevel level, AckFrame ack) throws QuicTransportException {
-		PacketNumberSpace space = spaces.get(level);
+		PacketNumberSpace space = space(level);
 		space.onAckReceived(ack.largestAcked);
 		long now = reactor.currentTimeMillis();
 
@@ -1262,7 +1356,7 @@ public final class QuicConnection extends AbstractReactive {
 	 * space says nothing about one in the Application Data space.
 	 */
 	private void detectAndRequeueLost(EncryptionLevel level, long now) throws QuicTransportException {
-		LossDetector.Detection detection = LossDetector.detectLost(spaces.get(level), now, rtt);
+		LossDetector.Detection detection = LossDetector.detectLost(space(level), now, rtt);
 		if (detection.lost().isEmpty()) return;
 
 		long lostBytes = 0;
@@ -1326,7 +1420,7 @@ public final class QuicConnection extends AbstractReactive {
 				notifyHandler("onFrameLost", () -> frameHandler.onFrameLost(this, frame));
 				continue;
 			}
-			boolean retransmittable = levelKeys.accepts()
+			boolean retransmittable = levelKeys.acceptsSend()
 				&& (frame instanceof CryptoFrame || frame instanceof HandshakeDoneFrame);
 			if (retransmittable) {
 				retransmit.add(frame);
@@ -1371,8 +1465,38 @@ public final class QuicConnection extends AbstractReactive {
 	 */
 	private boolean shouldAck(PacketNumberSpace space, EncryptionLevel level) {
 		if (space.ackElicitingReceivedSinceAck() == 0) return false;
-		if (level != EncryptionLevel.ONE_RTT) return true;
+		if (level.packetNumberSpace() != EncryptionLevel.Space.APPLICATION) return true;
 		return ackNowOneRtt || space.ackElicitingReceivedSinceAck() >= ACK_ELICITING_THRESHOLD;
+	}
+
+	/**
+	 * Whether a packet at {@code level} may carry an ACK frame — everything except {@code ZERO_RTT}
+	 * (RFC 9000 §12.4, Table 3).
+	 * <p>
+	 * Checked <b>before</b> building the ACK rather than left to {@code validateForSending}, which
+	 * would be an {@code INTERNAL_ERROR} closing the connection over a frame this layer chose to add.
+	 */
+	private static boolean carriesAcks(EncryptionLevel level) {
+		return level != EncryptionLevel.ZERO_RTT;
+	}
+
+	/**
+	 * The level an application frame is queued at right now: {@code ONE_RTT} once its keys exist,
+	 * {@code ZERO_RTT} while a client is sending early data, {@code ONE_RTT} again as the resting
+	 * answer so a frame queued before either exists waits for the level that always arrives.
+	 * <p>
+	 * The {@code role} test is not redundant with the key check, and that is deliberate. A server
+	 * never sends a 0-RTT packet (spec FR-052, RFC 9001 §4.6.1); that is already true structurally,
+	 * because {@code TlsKeys.ofClientOnly} leaves a server's 0-RTT <i>send</i> slot empty — but a
+	 * structural guarantee is exactly the kind a later change to key installation removes silently, so
+	 * the rule is also written down where it applies.
+	 */
+	private EncryptionLevel applicationSendLevel() {
+		if (keys.get(EncryptionLevel.ONE_RTT).acceptsSend()) return EncryptionLevel.ONE_RTT;
+		if (role == Role.CLIENT && keys.get(EncryptionLevel.ZERO_RTT).acceptsSend()) {
+			return EncryptionLevel.ZERO_RTT;
+		}
+		return EncryptionLevel.ONE_RTT;
 	}
 
 	// ---------------------------------------------------------------- TLS driving (T030)
@@ -1386,6 +1510,10 @@ public final class QuicConnection extends AbstractReactive {
 			throw cryptoErrorFor(e);
 		} catch (TlsHelloRetryRequestException e) {
 			throw helloRetryRequestErrorFor(e);
+		} catch (TlsProtocolViolationException e) {
+			// Ordered before the MalformedDataException arm it extends: a resumption bound broken by the
+			// peer is an RFC 9000 §20.1 transport rule, not an RFC 9000 §18 parameter problem.
+			throw protocolViolationErrorFor(e);
 		} catch (MalformedDataException e) {
 			throw transportParameterErrorFor(e);
 		}
@@ -1393,6 +1521,8 @@ public final class QuicConnection extends AbstractReactive {
 	}
 
 	private void applyTlsResult(TlsEngineResult result) throws QuicTransportException {
+		if (result.resumed()) sessionResumed = true;
+		if (result.earlyDataAccepted()) earlyDataAccepted = true;
 		// Installations come in firing order (Handshake, then 1-RTT) and must be applied before the
 		// CRYPTO output that depends on them can be sent.
 		for (KeyInstallation installation : result.keysToInstall()) {
@@ -1400,6 +1530,42 @@ public final class QuicConnection extends AbstractReactive {
 			keys.get(installation.level()).install(
 				role == Role.CLIENT ? installed.clientKeys() : installed.serverKeys(),
 				role == Role.CLIENT ? installed.serverKeys() : installed.clientKeys());
+		}
+		boolean earlyDataRejected = false;
+		if (role == Role.CLIENT
+			&& keys.get(EncryptionLevel.ONE_RTT).acceptsSend()
+			&& !keys.get(EncryptionLevel.ZERO_RTT).isDiscarded()) {
+			// Early data was *offered* exactly when 0-RTT send keys were installed, and refused exactly
+			// when the EncryptedExtensions that decides it did not echo early_data (RFC 8446 §4.2.10).
+			// Read before the discard on the next line takes the keys away — and sound at this point,
+			// because EncryptedExtensions precedes the server Finished on the CRYPTO stream, so the
+			// decision is always latched before the 1-RTT keys this branch is guarded by exist.
+			earlyDataRejected = keys.get(EncryptionLevel.ZERO_RTT).acceptsSend() && !earlyDataAccepted;
+			// RFC 9001 §4.9.3: a client discards its 0-RTT keys when it installs 1-RTT keys — not at the
+			// ServerHello, and not later. Whatever it had queued for 0-RTT and never sent must still go
+			// out, so it is re-levelled first; discardLevel would otherwise recycle it.
+			//
+			// Unconditionally, refusal included, and that is the load-bearing part: this queue holds the
+			// frames of *every* stream opened while 0-RTT was the application send level, and only the
+			// layer above knows which of them describe work it will re-create and which must simply be
+			// carried to 1-RTT. Purging them here would leave the second kind with a hole no
+			// retransmission fills. What a rejection discards is decided per stream, through
+			// onEarlyDataRejected below and dropQueuedFrames.
+			sendQueue.moveAll(EncryptionLevel.ZERO_RTT, EncryptionLevel.ONE_RTT);
+			discardLevel(EncryptionLevel.ZERO_RTT);
+			if (earlyDataRejected && frameHandler != null) {
+				// Here, and not at the end of this method, because what the handler discards must be gone
+				// from the send queue before anything can flush it — and establishment does flush, through
+				// the batch the stream layer opens while it widens its limits. A frame re-levelled a line
+				// above and sent a moment later would put a stream the peer never saw on the wire at 1-RTT,
+				// which is precisely the retransmission this phase exists to replace with a re-creation.
+				//
+				// The registry's "move the state before the promise" rule is nonetheless satisfied: the
+				// 0-RTT keys are already discarded and the queue already re-levelled, so a handler that
+				// enqueues from inside this call is enqueueing at 1-RTT, and one that fails a promise is
+				// failing it against state that has finished moving.
+				notifyHandler("onEarlyDataRejected", () -> frameHandler.onEarlyDataRejected(this));
+			}
 		}
 
 		QuicTransportException deferred = null;
@@ -1428,6 +1594,12 @@ public final class QuicConnection extends AbstractReactive {
 	/** Takes ownership of {@code bytes}. */
 	private void enqueueCrypto(EncryptionLevel level, ByteBuf bytes) throws QuicTransportException {
 		try {
+			if (!level.hasCryptoStream()) {
+				// Unreachable from the wire: an engine only produces CRYPTO bytes for a level that has a
+				// CRYPTO stream, and a 0-RTT packet may not carry a CRYPTO frame (RFC 9000 §12.5). The
+				// finally block still recycles, so this path owns its buffer like every other.
+				throw new IllegalArgumentException("No CRYPTO stream at encryption level " + level);
+			}
 			long offset = cryptoOutOffset.get(level);
 			while (bytes.readRemaining() > 0) {
 				int chunk = Math.min(MAX_CRYPTO_CHUNK, bytes.readRemaining());
@@ -1457,6 +1629,11 @@ public final class QuicConnection extends AbstractReactive {
 			// Non-null only when a Retry was processed; a server that sends the parameter without having
 			// sent a Retry, or omits it after sending one, fails validation (RFC 9000 §7.3).
 			role == Role.CLIENT ? retrySourceConnectionId : null);
+		if (role == Role.CLIENT && rememberedTransportParameters != null && result.resumed()) {
+			// FR-054: only on a handshake that actually used the ticket. A server that fell back to a
+			// full handshake opened a new session and promised nothing, so the same numbers are legal.
+			TransportParameterValidation.validateNonReduction(rememberedTransportParameters, peer);
+		}
 		this.peerTransportParameters = peer;
 		this.negotiatedAlpn = result.negotiatedAlpn();
 
@@ -1464,6 +1641,11 @@ public final class QuicConnection extends AbstractReactive {
 			// FR-005: the server signals confirmation to the client, and confirms itself once the frame
 			// is actually on the wire (see sendDatagram).
 			sendQueue.enqueue(EncryptionLevel.ONE_RTT, HandshakeDoneFrame.INSTANCE, false);
+			// RFC 9001 §4.9.3: the handshake is done, so nothing may arrive at 0-RTT that matters. The
+			// permitted 3×PTO retention for reordered packets is deliberately not taken (see the
+			// package note): a late 0-RTT packet is dropped as a discarded level, and the client
+			// retransmits its stream data in 1-RTT.
+			discardLevel(EncryptionLevel.ZERO_RTT);
 		}
 
 		transitionTo(QuicConnectionState.ESTABLISHED);
@@ -1491,22 +1673,27 @@ public final class QuicConnection extends AbstractReactive {
 	 * <p>
 	 * Deliberately fires no loss callback (FR-006): the packets of a discarded space are neither lost
 	 * nor acknowledged, they simply stop existing. Idempotent.
+	 * <p>
+	 * A level that <i>shares</i> its packet number space keeps that space alive: discarding 0-RTT keys
+	 * must not retire the Application space 1-RTT is numbered in (RFC 9000 §12.3).
 	 */
 	private void discardLevel(EncryptionLevel level) {
 		LevelKeys levelKeys = keys.get(level);
 		if (levelKeys.isDiscarded()) return;
 		levelKeys.discard();
-		PacketNumberSpace space = spaces.get(level);
-		// RFC 9002 §B.9: the bytes of a discarded space leave the in-flight count without any window
-		// reduction — they are neither lost nor acknowledged. Skipping this leaves a connection
-		// permanently congestion-blocked by handshake packets it will never hear about again.
-		long inFlight = 0;
-		for (SentPacket packet : space.sentPackets().values()) {
-			if (packet.inFlight) inFlight += packet.sizeInBytes;
+		PacketNumberSpace space = space(level);
+		if (space.level() == level) {
+			// RFC 9002 §B.9: the bytes of a discarded space leave the in-flight count without any window
+			// reduction — they are neither lost nor acknowledged. Skipping this leaves a connection
+			// permanently congestion-blocked by handshake packets it will never hear about again.
+			long inFlight = 0;
+			for (SentPacket packet : space.sentPackets().values()) {
+				if (packet.inFlight) inFlight += packet.sizeInBytes;
+			}
+			congestion.onSpaceDiscarded(inFlight);
+			space.discard();
 		}
-		congestion.onSpaceDiscarded(inFlight);
-		space.discard();
-		cryptoIn.get(level).close();
+		if (level.hasCryptoStream()) cryptoIn.get(level).close();
 		QuicFrame queued;
 		while ((queued = sendQueue.poll(level)) != null) {
 			Recyclers.recycle(queued);
@@ -1603,8 +1790,14 @@ public final class QuicConnection extends AbstractReactive {
 	 */
 	private void buildPacketFor(EncryptionLevel level, int limit, boolean congestionLimited, Datagram plan)
 		throws QuicTransportException {
+		if (level == EncryptionLevel.ZERO_RTT && role == Role.SERVER) {
+			// Spec FR-052 / RFC 9001 §4.6.1. A server holds 0-RTT receive keys only, so this is already
+			// unreachable; stated anyway, because "unreachable" here rests on a key-installation detail
+			// two packages away.
+			return;
+		}
 		LevelKeys levelKeys = keys.get(level);
-		if (!levelKeys.accepts()) return;
+		if (!levelKeys.acceptsSend()) return;
 
 		// The packet number is not known until we commit to sending, so the allowance is computed
 		// against the widest possible encoding. Under-filling is harmless; the opposite would produce a
@@ -1612,11 +1805,11 @@ public final class QuicConnection extends AbstractReactive {
 		int allowance = limit - plan.used - packetOverhead(level, 4);
 		if (allowance <= 0) return;
 
-		PacketNumberSpace space = spaces.get(level);
+		PacketNumberSpace space = space(level);
 		List<QuicFrame> frames = new ArrayList<>();
 		int frameBytes = 0;
 
-		if (shouldAck(space, level)) {
+		if (carriesAcks(level) && shouldAck(space, level)) {
 			AckFrame ack = buildAck(space, reactor.currentTimeMillis());
 			if (ack != null && ack.encodedLength() <= allowance) {
 				frames.add(ack);
@@ -1674,11 +1867,12 @@ public final class QuicConnection extends AbstractReactive {
 	private boolean hasPendingWork() {
 		boolean congestionLimited = congestion.isBlocked() && !bypassCongestionWindow;
 		for (EncryptionLevel level : LEVEL_ORDER) {
-			if (!keys.get(level).accepts()) continue;
+			if (!keys.get(level).acceptsSend()) continue;
 			// Queued data over the window is not "pending" for this flush: claiming it were would spin the
 			// flush loop to its bound on every call until an ACK arrived.
 			if (!congestionLimited && sendQueue.hasPending(level)) return true;
-			if (shouldAck(spaces.get(level), level)) return true;
+			// carriesAcks keeps the Application space from being consulted twice, once per level.
+			if (carriesAcks(level) && shouldAck(space(level), level)) return true;
 		}
 		return false;
 	}
@@ -1821,7 +2015,7 @@ public final class QuicConnection extends AbstractReactive {
 		LossDetector.Armed probe = LossDetector.nextProbe(
 			spaces.values(), rtt, ptoCount, peerMaxAckDelayMillis(), handshakeConfirmed);
 		EncryptionLevel level = probe != null ? probe.level() : handshakeProbeLevel();
-		if (level == null || !keys.get(level).accepts()) return;
+		if (level == null || !keys.get(level).acceptsSend()) return;
 		// Incremented before sending: the next timeout must already be the doubled one, or a persistently
 		// black-holed path would be probed at a fixed interval forever (RFC 9002 §6.2.1).
 		ptoCount++;
@@ -1830,9 +2024,13 @@ public final class QuicConnection extends AbstractReactive {
 		// RFC 9002 §7: the probe leaves regardless of the window.
 		bypassCongestionWindow = true;
 		boolean carriesData = false;
+		// By space, not by level: 0-RTT and 1-RTT share the Application space, so a level loop would
+		// probe it twice and re-queue two packets where RFC 9002 §6.2.4 asks for one.
+		EnumSet<EncryptionLevel.Space> probed = EnumSet.noneOf(EncryptionLevel.Space.class);
 		for (EncryptionLevel candidate : LEVEL_ORDER) {
-			if (!keys.get(candidate).accepts()) continue;
-			carriesData |= requeueOldestUnacknowledged(spaces.get(candidate));
+			if (!keys.get(candidate).acceptsSend()) continue;
+			if (!probed.add(candidate.packetNumberSpace())) continue;
+			carriesData |= requeueOldestUnacknowledged(space(candidate));
 		}
 		if (!carriesData && !sendQueue.hasPending(level)) {
 			sendQueue.enqueue(level, PingFrame.INSTANCE, false);
@@ -1877,7 +2075,9 @@ public final class QuicConnection extends AbstractReactive {
 			congestion.onPacketsLost(oldest.sizeInBytes);
 		}
 		requeueLost(oldest);
-		return sendQueue.hasPending(space.level());
+		// The packet's own level, not the space's: a re-queued 0-RTT packet's frames land in the 0-RTT
+		// queue, while the Application space calls itself ONE_RTT.
+		return sendQueue.hasPending(oldest.level);
 	}
 
 	/** RFC 9000 §13.2.1: a 1-RTT ACK may be held back, but never past our advertised {@code max_ack_delay}. */
@@ -2180,7 +2380,7 @@ public final class QuicConnection extends AbstractReactive {
 		}
 
 		LevelKeys levelKeys = keys.get(level);
-		PacketNumberSpace space = spaces.get(level);
+		PacketNumberSpace space = space(level);
 		ByteBuf datagram;
 		try {
 			// RFC 9001 §6.6 accounting still applies to the last packet a connection ever sends.
@@ -2263,9 +2463,14 @@ public final class QuicConnection extends AbstractReactive {
 		cancelAckTimer();
 		cancelIdleTimer();
 		cancelKeepAliveTimer();
-		for (EncryptionLevel level : EncryptionLevel.values()) {
-			spaces.get(level).abandonOutstanding();
-			cryptoIn.get(level).close();
+		// Research D-5 audit verdict: iterate the structures rather than the levels. There are three
+		// packet number spaces for four levels, so a per-level loop would abandon the Application space
+		// twice, and ZERO_RTT has no CRYPTO stream to close at all.
+		for (PacketNumberSpace space : spaces.values()) {
+			space.abandonOutstanding();
+		}
+		for (CryptoStreamAssembler assembler : cryptoIn.values()) {
+			assembler.close();
 		}
 		sendQueue.drop();
 		for (ProtectedPacket packet : awaitingKeys) {
@@ -2282,6 +2487,9 @@ public final class QuicConnection extends AbstractReactive {
 		releaseForClosing();
 		cancelClosingTimer();
 		closingFrame = null;
+		// Research D-5 audit verdict: ZERO_RTT belongs in this loop. Its keys, its queued frames and its
+		// packets held awaiting keys are all real state a 0-RTT attempt can leave behind, and
+		// discardLevel is what releases them; the shared Application space is retired once, at ONE_RTT.
 		for (EncryptionLevel level : EncryptionLevel.values()) {
 			// Recycles the frames of every unacknowledged packet, and the buffered CRYPTO stream.
 			discardLevel(level);
@@ -2315,10 +2523,30 @@ public final class QuicConnection extends AbstractReactive {
 		}
 	}
 
+	/**
+	 * The packet number space {@code level}'s packets are numbered and acknowledged in — three spaces
+	 * for four levels, because 0-RTT and 1-RTT share the Application space (RFC 9000 §12.3).
+	 * <p>
+	 * The single lookup point, so no call site can key a space by encryption level and quietly invent
+	 * a fourth one (research D-5 audit (a)).
+	 */
+	private PacketNumberSpace space(EncryptionLevel level) {
+		return spaces.get(level.packetNumberSpace());
+	}
+
+	/**
+	 * The highest level a <b>control</b> packet may go out at — a CONNECTION_CLOSE or a probe.
+	 * <p>
+	 * {@code ZERO_RTT} is skipped, and not as an oversight: this picks a level the peer can certainly
+	 * read, and a server that refused early data holds no 0-RTT keys at all, so a CONNECTION_CLOSE
+	 * sent there would be dropped rather than read. The level below it is always readable.
+	 */
 	private @Nullable EncryptionLevel highestSendableLevel() {
 		for (int i = LEVEL_ORDER.length - 1; i >= 0; i--) {
-			if (keys.get(LEVEL_ORDER[i]).accepts()) {
-				return LEVEL_ORDER[i];
+			EncryptionLevel level = LEVEL_ORDER[i];
+			if (level == EncryptionLevel.ZERO_RTT) continue;
+			if (keys.get(level).acceptsSend()) {
+				return level;
 			}
 		}
 		return null;
@@ -2381,6 +2609,16 @@ public final class QuicConnection extends AbstractReactive {
 			"Invalid transport parameters: " + e.getMessage());
 	}
 
+	/**
+	 * A transport rule the peer broke from inside the TLS layer — a resumption bound, or QUIC's
+	 * {@code max_early_data_size} rule (RFC 9001 §4.6.1). Reported as RFC 9000 §20.1
+	 * {@code PROTOCOL_VIOLATION}, not as a transport-parameter error and not as a TLS alert: neither
+	 * names what happened.
+	 */
+	public static QuicTransportException protocolViolationErrorFor(TlsProtocolViolationException e) {
+		return new QuicTransportException(QuicTransportErrors.PROTOCOL_VIOLATION, e.getMessage());
+	}
+
 	// ---------------------------------------------------------------- the handler's API (T074)
 
 	/**
@@ -2402,8 +2640,9 @@ public final class QuicConnection extends AbstractReactive {
 			throw new QuicTransportException(QuicTransportErrors.INTERNAL_ERROR,
 				"enqueueFrame requires a frame handler registered at build time");
 		}
+		EncryptionLevel level = applicationSendLevel();
 		try {
-			FrameTypeRules.validateForSending(frame, EncryptionLevel.ONE_RTT);
+			FrameTypeRules.validateForSending(frame, level);
 		} catch (QuicTransportException e) {
 			// Ownership had already transferred, so the frame is ours to release — SendQueue.enqueue does
 			// the same on its own rejection path, and a caller cannot be expected to guess which of the two
@@ -2411,7 +2650,7 @@ public final class QuicConnection extends AbstractReactive {
 			Recyclers.recycle(frame);
 			throw e;
 		}
-		sendQueue.enqueue(EncryptionLevel.ONE_RTT, frame, true);
+		sendQueue.enqueue(level, frame, true);
 	}
 
 	/**
@@ -2441,13 +2680,33 @@ public final class QuicConnection extends AbstractReactive {
 			throw new QuicTransportException(QuicTransportErrors.INTERNAL_ERROR,
 				"requeueFrame requires a frame handler registered at build time");
 		}
+		EncryptionLevel level = applicationSendLevel();
 		try {
-			FrameTypeRules.validateForSending(frame, EncryptionLevel.ONE_RTT);
+			FrameTypeRules.validateForSending(frame, level);
 		} catch (QuicTransportException e) {
 			Recyclers.recycle(frame);
 			throw e;
 		}
-		sendQueue.requeue(EncryptionLevel.ONE_RTT, List.of(frame), true);
+		sendQueue.requeue(level, List.of(frame), true);
+	}
+
+	/**
+	 * Removes every frame still queued for transmission that {@code filter} accepts, recycling each one
+	 * (spec FR-055) — the seam through which the layer above purges the frames belonging to state it has
+	 * just discarded, so they are neither sent nor accounted against the send-queue bound.
+	 * <p>
+	 * The predicate is the <b>caller's</b>: this layer interprets no stream frame, and deciding which
+	 * frames belong to a discarded stream is the stream layer's rule, not the transport's (FR-037).
+	 * <p>
+	 * Frames already handed to a packet are out of reach here, and correctly so: they are the loss
+	 * recovery machinery's, which offers them back through {@link QuicFrameHandler#onFrameLost} for the
+	 * handler to release.
+	 *
+	 * @return how many frames were removed
+	 */
+	public int dropQueuedFrames(Predicate<QuicFrame> filter) {
+		checkInReactorThread(this);
+		return sendQueue.removeIf(filter);
 	}
 
 	/** Flushes whatever is queued. Safe to call when nothing is queued, and safe to call repeatedly. */
@@ -2615,6 +2874,86 @@ public final class QuicConnection extends AbstractReactive {
 		return negotiatedAlpn;
 	}
 
+	/**
+	 * The peer parameters this connection was built to resume against (RFC 9000 §7.4.1), or
+	 * {@code null} when it is not a resumption attempt. Always {@code null} on a server.
+	 */
+	public @Nullable QuicTransportParameters rememberedTransportParameters() {
+		checkInReactorThread(this);
+		return rememberedTransportParameters;
+	}
+
+	/**
+	 * The limits that bind <b>early data</b> right now, or {@code null} when there is no early data to
+	 * bind — because the handshake has already supplied the real ones, or because no 0-RTT key is
+	 * installed in the direction that matters.
+	 * <p>
+	 * The single funnel the layer above pulls through, deliberately a pull rather than a push: a
+	 * callback would be a second way for the stream layer to learn its limits, and the two would have
+	 * to agree forever. Once {@link #peerTransportParameters()} is non-null this returns {@code null},
+	 * so a caller that consults it after establishment cannot accidentally keep using the remembered
+	 * values.
+	 * <p>
+	 * The two roles answer differently because they know different things. A <b>client</b> sending
+	 * 0-RTT has the parameters it remembered, and RFC 9000 §7.4.1 obliges it to obey exactly those. A
+	 * <b>server</b> processing 0-RTT has been told nothing yet, so it answers
+	 * {@link TransportParameterValidation#WITHOUT_SEND_CREDIT}: it may receive everything it
+	 * advertised — which its own settings already describe — and may send nothing until the handshake
+	 * completes.
+	 */
+	public @Nullable QuicTransportParameters earlyTransportParameters() {
+		checkInReactorThread(this);
+		if (peerTransportParameters != null) return null;
+		if (role == Role.CLIENT) {
+			return keys.get(EncryptionLevel.ZERO_RTT).acceptsSend() ? rememberedTransportParameters : null;
+		}
+		return keys.get(EncryptionLevel.ZERO_RTT).acceptsReceive()
+			? TransportParameterValidation.WITHOUT_SEND_CREDIT
+			: null;
+	}
+
+	/**
+	 * Whether this handshake resumed a previous session — a pre-shared key was accepted, so no
+	 * certificate was exchanged (RFC 8446 §2.2). {@code false} until the decision is taken, and never
+	 * revoked afterwards.
+	 * <p>
+	 * Distinct from {@link #isEarlyDataAccepted()}: a resumed handshake that refuses early data reports
+	 * {@code true} here and {@code false} there. Carries no ticket, key or binder material (SI-6).
+	 */
+	public boolean isSessionResumed() {
+		checkInReactorThread(this);
+		return sessionResumed;
+	}
+
+	/**
+	 * Whether early data was accepted on this connection (RFC 8446 §4.2.10, RFC 9001 §4.6.1). A client
+	 * reads it as "the 0-RTT packets I sent were taken"; a server as "the 0-RTT packets this peer sends
+	 * are to be processed".
+	 * <p>
+	 * Rejection is signalled by omission and is never a handshake failure, so a client that offered
+	 * early data and reached {@link #isHandshakeConfirmed()} with this still {@code false} was refused.
+	 */
+	public boolean isEarlyDataAccepted() {
+		checkInReactorThread(this);
+		return earlyDataAccepted;
+	}
+
+	/**
+	 * Whether an application frame enqueued right now would leave in a <b>0-RTT</b> packet: a client
+	 * whose 0-RTT send keys are installed and whose 1-RTT keys are not yet (RFC 9001 §4.6.1).
+	 * <p>
+	 * The one thing the stream layer needs in order to mark a stream as created in early data, exposed
+	 * as this question rather than as the send level itself — the level is the send path's private
+	 * decision, and a second caller reading it would be a second thing to keep in step with it.
+	 * <p>
+	 * False on a server always, and false again on a client the moment 1-RTT keys exist, whether the
+	 * early data was accepted or refused.
+	 */
+	public boolean isSendingEarlyData() {
+		checkInReactorThread(this);
+		return applicationSendLevel() == EncryptionLevel.ZERO_RTT;
+	}
+
 	/** FR-005: the handshake is confirmed, so the Handshake level is gone for good. */
 	public boolean isHandshakeConfirmed() {
 		checkInReactorThread(this);
@@ -2626,9 +2965,13 @@ public final class QuicConnection extends AbstractReactive {
 		return keys.get(level).isDiscarded();
 	}
 
+	/**
+	 * Whether {@code level}'s keys exist in the direction(s) that level uses — both for the three
+	 * bidirectional levels, the one direction this role owns for {@code ZERO_RTT}.
+	 */
 	public boolean isLevelInstalled(EncryptionLevel level) {
 		checkInReactorThread(this);
-		return keys.get(level).isInstalled();
+		return keys.get(level).isEitherDirectionInstalled();
 	}
 
 	public long datagramsSent() {

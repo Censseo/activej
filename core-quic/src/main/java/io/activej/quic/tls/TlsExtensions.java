@@ -78,6 +78,8 @@ public final class TlsExtensions {
 				case AlpnExt.TYPE -> readAlpn(body);
 				case ServerNameExt.TYPE -> readServerName(body);
 				case PskKeyExchangeModesExt.TYPE -> readPskKeyExchangeModes(body);
+				case PreSharedKeyExt.TYPE -> readPreSharedKey(body);
+				case EarlyDataExt.TYPE -> readEarlyData(body);
 				case QuicTransportParametersExt.TYPE -> new QuicTransportParametersExt(QuicTransportParameters.read(body));
 				default -> {
 					// the opaque body is carried as-is — the one place the bytes are copied out
@@ -293,6 +295,92 @@ public final class TlsExtensions {
 		return new PskKeyExchangeModesExt(modes);
 	}
 
+	/**
+	 * RFC 8446 §4.2.11. The two forms are told apart by body length, as {@code supported_versions}
+	 * is: an offer's body is at least {@link PreSharedKeyExt#MIN_OFFER_BODY_LENGTH} bytes, so a
+	 * 2-byte body can only be {@code selected_identity} and the split is total.
+	 */
+	private static TlsExtension readPreSharedKey(ByteBuf body) throws TruncatedDataException, MalformedDataException {
+		if (body.readRemaining() == 2) {
+			return PreSharedKeyExt.ofSelectedIdentity(readShort(body));
+		}
+		requireRemaining(body, 2, "pre_shared_key identities vector");
+		int identitiesLength = readShort(body);
+		if (identitiesLength > body.readRemaining()) {
+			throw new MalformedDataException("pre_shared_key identities vector declares " + identitiesLength +
+				" bytes with " + body.readRemaining() + " remaining");
+		}
+		List<PreSharedKeyExt.PskIdentity> identities = new ArrayList<>();
+		ByteBuf identitiesRegion = body.slice(identitiesLength);
+		try {
+			while (identitiesRegion.canRead()) {
+				requireRemaining(identitiesRegion, 2, "pre_shared_key identity");
+				int identityLength = readShort(identitiesRegion);
+				if (identityLength == 0) {
+					throw new MalformedDataException("pre_shared_key identity must not be empty (RFC 8446 §4.2.11)");
+				}
+				if (identityLength + 4 > identitiesRegion.readRemaining()) {
+					throw new TruncatedDataException("pre_shared_key identity declares " + identityLength +
+						" bytes with " + identitiesRegion.readRemaining() + " remaining");
+				}
+				byte[] identity = new byte[identityLength];
+				identitiesRegion.read(identity);
+				identities.add(new PreSharedKeyExt.PskIdentity(identity, readUint32(identitiesRegion)));
+			}
+		} finally {
+			identitiesRegion.recycle();
+			body.moveHead(identitiesLength);
+		}
+
+		requireRemaining(body, 2, "pre_shared_key binders vector");
+		int bindersLength = readShort(body);
+		if (bindersLength > body.readRemaining()) {
+			throw new MalformedDataException("pre_shared_key binders vector declares " + bindersLength +
+				" bytes with " + body.readRemaining() + " remaining");
+		}
+		List<byte[]> binders = new ArrayList<>();
+		ByteBuf bindersRegion = body.slice(bindersLength);
+		try {
+			while (bindersRegion.canRead()) {
+				int binderLength = bindersRegion.readByte() & 0xFF;
+				if (binderLength < 32) {
+					throw new MalformedDataException("PskBinderEntry must be 32..255 bytes: " + binderLength);
+				}
+				if (binderLength > bindersRegion.readRemaining()) {
+					throw new TruncatedDataException("PskBinderEntry declares " + binderLength + " bytes with " +
+						bindersRegion.readRemaining() + " remaining");
+				}
+				byte[] binder = new byte[binderLength];
+				bindersRegion.read(binder);
+				binders.add(binder);
+			}
+		} finally {
+			bindersRegion.recycle();
+			body.moveHead(bindersLength);
+		}
+
+		if (identities.isEmpty()) {
+			throw new MalformedDataException("pre_shared_key offers no identity (RFC 8446 §4.2.11)");
+		}
+		if (identities.size() != binders.size()) {
+			throw new MalformedDataException("pre_shared_key offers " + identities.size() + " identities against " +
+				binders.size() + " binders (RFC 8446 §4.2.11)");
+		}
+		return PreSharedKeyExt.ofClientOffer(identities, binders);
+	}
+
+	/** RFC 8446 §4.2.10: an empty body in a ClientHello/EncryptedExtensions, a uint32 in a NewSessionTicket. */
+	private static TlsExtension readEarlyData(ByteBuf body) throws MalformedDataException {
+		int bodyLength = body.readRemaining();
+		if (bodyLength == 0) {
+			return EarlyDataExt.empty();
+		}
+		if (bodyLength != 4) {
+			throw new MalformedDataException("early_data body must be 0 or 4 bytes: " + bodyLength);
+		}
+		return EarlyDataExt.ofMaxEarlyDataSize(readUint32(body));
+	}
+
 	// ---- scalar helpers (big-endian, matching the TLS wire format) ----
 
 	static void writeShort(ByteBuf buf, int v) {
@@ -302,6 +390,10 @@ public final class TlsExtensions {
 
 	static int readShort(ByteBuf buf) {
 		return ((buf.readByte() & 0xFF) << 8) | (buf.readByte() & 0xFF);
+	}
+
+	static long readUint32(ByteBuf buf) {
+		return ((long) readShort(buf) << 16) | readShort(buf);
 	}
 
 	static int peekShort(ByteBuf buf) {

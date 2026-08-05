@@ -69,8 +69,8 @@ public final class CoalescedPackets {
 	/**
 	 * One packet located within a datagram.
 	 *
-	 * @param level {@code null} for 0-RTT, Retry and Version Negotiation — none of which this feature
-	 *              opens with a level's keys
+	 * @param level {@code null} for Retry and Version Negotiation, neither of which is packet-protected
+	 *              and neither of which therefore belongs to an encryption level at all
 	 * @param bytes a retained slice covering the whole packet, header included; owned by the caller
 	 */
 	public record ProtectedPacket(
@@ -295,8 +295,8 @@ public final class CoalescedPackets {
 		};
 		EncryptionLevel level = switch (kind) {
 			case INITIAL -> EncryptionLevel.INITIAL;
+			case ZERO_RTT -> EncryptionLevel.ZERO_RTT;
 			case HANDSHAKE -> EncryptionLevel.HANDSHAKE;
-			// 0-RTT is out of scope for this feature; the caller drops it.
 			default -> null;
 		};
 		out.add(new ProtectedPacket(kind, level, version, dcid, scid,

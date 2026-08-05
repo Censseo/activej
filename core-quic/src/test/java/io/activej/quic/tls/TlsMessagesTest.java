@@ -150,8 +150,9 @@ public class TlsMessagesTest {
 		assertEquals(2, message.ticketNonce.length);
 		assertEquals(178, message.ticket.length); // 0x00b2 per the trace
 		assertEquals(1, message.extensions.size());
-		assertTrue(message.extensions.get(0) instanceof UnknownExtension);
-		assertEquals(0x002a, message.extensions.get(0).type()); // early_data: parsed, never used
+		// early_data is a first-class extension since feature 006; the bytes on the wire are unchanged
+		assertEquals(0x002a, message.extensions.get(0).type());
+		assertEquals(1024, ((EarlyDataExt) message.extensions.get(0)).maxEarlyDataSize);
 
 		assertReserializesTo(Rfc8448.NEW_SESSION_TICKET, message);
 	}
@@ -235,7 +236,7 @@ public class TlsMessagesTest {
 			random.nextLong() & 0xFFFFFFFFL,
 			randomBytes(1 + random.nextInt(255)),
 			randomBytes(1 + random.nextInt(300)),
-			List.of(new UnknownExtension(0x002a, new byte[] {0, 0, 4, 0})));
+			List.of(EarlyDataExt.ofMaxEarlyDataSize(1024)));
 		assertRoundTrip(message);
 	}
 
