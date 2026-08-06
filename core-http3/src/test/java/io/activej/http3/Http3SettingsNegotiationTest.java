@@ -24,6 +24,7 @@ import io.activej.http3.frame.Http3StreamType;
 import io.activej.http3.testutil.Http3TestBytes;
 import io.activej.http3.testutil.Http3WirePair;
 import io.activej.http3.testutil.ManualEventloop;
+import io.activej.quic.connection.QuicConnectionSettings;
 import io.activej.quic.stream.QuicStream;
 import io.activej.reactor.Reactor;
 import io.activej.test.rules.ByteBufRule;
@@ -37,9 +38,12 @@ import java.util.List;
 
 import static io.activej.http3.testutil.Http3TestBytes.concat;
 import static io.activej.http3.testutil.Http3TestBytes.settingsFrame;
+import static io.activej.http3.frame.SettingsFrame.H3_DATAGRAM;
 import static io.activej.http3.testutil.Http3TestBytes.streamHeader;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 /**
  * T058 / FR-016: what the peer's SETTINGS frame may and may not contain.
@@ -54,6 +58,10 @@ public final class Http3SettingsNegotiationTest {
 
 	/** The RFC 9114 §7.2.4.1 HTTP/2 SETTINGS identifiers, reserved in HTTP/3. */
 	private static final long[] RESERVED_IDENTIFIERS = {0x02, 0x03, 0x04, 0x05};
+
+	private static final Http3Settings DATAGRAMS_ON = Http3Settings.builder()
+		.withDatagramsEnabled(true)
+		.build();
 
 	private final List<Http3WirePair> wires = new ArrayList<>();
 	private final ByteBufs received = new ByteBufs();
@@ -130,20 +138,93 @@ public final class Http3SettingsNegotiationTest {
 		assertEquals(Http3Errors.H3_EXCESSIVE_LOAD, peer.h3.closedWithErrorCode());
 	}
 
+	// ---------------------------------------------------------------- SETTINGS_H3_DATAGRAM (T134, FR-079)
+
+	@Test
+	public void anH3DatagramValueOtherThanZeroOrOneIsASettingsError() {
+		for (long value : new long[]{2, 3, 255, Long.MAX_VALUE >> 2}) {
+			Peer peer = connect(Http3Settings.create());
+			peer.sendOnControlStream(settingsFrame(new long[]{H3_DATAGRAM}, new long[]{value}));
+
+			peer.driveUntilClosed();
+			assertEquals("SETTINGS_H3_DATAGRAM = " + value + " (RFC 9297 §2.1.1)",
+				Http3Errors.H3_SETTINGS_ERROR, peer.h3.closedWithErrorCode());
+		}
+	}
+
+	@Test
+	public void h3DatagramOneWithoutTheTransportParameterIsASettingsError() {
+		// The peer's QUIC settings are the default, so it advertised no max_datagram_frame_size: there is no
+		// DATAGRAM frame for the HTTP/3 datagram it just said it would send.
+		Peer peer = connect(DATAGRAMS_ON);
+		peer.sendOnControlStream(settingsFrame(new long[]{H3_DATAGRAM}, new long[]{1}));
+
+		peer.driveUntilClosed();
+		assertEquals(Http3Errors.H3_SETTINGS_ERROR, peer.h3.closedWithErrorCode());
+	}
+
+	@Test
+	public void h3DatagramOneWithTheTransportParameterNegotiates() {
+		Peer peer = connect(DATAGRAMS_ON, datagramQuicSettings());
+		peer.sendOnControlStream(settingsFrame(new long[]{H3_DATAGRAM}, new long[]{1}));
+
+		peer.wire.driveUntil(() -> peer.h3.state() == State.READY);
+		assertEquals(State.READY, peer.h3.state());
+		assertTrue(peer.h3.datagramsAvailable());
+	}
+
+	@Test
+	public void h3DatagramZeroIsAcceptedAndLeavesDatagramsUnavailable() {
+		// The "on ↔ off" compatibility row: the peer declines, which is not an error, and this side simply
+		// never sends one.
+		Peer peer = connect(DATAGRAMS_ON, datagramQuicSettings());
+		peer.sendOnControlStream(settingsFrame(new long[]{H3_DATAGRAM}, new long[]{0}));
+
+		peer.wire.driveUntil(() -> peer.h3.state() == State.READY);
+		assertEquals(State.READY, peer.h3.state());
+		assertFalse(peer.h3.datagramsAvailable());
+	}
+
+	@Test
+	public void anAbsentH3DatagramSettingLeavesDatagramsUnavailable() {
+		Peer peer = connect(DATAGRAMS_ON, datagramQuicSettings());
+		peer.sendOnControlStream(settingsFrame(new long[]{0x06}, new long[]{4096}));
+
+		peer.wire.driveUntil(() -> peer.h3.state() == State.READY);
+		assertFalse(peer.h3.datagramsAvailable());
+	}
+
 	// ---------------------------------------------------------------- helpers
 
 	private Peer connect(Http3Settings settings) {
+		return connect(settings, QuicConnectionSettings.create());
+	}
+
+	private Peer connect(Http3Settings settings, QuicConnectionSettings peerQuicSettings) {
 		Http3Connection[] captured = new Http3Connection[1];
 		Http3WirePair wire = new Http3WirePair(loop)
+			.withClientSettings(peerQuicSettings)
+			// The local transport half of the same negotiation, which Http3Server derives for itself: an H3
+			// switch alone advertises nothing, and RFC 9297 §2.1.1 needs both.
+			.withServerSettings(settings.datagramsEnabled() ?
+				datagramQuicSettings() :
+				QuicConnectionSettings.create())
 			.withClientStreamListener(stream -> Http3TestBytes.collect(stream, received))
 			.withServerHandlerFactory(connection -> {
 				captured[0] = Http3Connection.builder(reactor(), connection).withSettings(settings).build();
-				captured[0].start();
-				return captured[0].streamManager();
+				return captured[0].startAndGetFrameHandler();
 			})
 			.connect();
 		wires.add(wire);
 		return new Peer(wire, captured[0]);
+	}
+
+	/** The peer's half of the transport negotiation: it advertises {@code max_datagram_frame_size}. */
+	private static QuicConnectionSettings datagramQuicSettings() {
+		return QuicConnectionSettings.builder()
+			.withMaxDatagramFrameSize(MemSize.bytes(QuicConnectionSettings.maxDatagramFrameSizeFor(
+				QuicConnectionSettings.DEFAULT_MAX_DATAGRAM_SIZE.toInt())))
+			.build();
 	}
 
 	private record Peer(Http3WirePair wire, Http3Connection h3) {

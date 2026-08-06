@@ -49,6 +49,87 @@ public final class TransportParameterValidation {
 	public static final long MIN_ACTIVE_CONNECTION_ID_LIMIT = 2;
 
 	/**
+	 * The parameters a server processing early data may be assumed to have advertised: every
+	 * {@code initial_max_*} at <b>zero</b>, everything else at its RFC 9000 §18.2 default.
+	 * <p>
+	 * This is the honest server-side answer to "what may I send before the handshake completes?", and
+	 * the answer is <i>nothing</i>. A server accepting 0-RTT knows what it may <b>receive</b> — the
+	 * limits it advertised itself, which its own settings already supply — but it has been told nothing
+	 * about the client's, because the client's transport parameters arrive with the ClientHello it has
+	 * not yet finished processing. Sending under an assumed limit would be sending under a guess.
+	 * <p>
+	 * Deliberately not {@code null}: a stream layer given {@code null} would have to encode "no credit"
+	 * a second way, and two encodings of the same state is how one of them ends up untested.
+	 */
+	public static final QuicTransportParameters WITHOUT_SEND_CREDIT = new QuicTransportParameters(
+		null, 0, null,
+		QuicTransportParameters.DEFAULT_MAX_UDP_PAYLOAD_SIZE,
+		0, 0, 0, 0, 0, 0,
+		QuicTransportParameters.DEFAULT_ACK_DELAY_EXPONENT,
+		QuicTransportParameters.DEFAULT_MAX_ACK_DELAY,
+		false, null,
+		QuicTransportParameters.DEFAULT_ACTIVE_CONNECTION_ID_LIMIT,
+		null, null, 0);
+
+	/**
+	 * RFC 9000 §7.4.1: a server resuming a session may <b>raise</b> the seven limits below, never lower
+	 * them beneath the values it issued with the ticket (spec FR-054). {@code max_datagram_frame_size} is
+	 * checked alongside them under RFC 9221 §3's own rule, which exists for the same reason.
+	 * <p>
+	 * The rule exists because 0-RTT data is already on the wire by the time these parameters arrive.
+	 * The client sent it against what it remembered; a server that then advertised less would have
+	 * received data it never permitted, and no recovery is possible — the bytes cannot be un-sent. So
+	 * the reduction is the error, not the data.
+	 * <p>
+	 * Everything else is free to move, including the eight parameters RFC 9000 §7.4.1 forbids
+	 * remembering at all ({@code ack_delay_exponent}, {@code max_ack_delay},
+	 * {@code initial_source_connection_id}, {@code original_destination_connection_id},
+	 * {@code preferred_address}, {@code retry_source_connection_id}, {@code stateless_reset_token},
+	 * {@code max_idle_timeout}) — {@code QuicSessionTicket.rememberableParameters} has already cleared
+	 * them, so there is nothing here for a comparison to read.
+	 * <p>
+	 * Applies only to a handshake that <b>actually resumed</b>. A server that fell back to a full
+	 * handshake opened a new session and owes the old one's limits nothing; the caller gates on
+	 * {@code TlsEngineResult.resumed()} for exactly that reason.
+	 *
+	 * @param remembered the parameters stored with the ticket that was offered
+	 * @param actual     the parameters this handshake delivered
+	 * @throws QuicTransportException {@code PROTOCOL_VIOLATION}, naming the parameter, the value that
+	 *                                was promised and the value that replaced it
+	 * @see <a href="https://www.rfc-editor.org/rfc/rfc9221#section-3">RFC 9221 §3 — max_datagram_frame_size</a>
+	 */
+	public static void validateNonReduction(QuicTransportParameters remembered, QuicTransportParameters actual)
+		throws QuicTransportException {
+		checkNotReduced("active_connection_id_limit",
+			remembered.activeConnectionIdLimit(), actual.activeConnectionIdLimit());
+		checkNotReduced("initial_max_data",
+			remembered.initialMaxData(), actual.initialMaxData());
+		checkNotReduced("initial_max_stream_data_bidi_local",
+			remembered.initialMaxStreamDataBidiLocal(), actual.initialMaxStreamDataBidiLocal());
+		checkNotReduced("initial_max_stream_data_bidi_remote",
+			remembered.initialMaxStreamDataBidiRemote(), actual.initialMaxStreamDataBidiRemote());
+		checkNotReduced("initial_max_stream_data_uni",
+			remembered.initialMaxStreamDataUni(), actual.initialMaxStreamDataUni());
+		checkNotReduced("initial_max_streams_bidi",
+			remembered.initialMaxStreamsBidi(), actual.initialMaxStreamsBidi());
+		checkNotReduced("initial_max_streams_uni",
+			remembered.initialMaxStreamsUni(), actual.initialMaxStreamsUni());
+		// RFC 9221 §3, not RFC 9000 §7.4.1: a client that remembered a non-zero value may have put a
+		// DATAGRAM frame in early data against it, and the same "the bytes cannot be un-sent" argument
+		// applies. Reported with the same code, since the remedy is identical.
+		checkNotReduced("max_datagram_frame_size",
+			remembered.maxDatagramFrameSize(), actual.maxDatagramFrameSize());
+	}
+
+	private static void checkNotReduced(String parameter, long remembered, long actual)
+		throws QuicTransportException {
+		if (actual >= remembered) return;
+		throw new QuicTransportException(QuicTransportErrors.PROTOCOL_VIOLATION,
+			"the server reduced " + parameter + " from the " + remembered + " it issued with the session " +
+			"ticket to " + actual + ", which RFC 9000 §7.4.1 forbids on a resumed connection");
+	}
+
+	/**
 	 * Validates the peer's parameters against the connection IDs actually observed on the wire.
 	 *
 	 * @param peer                     the parameters from {@code TlsEngineResult.peerTransportParameters()}
@@ -164,7 +245,8 @@ public final class TransportParameterValidation {
 			null,                                        // preferred_address: out of scope
 			QuicTransportParameters.DEFAULT_ACTIVE_CONNECTION_ID_LIMIT,
 			localConnectionId.bytes(),
-			null);                                       // retry_source_connection_id: set by a Retry-issuing server
+			null,                                        // retry_source_connection_id: set by a Retry-issuing server
+			settings.maxDatagramFrameSize());            // 0 — the default — is not encoded at all (RFC 9221 §3)
 	}
 
 	private static QuicTransportException error(String message) {

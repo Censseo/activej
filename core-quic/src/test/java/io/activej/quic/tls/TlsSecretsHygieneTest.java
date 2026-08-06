@@ -21,11 +21,11 @@ import io.activej.quic.crypto.QuicCipherSuite;
 import io.activej.quic.crypto.QuicKeys;
 import org.junit.Test;
 
+import java.security.SecureRandom;
 import java.util.HexFormat;
 import java.util.Locale;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.*;
 
 /**
  * Secrets-hygiene regression guard (FR-016, FR-020, SI-6): the {@code toString} of every
@@ -70,6 +70,61 @@ public class TlsSecretsHygieneTest {
 		String rendered = exception.toString();
 		assertEquals("TlsAlertException[illegal_parameter(47): " + exception.getMessage() + "]", rendered);
 		assertSecretNotRendered(rendered.toLowerCase(Locale.ROOT), sharedSecret);
+	}
+
+	@Test
+	public void sessionTicketRenderedFormsCarryNoSecretMaterial() {
+		byte[] resumptionSecret = deterministicBytes(32);
+		QuicSessionTicket ticket = QuicSessionTicket.builder("example.com", "h3",
+				TlsCipherSuite.TLS_AES_128_GCM_SHA256, resumptionSecret)
+			.withIssuedAt(1_700_000_000_000L)
+			.withLifetime(3_600_000L)
+			.withTicketAgeAdd(0xDEADBEEFL)
+			.withTransportParameters(QuicTransportParameters.defaults(new byte[]{1, 2, 3, 4}))
+			.withApplicationSettings(deterministicBytes(8))
+			.build();
+
+		QuicTicketKeys keys = QuicTicketKeys.create(new SecureRandom(), 6 * 3_600_000L, 3_600_000L, 1_700_000_000_000L);
+		byte[] sealed = keys.seal(ticket, 1_700_000_000_000L);
+		QuicSessionTicket opened = keys.open(sealed);
+		assertNotNull(opened);
+
+		InMemoryQuicSessionCache cache = InMemoryQuicSessionCache.create(256, () -> 1_700_000_000_000L);
+		cache.put("example.com", 443, "h3", ticket);
+
+		assertEquals("QuicSessionTicket[example.com, h3, TLS_AES_128_GCM_SHA256]", ticket.toString());
+		assertEquals("QuicTicketKeys[retained=1]", keys.toString());
+		assertEquals("InMemoryQuicSessionCache[size=1, max=256]", cache.toString());
+
+		String rendered = (ticket + " " + opened + " " + keys + " " + cache).toLowerCase(Locale.ROOT);
+		assertSecretNotRendered(rendered, resumptionSecret);
+		assertSecretNotRendered(rendered, sealed);
+		assertSecretNotRendered(rendered, opened.identity());
+		assertFalse("rendered form leaks the ticket-age obfuscation offset: " + rendered,
+			rendered.contains("deadbeef"));
+	}
+
+	@Test
+	public void sessionTicketFailurePathsNameTheConditionAndNoSecret() {
+		byte[] resumptionSecret = deterministicBytes(32);
+		QuicSessionTicket ticket = QuicSessionTicket.builder("example.com", "h3",
+				TlsCipherSuite.TLS_AES_128_GCM_SHA256, resumptionSecret)
+			.withIssuedAt(1_700_000_000_000L)
+			.withLifetime(3_600_000L)
+			.withTicketAgeAdd(1)
+			.withTransportParameters(QuicTransportParameters.defaults(new byte[]{1, 2, 3, 4}))
+			.withApplicationSettings(new byte[70_000])
+			.build();
+		QuicTicketKeys keys = QuicTicketKeys.create(new SecureRandom(), 6 * 3_600_000L, 3_600_000L, 1_700_000_000_000L);
+
+		IllegalArgumentException oversized = assertThrows(IllegalArgumentException.class,
+			() -> keys.seal(ticket, 1_700_000_000_000L));
+		assertSecretNotRendered(oversized.getMessage().toLowerCase(Locale.ROOT), resumptionSecret);
+
+		InMemoryQuicSessionCache cache = InMemoryQuicSessionCache.create(256, () -> 1_700_000_000_000L);
+		IllegalArgumentException wrongOrigin = assertThrows(IllegalArgumentException.class,
+			() -> cache.put("other.example.com", 443, "h3", ticket));
+		assertSecretNotRendered(wrongOrigin.getMessage().toLowerCase(Locale.ROOT), resumptionSecret);
 	}
 
 	@Test

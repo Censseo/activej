@@ -18,6 +18,7 @@ package io.activej.http3.testutil;
 
 import io.activej.bytebuf.ByteBuf;
 import io.activej.net.socket.udp.UdpPacket;
+import org.jetbrains.annotations.Nullable;
 
 import java.net.InetSocketAddress;
 import java.util.ArrayDeque;
@@ -29,13 +30,19 @@ import static java.util.Objects.requireNonNull;
 
 /**
  * A reliable, in-process datagram fabric: a FIFO queue of datagrams routed between bound addresses.
- * Nothing is dropped, reordered, duplicated or delayed.
+ * Nothing is reordered, duplicated or delayed, and nothing is dropped unless a test asks for it by name
+ * through {@link #dropNextFrom}.
  * <p>
  * <b>Why the simplification.</b> {@code core-quic}'s {@code DatagramNetwork} is seeded and lossy
  * because loss recovery is what it tests. Reliable ordered delivery is feature 03/04's already-tested
  * responsibility, so an HTTP/3 test that re-simulated loss would be asserting someone else's contract
  * through a slower, flakier fixture (research Decision 12). What survives from that class is the part
  * HTTP/3 does need: delivery is <b>explicit</b>.
+ * <p>
+ * <b>The one exception is RFC 9221 DATAGRAM</b>, whose behaviour under loss — released, never
+ * retransmitted — is HTTP/3's own contract rather than the transport's, and so cannot be borrowed from
+ * feature 03's coverage. {@link #dropNextFrom} is a counted, directional, opt-in drop rather than a
+ * seed, so a loss test names exactly which datagram it loses instead of hoping a generator loses one.
  * <p>
  * <b>Delivery is explicit.</b> {@link #send} only enqueues; nothing reaches a receiver until
  * {@link #deliverDue()} runs. That keeps two properties every protocol-level assertion here depends
@@ -54,13 +61,41 @@ public final class StubDatagramNetwork {
 	/** One datagram waiting for {@link #deliverDue()}. */
 	private record InFlight(InetSocketAddress from, InetSocketAddress to, ByteBuf payload) {}
 
+	/**
+	 * Sees every datagram this fabric carries, at {@link #send} and again at delivery.
+	 * <p>
+	 * The payload is handed over as a <b>copy</b>: the real buffer stays the fabric's, so an observer
+	 * cannot consume, retain or recycle what a connection is still going to read (DI-1).
+	 */
+	@FunctionalInterface
+	public interface DatagramObserver {
+		void onDatagram(Event event, InetSocketAddress from, InetSocketAddress to, byte[] datagram);
+	}
+
+	/** Which end of the wire an observed datagram was at. */
+	public enum Event {SENT, DELIVERED}
+
 	private final Map<InetSocketAddress, Consumer<UdpPacket>> receivers = new HashMap<>();
 	private final ArrayDeque<InFlight> inFlight = new ArrayDeque<>();
+
+	private @Nullable DatagramObserver observer;
 
 	private boolean closed;
 
 	private int sentCount;
 	private int deliveredCount;
+	private int droppedCount;
+
+	private @Nullable InetSocketAddress dropFrom;
+	private int dropsRemaining;
+
+	/**
+	 * Installs the tap of {@link DatagramObserver}; absent otherwise, so a test that does not ask for it
+	 * pays neither the copy nor the callback. At most one — the second call replaces the first.
+	 */
+	public void observe(DatagramObserver observer) {
+		this.observer = observer;
+	}
 
 	public void bind(InetSocketAddress address, Consumer<UdpPacket> receiver) {
 		if (receivers.putIfAbsent(address, receiver) != null) {
@@ -82,7 +117,37 @@ public final class StubDatagramNetwork {
 			return;
 		}
 		sentCount++;
+		// Observed before it is dropped: the sender did send it, and a loss test asserting on what left the
+		// sender should not have to know whether this fabric kept it.
+		notifyObserver(Event.SENT, from, to, payload);
+		if (dropsRemaining > 0 && from.equals(dropFrom)) {
+			dropsRemaining--;
+			droppedCount++;
+			payload.recycle();
+			return;
+		}
 		inFlight.add(new InFlight(from, to, payload));
+	}
+
+	/**
+	 * Loses the next {@code count} datagrams sent from {@code from}, recycling each rather than queueing
+	 * it, so a sender sees an ordinary send and a receiver never hears of it.
+	 * <p>
+	 * Directional and counted rather than seeded: a datagram is dropped at {@link #send}, before anything
+	 * can be coalesced behind it, so a test that quiesces the exchange first loses exactly the packet its
+	 * next {@code send} produces. A second call replaces the first.
+	 */
+	public void dropNextFrom(InetSocketAddress from, int count) {
+		this.dropFrom = from;
+		this.dropsRemaining = count;
+	}
+
+	private void notifyObserver(Event event, InetSocketAddress from, InetSocketAddress to, ByteBuf payload) {
+		DatagramObserver current = observer;
+		if (current == null) return;
+		byte[] copy = new byte[payload.readRemaining()];
+		System.arraycopy(payload.array(), payload.head(), copy, 0, copy.length);
+		current.onDatagram(event, from, to, copy);
 	}
 
 	/**
@@ -107,6 +172,7 @@ public final class StubDatagramNetwork {
 			}
 			deliveredCount++;
 			delivered++;
+			notifyObserver(Event.DELIVERED, entry.from(), entry.to(), entry.payload());
 			// The address a receiver sees is the SOURCE, matching UdpSocket's convention — this is what
 			// server dispatch keys on.
 			receiver.accept(UdpPacket.of(entry.payload(), entry.from()));
@@ -127,6 +193,11 @@ public final class StubDatagramNetwork {
 		return deliveredCount;
 	}
 
+	/** Datagrams {@link #dropNextFrom} lost, which is every datagram this fabric has ever failed to carry. */
+	public int droppedCount() {
+		return droppedCount;
+	}
+
 	/**
 	 * Recycles every queued datagram and forgets every binding. Without this, a test that ends
 	 * mid-flight leaks and {@code ByteBufRule} blames the wrong component. Idempotent.
@@ -145,6 +216,7 @@ public final class StubDatagramNetwork {
 		return "StubDatagramNetwork{" +
 			"sent=" + sentCount +
 			", delivered=" + deliveredCount +
+			", dropped=" + droppedCount +
 			", inFlight=" + inFlight.size() +
 			(closed ? ", closed" : "") +
 			'}';

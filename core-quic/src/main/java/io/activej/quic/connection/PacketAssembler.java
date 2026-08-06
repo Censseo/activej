@@ -130,6 +130,11 @@ public final class PacketAssembler {
 			case HANDSHAKE -> 1 + 4 + 1 + dcid.length() + 1 + scid.length()
 				+ QuicVarInts.encodedLength(pnLength + ciphertextLength) + pnLength;
 			case ONE_RTT -> 1 + dcid.length() + pnLength;
+			// RFC 9000 §17.2.3: a 0-RTT packet is a long header of type 0x1, laid out exactly like a
+			// Handshake one — version, both connection IDs, Length, packet number — and carrying no
+			// token. Only a client ever builds one (spec FR-052).
+			case ZERO_RTT -> 1 + 4 + 1 + dcid.length() + 1 + scid.length()
+				+ QuicVarInts.encodedLength(pnLength + ciphertextLength) + pnLength;
 		};
 
 		ByteBuf header = ByteBufPool.allocate(size);
@@ -149,6 +154,16 @@ public final class PacketAssembler {
 			case HANDSHAKE -> {
 				// 0xE0: long header + fixed bit + type 0x2.
 				header.writeByte((byte) (0xE0 | (pnLength - 1)));
+				header.writeInt((int) version);
+				header.writeByte((byte) dcid.length());
+				header.put(dcid.bytes());
+				header.writeByte((byte) scid.length());
+				header.put(scid.bytes());
+				QuicVarInts.write(header, pnLength + ciphertextLength);
+			}
+			case ZERO_RTT -> {
+				// 0xD0: long header + fixed bit + type 0x1 (RFC 9000 §17.2.3), reserved bits zero.
+				header.writeByte((byte) (0xD0 | (pnLength - 1)));
 				header.writeInt((int) version);
 				header.writeByte((byte) dcid.length());
 				header.put(dcid.bytes());

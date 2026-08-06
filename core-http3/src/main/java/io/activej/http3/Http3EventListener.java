@@ -17,12 +17,15 @@
 package io.activej.http3;
 
 import io.activej.http3.Http3Connection.GoAwayDirection;
+import io.activej.http3.Http3Connection.QpackBlockedExit;
+import io.activej.http3.Http3Connection.QpackTable;
 
 /**
  * The module-internal seam through which an {@link Http3Connection} and the
- * {@link Http3RequestStream}s it owns report the four events an {@link Http3Server.Inspector} or an
+ * {@link Http3RequestStream}s it owns report the events an {@link Http3Server.Inspector} or an
  * {@link Http3Client.Inspector} publishes but neither a server nor a client can see for itself
- * (FR-062).
+ * (FR-062) — the four of phase 1, the three QPACK dynamic-table counters of FR-018, the three
+ * blocked-section ones of FR-033 to FR-036, and the five datagram ones of FR-079 to FR-085.
  * <p>
  * Deliberately <b>not public</b>: a connection is built by the server or the client that owns it, and
  * this is how that owner is told what happened underneath it. The public observability surface is the
@@ -64,4 +67,105 @@ interface Http3EventListener {
 	 * {@code RESET_STREAM}/{@code STOP_SENDING} carries.
 	 */
 	default void onStreamReset(long streamId, long errorCode) {}
+
+	/**
+	 * Entries were inserted into one of the connection's two QPACK dynamic tables (FR-018): by this
+	 * endpoint's encoder, or by the peer's encoder stream. Never fired on a connection whose capacity is
+	 * 0, which has no table to insert into.
+	 *
+	 * @param insertions entries the operation just reported on inserted, always at least 1
+	 * @param tableBytes RFC 9204 §3.2.1 accounted size the table holds afterwards
+	 */
+	default void onQpackInsertions(QpackTable table, int insertions, int tableBytes) {}
+
+	/**
+	 * Entries were evicted from one of them to make room for those insertions (RFC 9204 §3.2.2).
+	 *
+	 * @param evictions  entries evicted, always at least 1
+	 * @param tableBytes RFC 9204 §3.2.1 accounted size the table holds afterwards
+	 */
+	default void onQpackEvictions(QpackTable table, int evictions, int tableBytes) {}
+
+	/**
+	 * A field section was encoded against the dynamic table — the numerator and denominator of a
+	 * dynamic-table hit rate, reported per section so that a consumer chooses its own window.
+	 *
+	 * @param fieldLines        field lines the section carried
+	 * @param dynamicReferences those of them emitted as a dynamic-table reference rather than a literal
+	 */
+	default void onQpackFieldSectionEncoded(long streamId, int fieldLines, int dynamicReferences) {}
+
+	/**
+	 * A stream became blocked: a field section of its arrived whole but referenced an insertion that has
+	 * not (RFC 9204 §2.1.2, FR-033). Fired once per stream rather than once per section — a stream
+	 * already blocked does not become blocked again.
+	 *
+	 * @param blockedStreams streams blocked now, this one included
+	 * @param heldBytes      bytes held across all of them, this section included
+	 */
+	default void onQpackStreamBlocked(long streamId, int blockedStreams, long heldBytes) {}
+
+	/**
+	 * A blocked stream stopped being blocked, one of the four ways {@link QpackBlockedExit} names.
+	 *
+	 * @param blockedMillis  how long it was blocked — the head-of-line delay FR-036 bounds
+	 * @param blockedStreams streams still blocked after this one left
+	 */
+	default void onQpackStreamUnblocked(
+		long streamId, QpackBlockedExit exit, long blockedMillis, int blockedStreams) {}
+
+	/**
+	 * A field section was refused rather than held, because holding it would have exceeded one of the
+	 * bounds on blocked sections (FR-034, FR-035) — which closes the connection.
+	 * <p>
+	 * The two numbers say <i>which</i> bound: they are what was already held when the section arrived, so
+	 * a count at the advertised {@code SETTINGS_QPACK_BLOCKED_STREAMS} means the count bound, and bytes at
+	 * {@code that count × maxFieldSectionSize} mean the byte bound.
+	 */
+	default void onQpackBlockedSectionRefused(long streamId, int blockedStreams, long heldBytes) {}
+
+	/**
+	 * One HTTP/3 datagram was handed to the transport for the exchange on {@code streamId} (FR-079).
+	 *
+	 * @param payloadBytes the application payload's length, quarter stream ID and framing excluded
+	 * @param sent         datagrams sent over this connection, this one included
+	 */
+	default void onDatagramSent(long streamId, int payloadBytes, long sent) {}
+
+	/**
+	 * One HTTP/3 datagram arrived for the exchange on {@code streamId} and was routed to it. A datagram
+	 * whose quarter stream ID named no live exchange never reaches here — it is a drop (FR-082).
+	 *
+	 * @param payloadBytes the application payload's length, quarter stream ID excluded
+	 * @param received     datagrams routed over this connection, this one included
+	 */
+	default void onDatagramReceived(long streamId, int payloadBytes, long received) {}
+
+	/**
+	 * An exchange's inbound queue was at {@code maxInboundDatagramsPerStream}, so its <b>oldest</b>
+	 * datagram was dropped to make room (FR-085). The bound is per exchange; this total is the
+	 * connection's, which is what says whether one exchange or all of them are behind.
+	 *
+	 * @param droppedByQueue queue drops over this connection, this one included
+	 */
+	default void onDatagramDroppedByQueue(long streamId, long droppedByQueue) {}
+
+	/**
+	 * A DATAGRAM frame carrying an HTTP/3 datagram was declared lost. RFC 9221 §5 forbids retransmitting
+	 * it, so it is released — this is the only signal that it existed. No stream id: loss is known of the
+	 * frame, and the exchange it belonged to is not re-derived from a payload already released.
+	 *
+	 * @param droppedByLoss loss drops over this connection, this one included
+	 */
+	default void onDatagramDroppedByLoss(long droppedByLoss) {}
+
+	/**
+	 * A send was refused because the payload exceeded what the peer's {@code max_datagram_frame_size}
+	 * leaves for one — RFC 9221 §3 forbids splitting it and truncating would corrupt it, so it is refused
+	 * whole and the payload recycled. Both sizes are carried, since the refusal is the difference.
+	 *
+	 * @param refusedOversize oversize refusals over this connection, this one included
+	 */
+	default void onDatagramRefusedOversize(
+		long streamId, int payloadBytes, long maxPayloadBytes, long refusedOversize) {}
 }

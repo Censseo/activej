@@ -1,0 +1,14 @@
+# RFC 9204 Appendix B fixture index.
+#
+# One filename per line, in SERIES ORDER. Appendix B is a single cumulative exchange on one
+# connection, so B.2..B.5 only make sense replayed after their predecessors -- read this
+# file rather than listing the directory (a classpath directory is not portably listable
+# once these resources are inside a jar), and replay in the order given.
+#
+# Lines starting with '#' and blank lines are comments.
+
+b1-literal-field-line-with-name-reference.vec
+b2-dynamic-table.vec
+b3-speculative-insert.vec
+b4-duplicate-stream-cancellation.vec
+b5-dynamic-table-insert-eviction.vec

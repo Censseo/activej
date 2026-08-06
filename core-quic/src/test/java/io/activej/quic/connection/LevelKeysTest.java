@@ -211,6 +211,61 @@ public class LevelKeysTest {
 		assertFalse("HP key must not appear", s.contains(hex(keys.headerProtectionKey())));
 	}
 
+	/**
+	 * {@code ZERO_RTT} is one-directional by protocol: a client protects 0-RTT packets and never opens
+	 * one, a server opens them and may never send one (RFC 9001 §4.6.1). Both halves are asserted,
+	 * because the two roles reach opposite conclusions from the same installation.
+	 */
+	@Test
+	public void aZeroRttLevelIsInstalledInExactlyOneDirection() {
+		LevelKeys clientSide = new LevelKeys(EncryptionLevel.ZERO_RTT);
+		clientSide.install(keysFor(QuicCipherSuite.AES_128_GCM), null);
+		assertTrue(clientSide.acceptsSend());
+		assertFalse(clientSide.acceptsReceive());
+		assertFalse("accepts() means both directions", clientSide.accepts());
+		assertFalse(clientSide.isInstalled());
+		assertTrue(clientSide.isEitherDirectionInstalled());
+
+		LevelKeys serverSide = new LevelKeys(EncryptionLevel.ZERO_RTT);
+		serverSide.install(null, keysFor(QuicCipherSuite.AES_128_GCM));
+		assertFalse(serverSide.acceptsSend());
+		assertTrue(serverSide.acceptsReceive());
+		assertFalse(serverSide.accepts());
+		assertTrue(serverSide.isEitherDirectionInstalled());
+	}
+
+	@Test
+	public void anUninstalledOrDiscardedLevelAcceptsNeitherDirection() {
+		LevelKeys never = new LevelKeys(EncryptionLevel.ZERO_RTT);
+		assertFalse(never.acceptsSend());
+		assertFalse(never.acceptsReceive());
+		assertFalse(never.isEitherDirectionInstalled());
+
+		LevelKeys discarded = installed(QuicCipherSuite.AES_128_GCM);
+		discarded.discard();
+		assertFalse(discarded.acceptsSend());
+		assertFalse(discarded.acceptsReceive());
+		assertFalse(discarded.accepts());
+	}
+
+	/** A one-directional level must not blow up on the counters of the direction it does not have. */
+	@Test
+	public void theCountersOfAnAbsentDirectionAreNoOps() throws Exception {
+		LevelKeys clientSide = new LevelKeys(EncryptionLevel.ZERO_RTT);
+		clientSide.install(keysFor(QuicCipherSuite.AES_128_GCM), null);
+		clientSide.onDecryptionFailed();
+		assertEquals(0, clientSide.failedDecryptions());
+		clientSide.onPacketSent();
+		assertEquals(1, clientSide.packetsSent());
+
+		LevelKeys serverSide = new LevelKeys(EncryptionLevel.ZERO_RTT);
+		serverSide.install(null, keysFor(QuicCipherSuite.AES_128_GCM));
+		serverSide.onPacketSent();
+		assertEquals(0, serverSide.packetsSent());
+		serverSide.onDecryptionFailed();
+		assertEquals(1, serverSide.failedDecryptions());
+	}
+
 	private static String hex(byte[] bytes) {
 		StringBuilder sb = new StringBuilder();
 		for (byte b : bytes) {

@@ -1,0 +1,74 @@
+# RFC 9204 Appendix B.2 -- Dynamic Table
+#
+# "The encoder sets the dynamic table capacity, inserts a header with a dynamic name
+#  reference, then sends a potentially blocking, encoded field section referencing this
+#  new entry.  The decoder acknowledges processing the encoded field section, which
+#  implicitly acknowledges all dynamic table insertions up to the Required Insert Count."
+#
+# Transcribed byte-for-byte from https://www.rfc-editor.org/rfc/rfc9204.txt (2026-08-04).
+# See ./README.md for the file format.
+
+name: B.2
+title: Dynamic Table
+rfc: RFC 9204 Appendix B.2
+continues-from: B.1
+stream: 4
+
+max-table-capacity: 220
+table-capacity-before: 0
+table-capacity-after: 220
+# floor(220 / 32) -- RFC 9204 section 4.5.1.1 MaxEntries, the modulus for the encoded
+# Required Insert Count. 2 * MaxEntries = 12.
+max-entries: 6
+blocked-streams: 0
+delivery-order: encoder-stream, field-section, decoder-stream
+
+[encoder-stream]
+# Set Dynamic Table Capacity = 220
+# 5-bit prefix integer: 0x3f then (220 - 31) = 189 as a continuation varint -> bd 01
+3f bd 01
+# Insert With Name Reference, Static Table, Index=0 (:authority)
+# 0xc0 = 1100_0000 -> pattern 1, T=1 (static), 6-bit prefix index = 0
+# 0x0f = H=0, value length 15
+c0 0f
+# "www.example.com"
+77 77 77 2e 65 78 61 6d 70 6c 65 2e 63 6f 6d
+# Insert With Name Reference, Static Table, Index=1 (:path)
+# 0xc1 = 1100_0001 -> pattern 1, T=1 (static), 6-bit prefix index = 1
+# 0x0c = H=0, value length 12
+c1 0c
+# "/sample/path"
+2f 73 61 6d 70 6c 65 2f 70 61 74 68
+
+[field-section]
+# Required Insert Count = 2, Base = 0
+# 0x03 = (2 % (2 * MaxEntries=6)) + 1 = 3
+# 0x81 = S=1 (Base < Required Insert Count), Delta Base = 2 - 0 - 1 = 1
+03 81
+# Indexed Field Line With Post-Base Index, Absolute Index = Base(0) + Index(0) = 0
+# 0x10 = 0001_0000 -> pattern 0001, 4-bit prefix index = 0
+10
+# Indexed Field Line With Post-Base Index, Absolute Index = Base(0) + Index(1) = 1
+11
+
+[expected-fields]
+:authority: www.example.com
+:path: /sample/path
+
+[decoder-stream]
+# Section Acknowledgment (stream=4)
+# 0x84 = 1000_0100 -> pattern 1, 7-bit prefix stream id = 4
+84
+
+# Encoder's dynamic table at the end of this example, i.e. AFTER the Section
+# Acknowledgment. Between the field section and the acknowledgment the RFC shows both
+# entries at Ref=1; the acknowledgment releases them.
+[expected-table]
+# abs ref name value
+0 0 :authority www.example.com
+1 0 :path /sample/path
+
+[expected-state]
+insert-count: 2
+known-received-count: 2
+size: 106

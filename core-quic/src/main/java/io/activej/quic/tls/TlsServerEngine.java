@@ -38,6 +38,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 
 import static io.activej.quic.tls.TlsAlerts.*;
 
@@ -70,6 +71,22 @@ public final class TlsServerEngine implements TlsEngine {
 
 	private static final String ALPN_H3 = "h3";
 
+	/**
+	 * The origin a ticket is bound to when the ClientHello carried no SNI. RFC 6066 §3 forbids a
+	 * wildcard in a {@code host_name}, so this can never collide with a real one.
+	 */
+	private static final String NO_SERVER_NAME = "*";
+
+	/**
+	 * How many offered PSK identities are considered before the rest are ignored. Bounds the AEAD
+	 * work one ClientHello can buy; a plain constant rather than an {@code ApplicationSettings} key,
+	 * since no deployment has a reason to raise it (RFC 8446 §4.2.11 expects a handful).
+	 */
+	private static final int MAX_OFFERED_PSK_IDENTITIES = 4;
+
+	/** {@code ticket_lifetime} is a uint32 of seconds capped at seven days (RFC 8446 §4.6.1). */
+	private static final long MAX_TICKET_LIFETIME_SECONDS = 604_800L;
+
 	/** Server key-share group preference (RFC 8446 §4.2.8): x25519 first — the interop default. */
 	private static final NamedGroup[] GROUP_PREFERENCE = {NamedGroup.X25519, NamedGroup.SECP256R1};
 
@@ -84,6 +101,15 @@ public final class TlsServerEngine implements TlsEngine {
 	private final SecureRandom secureRandom;
 	private final Function<NamedGroup, KeyPair> ephemeralKeySource;
 	private final int maxHandshakeMessageSize;
+
+	// resumption configuration (spec FR-041..FR-047); no sealing keys ⇒ phase-1 behaviour throughout
+	private final @Nullable QuicTicketKeys ticketKeys;
+	private final long sessionTicketLifetimeMillis;
+	private final long ticketAgeToleranceMillis;
+	private final int sessionTicketsPerHandshake;
+	private final boolean earlyDataEnabled;
+	private final @Nullable QuicReplayGuard replayGuard;
+	private final LongSupplier currentTimeMillis;
 
 	/** Per-level reassembly of split/coalesced CRYPTO bytes (spec §Edge Cases), bounded by the message size bound. */
 	private final CryptoReassembly[] pending = newReassemblyBuffers();
@@ -105,12 +131,29 @@ public final class TlsServerEngine implements TlsEngine {
 	private byte @Nullable [] clientApplicationTrafficSecret;
 	private byte @Nullable [] serverApplicationTrafficSecret;
 
+	// resumption outcome. acceptedPskIdentity >= 0 means this handshake resumed; earlyDataOffered
+	// records that the accepted PSK also carried early_data, and earlyDataAccepted that this engine
+	// answered it — which is the whole of the RFC 8446 §4.2.10 signal, since a refusal is an omission.
+	private int acceptedPskIdentity = -1;
+	private boolean earlyDataOffered;
+	private boolean earlyDataAccepted;
+	private boolean earlyDataDecisionPending;
+	private byte @Nullable [] clientEarlyTrafficSecret;
+	private long nextTicketNonce;
+
 	TlsServerEngine(TlsServerConfig config) {
 		this.identity = config.identity();
 		this.localTransportParameters = config.localTransportParameters();
 		this.secureRandom = config.secureRandom();
 		this.ephemeralKeySource = config.ephemeralKeySource();
 		this.maxHandshakeMessageSize = config.maxHandshakeMessageSize().toInt();
+		this.ticketKeys = config.ticketKeys();
+		this.sessionTicketLifetimeMillis = config.sessionTicketLifetimeMillis();
+		this.ticketAgeToleranceMillis = config.ticketAgeToleranceMillis();
+		this.sessionTicketsPerHandshake = config.sessionTicketsPerHandshake();
+		this.earlyDataEnabled = config.earlyDataEnabled();
+		this.replayGuard = config.replayGuard();
+		this.currentTimeMillis = config.currentTimeMillis();
 	}
 
 	@Override
@@ -121,6 +164,12 @@ public final class TlsServerEngine implements TlsEngine {
 		cryptoBytes.recycle();
 		if (state == State.FAILED) {
 			throw new IllegalStateException("The handshake has already failed terminally");
+		}
+		if (!level.hasCryptoStream()) {
+			// A 0-RTT packet may not carry a CRYPTO frame (RFC 9000 §12.5), so the level has no
+			// reassembly slot and reaching here is a caller bug rather than a wire condition. The
+			// input has already been recycled above, so the ownership contract holds on this path too.
+			throw new IllegalArgumentException("No CRYPTO stream at encryption level " + level);
 		}
 		int slot = level.ordinal();
 		CryptoReassembly reassembly = pending[slot];
@@ -155,12 +204,17 @@ public final class TlsServerEngine implements TlsEngine {
 			failTerminally(cryptoToSend);
 			throw e;
 		}
+		boolean earlyDataDecision = takeEarlyDataDecision();
+		boolean resumed = acceptedPskIdentity >= 0;
 		if (completed) {
-			return TlsEngineResult.complete(cryptoToSend, installations, ALPN_H3, peerTransportParameters);
+			// A server never retains what it issues — a ticket is sealed state, not a dictionary key —
+			// so issuedTickets stays empty on this side (see TlsEngineResult.issuedTickets()).
+			return TlsEngineResult.complete(cryptoToSend, installations, ALPN_H3, peerTransportParameters,
+				List.of(), earlyDataDecision, resumed);
 		}
-		return installations.isEmpty() && cryptoToSend.isEmpty()
+		return installations.isEmpty() && cryptoToSend.isEmpty() && !earlyDataDecision && !resumed
 			? TlsEngineResult.empty()
-			: TlsEngineResult.of(cryptoToSend, installations);
+			: TlsEngineResult.of(cryptoToSend, installations, List.of(), earlyDataDecision, resumed);
 	}
 
 	// ---- state machine ----
@@ -189,7 +243,7 @@ public final class TlsServerEngine implements TlsEngine {
 						"Expected the client Finished on the HANDSHAKE-level CRYPTO stream, got message type " +
 						message.type() + " on " + level);
 				}
-				processClientFinished(finished, messageBytes, installations);
+				processClientFinished(finished, messageBytes, cryptoToSend, installations);
 				state = State.CONNECTED;
 				yield true;
 			}
@@ -222,11 +276,20 @@ public final class TlsServerEngine implements TlsEngine {
 		KeyShareEntry selectedShare = negotiateKeyShare(clientHello);
 		negotiateAlpn(clientHello);
 		negotiateTransportParameters(clientHello);
-		SignatureScheme scheme = negotiateSignatureScheme(clientHello);
 		recordServerName(clientHello);
 
 		transcript.bindCipherSuite(selectedSuite);
 		suite = selectedSuite;
+
+		// one instant for the whole resumption decision: the ticket's expiry, its reported age and the
+		// replay register must not be judged against three different readings of the clock
+		long now = currentTimeMillis.getAsLong();
+		AcceptedPsk accepted = selectPreSharedKey(clientHello, clientHelloBytes, selectedSuite, now);
+		acceptEarlyData(accepted, clientHelloBytes, selectedSuite, installations, now);
+		// RFC 8446 §4.2.3 makes signature_algorithms mandatory only when the client offers
+		// certificate authentication, and a PSK-authenticated server signs nothing — so the
+		// negotiation moves below PSK selection rather than staying unconditional.
+		SignatureScheme scheme = accepted == null ? negotiateSignatureScheme(clientHello) : null;
 
 		// --- ServerHello at the INITIAL level (data-model level mapping) ---
 		NamedGroup group = selectedShare.namedGroup();
@@ -241,18 +304,25 @@ public final class TlsServerEngine implements TlsEngine {
 		}
 		byte[] serverRandom = new byte[32];
 		secureRandom.nextBytes(serverRandom);
+		List<TlsExtension> serverHelloExtensions = new ArrayList<>(List.of(
+			SupportedVersionsExt.ofSelectedVersion(SupportedVersionsExt.TLS_1_3),
+			KeyShareExt.ofSelectedShare(new KeyShareEntry(
+				group.code(), TlsKeyExchanges.encodePublicKey(group, ephemeral.getPublic())))));
+		if (accepted != null) {
+			serverHelloExtensions.add(PreSharedKeyExt.ofSelectedIdentity(accepted.selectedIdentity()));
+		}
 		ServerHelloMessage serverHello = new ServerHelloMessage(
 			ServerHelloMessage.LEGACY_VERSION, serverRandom, clientHello.legacySessionId,
-			selectedSuite.code(), 0,
-			List.of(
-				SupportedVersionsExt.ofSelectedVersion(SupportedVersionsExt.TLS_1_3),
-				KeyShareExt.ofSelectedShare(new KeyShareEntry(
-					group.code(), TlsKeyExchanges.encodePublicKey(group, ephemeral.getPublic())))));
+			selectedSuite.code(), 0, serverHelloExtensions);
 		byte[] serverHelloBytes = serialize(serverHello);
 		transcript.update(serverHelloBytes);
-		logger.debug("→ ServerHello: suite {}, group {}", selectedSuite, group);
+		logger.debug("→ ServerHello: suite {}, group {}, resumed {}", selectedSuite, group, accepted != null);
 
-		keySchedule = TlsKeySchedule.start(selectedSuite);
+		// selectPreSharedKey already seeded the schedule with the resumption PSK; mixEcdhe runs
+		// either way, so psk_dhe_ke is the only mode and resumption never loses forward secrecy.
+		if (keySchedule == null) {
+			keySchedule = TlsKeySchedule.start(selectedSuite);
+		}
 		keySchedule.mixEcdhe(sharedSecret);
 		Arrays.fill(sharedSecret, (byte) 0);
 		byte[] clientHelloServerHelloHash = transcript.hash();
@@ -269,52 +339,215 @@ public final class TlsServerEngine implements TlsEngine {
 		initialFlight.put(serverHelloBytes);
 		cryptoToSend.put(EncryptionLevel.INITIAL, initialFlight);
 
-		// --- EE + Certificate + CertificateVerify + Finished at the HANDSHAKE level ---
-		EncryptedExtensionsMessage encryptedExtensions = new EncryptedExtensionsMessage(List.of(
+		// --- EE + [Certificate + CertificateVerify] + Finished at the HANDSHAKE level ---
+		List<TlsExtension> encryptedExtensionsList = new ArrayList<>(List.of(
 			new AlpnExt(List.of(ALPN_H3)),
 			new QuicTransportParametersExt(localTransportParameters)));
+		if (earlyDataAccepted) {
+			// RFC 8446 §4.2.10: the empty form. Echoing it is the acceptance; omitting it is the whole
+			// of the refusal, which is why there is no negative branch anywhere in this engine.
+			encryptedExtensionsList.add(EarlyDataExt.empty());
+		}
+		EncryptedExtensionsMessage encryptedExtensions = new EncryptedExtensionsMessage(encryptedExtensionsList);
 		byte[] eeBytes = serialize(encryptedExtensions);
 		transcript.update(eeBytes);
 
-		List<CertificateEntry> entries = new ArrayList<>();
-		try {
-			for (X509Certificate certificate : identity.chain()) {
-				entries.add(new CertificateEntry(certificate.getEncoded(), List.of()));
+		List<byte[]> flightMessages = new ArrayList<>();
+		flightMessages.add(eeBytes);
+		if (accepted == null) {
+			List<CertificateEntry> entries = new ArrayList<>();
+			try {
+				for (X509Certificate certificate : identity.chain()) {
+					entries.add(new CertificateEntry(certificate.getEncoded(), List.of()));
+				}
+			} catch (CertificateEncodingException e) {
+				throw new IllegalStateException("The configured identity chain cannot be DER-encoded", e);
 			}
-		} catch (CertificateEncodingException e) {
-			throw new IllegalStateException("The configured identity chain cannot be DER-encoded", e);
-		}
-		byte[] certificateBytes = serialize(new CertificateMessage(new byte[0], entries));
-		transcript.update(certificateBytes);
+			byte[] certificateBytes = serialize(new CertificateMessage(new byte[0], entries));
+			transcript.update(certificateBytes);
+			flightMessages.add(certificateBytes);
 
-		byte[] signature = TlsSignatures.sign(scheme, identity.privateKey(),
-			TlsSignatures.certificateVerifyContent(true, transcript.hash()));
-		byte[] certificateVerifyBytes = serialize(new CertificateVerifyMessage(scheme.code(), signature));
-		transcript.update(certificateVerifyBytes);
-		logger.debug("→ EncryptedExtensions + Certificate + CertificateVerify: scheme {}", scheme);
+			byte[] signature = TlsSignatures.sign(scheme, identity.privateKey(),
+				TlsSignatures.certificateVerifyContent(true, transcript.hash()));
+			byte[] certificateVerifyBytes = serialize(new CertificateVerifyMessage(scheme.code(), signature));
+			transcript.update(certificateVerifyBytes);
+			flightMessages.add(certificateVerifyBytes);
+			logger.debug("→ EncryptedExtensions + Certificate + CertificateVerify: scheme {}", scheme);
+		} else {
+			// RFC 8446 §4.4.2: a PSK-authenticated server sends neither Certificate nor CertificateVerify
+			logger.debug("→ EncryptedExtensions (PSK-authenticated flight)");
+		}
 
 		byte[] serverFinishedKey = keySchedule.finishedKey(serverHandshakeTrafficSecret);
 		byte[] serverVerifyData = keySchedule.verifyData(serverFinishedKey, transcript.hash());
 		Arrays.fill(serverFinishedKey, (byte) 0);
 		byte[] serverFinishedBytes = serialize(new FinishedMessage(serverVerifyData));
 		transcript.update(serverFinishedBytes);
+		flightMessages.add(serverFinishedBytes);
 		logger.debug("→ Finished");
 
 		serverFinishedTranscriptHash = transcript.hash();
 		clientApplicationTrafficSecret = keySchedule.clientApplicationTrafficSecret0(serverFinishedTranscriptHash);
 		serverApplicationTrafficSecret = keySchedule.serverApplicationTrafficSecret0(serverFinishedTranscriptHash);
 
-		ByteBuf handshakeFlight = ByteBufPool.allocate(
-			eeBytes.length + certificateBytes.length + certificateVerifyBytes.length + serverFinishedBytes.length);
-		handshakeFlight.put(eeBytes);
-		handshakeFlight.put(certificateBytes);
-		handshakeFlight.put(certificateVerifyBytes);
-		handshakeFlight.put(serverFinishedBytes);
-		cryptoToSend.put(EncryptionLevel.HANDSHAKE, handshakeFlight);
+		cryptoToSend.put(EncryptionLevel.HANDSHAKE, concatenate(flightMessages));
+	}
+
+	/**
+	 * Selects a PSK from the ClientHello's {@code pre_shared_key} offer, or returns {@code null} for a
+	 * full handshake.
+	 * <p>
+	 * <b>Selection precedes verification, and that split is the whole design.</b> Everything that
+	 * stops the server selecting a PSK — a client offering only {@code psk_ke}, no configured sealing
+	 * keys, a ticket that cannot be opened, one that is expired, one whose reported age is outside
+	 * tolerance, one issued for another origin or another suite — returns {@code null} quietly and
+	 * costs the client nothing but a full handshake (spec FR-045, FR-047), and no branch reports which
+	 * check refused it. Only a PSK that <i>was</i> selected and then failed its binder is fatal
+	 * (RFC 8446 §4.2.11.2): that is tampering evidence, not an unusable ticket.
+	 * <p>
+	 * The three loud checks above the loop are different in kind: they are a malformed offer rather
+	 * than an unusable one, and they fire whether or not the server has sealing keys at all.
+	 */
+	private @Nullable AcceptedPsk selectPreSharedKey(ClientHelloMessage clientHello, byte[] clientHelloBytes,
+			TlsCipherSuite selectedSuite, long now) throws TlsAlertException {
+		List<TlsExtension> extensions = clientHello.extensions;
+		PreSharedKeyExt offer = findExtension(extensions, PreSharedKeyExt.class);
+		if (offer == null) return null;
+
+		if (extensions.get(extensions.size() - 1) != offer) {
+			throw new TlsAlertException(ILLEGAL_PARAMETER,
+				"pre_shared_key must be the last ClientHello extension (RFC 8446 §4.2.11)");
+		}
+		if (!offer.isOffer()) {
+			throw new TlsAlertException(ILLEGAL_PARAMETER,
+				"pre_shared_key in a ClientHello must be the OfferedPsks form (RFC 8446 §4.2.11)");
+		}
+		PskKeyExchangeModesExt modes = findExtension(extensions, PskKeyExchangeModesExt.class);
+		if (modes == null) {
+			throw new TlsAlertException(MISSING_EXTENSION,
+				"pre_shared_key offered without psk_key_exchange_modes (RFC 8446 §4.2.9)");
+		}
+
+		if (!offersPskDheKe(modes)) return null; // FR-046: psk_ke is never accepted
+		if (ticketKeys == null) return null;
+
+		String origin = serverNameIndication != null ? serverNameIndication : NO_SERVER_NAME;
+		int considered = Math.min(offer.identities.size(), MAX_OFFERED_PSK_IDENTITIES);
+		for (int i = 0; i < considered; i++) {
+			PreSharedKeyExt.PskIdentity offered = offer.identities.get(i);
+			QuicSessionTicket ticket = ticketKeys.open(offered.identity());
+			if (ticket == null) continue;
+			if (!ticket.isFor(origin, ALPN_H3)) continue;
+			if (ticket.cipherSuite() != selectedSuite) continue;
+			if (ticket.isExpiredAt(now)) continue;
+			long reportedAge = (offered.obfuscatedTicketAge() - ticket.ticketAgeAdd()) & 0xFFFFFFFFL;
+			if (Math.abs(reportedAge - ticket.ageMillisAt(now)) > ticketAgeToleranceMillis) continue;
+
+			// --- selected: from here a binder failure is fatal, never a fallback ---
+			// the schedule is assigned to the field before the binder is computed, so failTerminally
+			// destroys the PSK-seeded early secret on the rejection path too
+			keySchedule = TlsKeySchedule.startWithPsk(selectedSuite, ticket.resumptionSecret());
+			byte[] binderKey = keySchedule.resumptionBinderKey();
+			byte[] expected = keySchedule.pskBinder(binderKey, TlsPskBinders.truncatedClientHelloHash(
+				selectedSuite, clientHelloBytes, offer.bindersSectionLength()));
+			Arrays.fill(binderKey, (byte) 0);
+			if (!TlsPskBinders.verifyBinder(expected, offer.binders.get(i))) {
+				throw new TlsAlertException(DECRYPT_ERROR, "PSK binder verification failed (RFC 8446 §4.2.11.2)");
+			}
+
+			acceptedPskIdentity = i;
+			// RFC 8446 §4.2.10: early data may only ride the first offered identity
+			earlyDataOffered = i == 0 && findExtension(extensions, EarlyDataExt.class) != null;
+			// the replay register (spec FR-069, RFC 8446 §8) is deliberately not consulted here: a
+			// ticket is single-use for *early data*, not for resumption, so spending it on a PSK that
+			// then turns out to carry no early-data offer would refuse the next connection's 0-RTT for
+			// nothing. acceptEarlyData consults it, at the point the grant is actually made.
+			return new AcceptedPsk(i, ticket);
+		}
+		return null;
+	}
+
+	/**
+	 * Answers the {@code early_data} offer that rode the accepted pre-shared key: derives
+	 * {@code client_early_traffic_secret} over the ClientHello and installs the RFC 9001 §4.1.4 0-RTT
+	 * packet-protection keys (spec FR-049).
+	 * <p>
+	 * The installation is <b>one-directional</b> ({@link TlsKeys#ofClientOnly}) and that is the point:
+	 * a server may decrypt 0-RTT packets and may never send one (spec FR-052, RFC 9001 §4.6.1). The
+	 * connection layer maps a client-only installation onto its receive slot, so the send slot at this
+	 * level is left empty by construction rather than by a rule that could be forgotten.
+	 * <p>
+	 * Ordering is not free: the key schedule must still be in its EARLY state, which it is between
+	 * {@link #selectPreSharedKey} seeding it with the resumption PSK and {@code mixEcdhe} advancing it.
+	 * <p>
+	 * Off unless {@link TlsServerConfig#earlyDataEnabled()}, which defaults to {@code false} — so a
+	 * server that has not opted in resumes sessions in 1-RTT and stays byte-identical to phase 1 on the
+	 * wire. Refusing early data is never a handshake failure (spec FR-048).
+	 * <p>
+	 * <b>The replay register is consulted here</b> (spec FR-069, RFC 8446 §8), on a PSK that has already
+	 * been accepted, and the placement is the whole point: a ticket presented a second time loses its
+	 * <i>early data</i> and nothing else. The pre-shared key still authenticates the connection, the
+	 * certificate flight is still skipped, and the handshake still completes — the same graceful shape
+	 * an unopenable or expired ticket already had, with "already used for early data" simply added to
+	 * the list of reasons early data does not happen. Failing the handshake instead would hand an
+	 * attacker a denial-of-service primitive out of the defence itself.
+	 * <p>
+	 * The register is judged at the same instant the rest of the resumption decision was, which is why
+	 * {@code nowMillis} is threaded down from {@link #processClientHello} rather than read again here.
+	 * A null register is unreachable with early data on — {@link TlsServerConfig.Builder#build()}
+	 * refuses that pair — and the check remains so that this method is total on its own field.
+	 */
+	private void acceptEarlyData(@Nullable AcceptedPsk accepted, byte[] clientHelloBytes,
+			TlsCipherSuite selectedSuite, List<KeyInstallation> installations, long nowMillis) {
+		if (accepted == null || !earlyDataOffered || !earlyDataEnabled) return;
+		if (replayGuard != null && !replayGuard.tryConsume(accepted.ticket(), nowMillis)) {
+			// the condition, never which ticket it was (SI-6); the register's own counters say which
+			// of replay, capacity or expiry refused it
+			logger.debug("→ refusing early data: the register did not grant this ticket a use (RFC 8446 §8)");
+			return;
+		}
+		assert keySchedule != null; // selectPreSharedKey seeded it before returning a non-null result
+		earlyDataAccepted = true;
+		earlyDataDecisionPending = true;
+		clientEarlyTrafficSecret = keySchedule.clientEarlyTrafficSecret(
+			TlsPskBinders.clientHelloHash(selectedSuite, clientHelloBytes));
+		installations.add(new KeyInstallation(EncryptionLevel.ZERO_RTT, TlsKeys.ofClientOnly(
+			QuicKeys.fromTrafficSecret(selectedSuite.quicCipherSuite(), clientEarlyTrafficSecret))));
+		logger.debug("→ accepting early data (RFC 8446 §4.2.10)");
+	}
+
+	/**
+	 * Reports the early-data decision once and clears it, so a later result cannot repeat a decision
+	 * the caller has already latched.
+	 */
+	private boolean takeEarlyDataDecision() {
+		boolean decision = earlyDataDecisionPending;
+		earlyDataDecisionPending = false;
+		return decision;
+	}
+
+	/**
+	 * Whether this handshake accepted early data — latched, so it stays {@code true} after
+	 * {@link #takeEarlyDataDecision()} has handed the decision over. Package-private: a test target,
+	 * never a public accessor, because everything around it is secret material (SI-6).
+	 */
+	boolean earlyDataAccepted() {
+		return earlyDataAccepted;
+	}
+
+	private static boolean offersPskDheKe(PskKeyExchangeModesExt modes) {
+		for (int mode : modes.modes) {
+			if (mode == PskKeyExchangeModesExt.PSK_DHE_KE) return true;
+		}
+		return false;
+	}
+
+	/** A PSK the server selected: the index to echo, and the ticket it was opened from. */
+	private record AcceptedPsk(int selectedIdentity, QuicSessionTicket ticket) {
 	}
 
 	private void processClientFinished(FinishedMessage finished, byte[] clientFinishedBytes,
-			List<KeyInstallation> installations) throws TlsAlertException {
+			Map<EncryptionLevel, ByteBuf> cryptoToSend, List<KeyInstallation> installations) throws TlsAlertException {
 		TlsKeySchedule schedule = keySchedule;
 		TlsCipherSuite selectedSuite = suite;
 		byte[] clientHandshakeTraffic = clientHandshakeTrafficSecret;
@@ -338,6 +571,15 @@ public final class TlsServerEngine implements TlsEngine {
 			QuicKeys.fromTrafficSecret(selectedSuite.quicCipherSuite(), clientApplicationTrafficSecret),
 			QuicKeys.fromTrafficSecret(selectedSuite.quicCipherSuite(), serverApplicationTrafficSecret))));
 
+		// the resumption master secret needs both this transcript and a live master secret, so
+		// issuance has to happen before the shedding block below destroys the schedule
+		issueSessionTickets(cryptoToSend, selectedSuite);
+
+		// RFC 9001 §4.9.3: the 0-RTT secret has no purpose past the handshake, so it goes with the rest
+		// of the handshake-phase state rather than being retained for a reordered packet (deliberate,
+		// conservative deviation — a late 0-RTT packet is dropped and the client retransmits in 1-RTT).
+		zeroEarlySecret();
+
 		// shed handshake-phase state (spec §Data & State); application traffic secrets stay for FR-005
 		Arrays.fill(clientHandshakeTraffic, (byte) 0);
 		Arrays.fill(serverHandshakeTrafficSecret, (byte) 0);
@@ -347,6 +589,87 @@ public final class TlsServerEngine implements TlsEngine {
 		schedule.destroy(); // zeroes the master secret before the schedule is dropped
 		keySchedule = null;
 		suite = null;
+	}
+
+	/**
+	 * Seals and emits {@code sessionTicketsPerHandshake} {@code NewSessionTicket} messages on the
+	 * ONE_RTT CRYPTO stream (spec FR-041, RFC 8446 §4.6.1), each advertising the QUIC-mandated
+	 * {@code max_early_data_size = 0xffffffff} (RFC 9001 §4.6.1). With no sealing keys configured this
+	 * returns before doing anything, which is the phase-1 behaviour byte for byte.
+	 * <p>
+	 * The whole body is failure-tolerant on purpose: <b>a ticket that cannot be issued must never fail
+	 * a handshake that has already completed.</b> The only consequence of giving up here is that the
+	 * client's next connection is a full handshake. The log line names the exception type and nothing
+	 * else — a ticket, its nonce and its age-add are all secret material (SI-6).
+	 */
+	private void issueSessionTickets(Map<EncryptionLevel, ByteBuf> cryptoToSend, TlsCipherSuite selectedSuite) {
+		QuicTicketKeys keys = ticketKeys;
+		if (keys == null || sessionTicketsPerHandshake == 0) return;
+		try {
+			long lifetimeSeconds = Math.min(sessionTicketLifetimeMillis / 1000, MAX_TICKET_LIFETIME_SECONDS);
+			if (lifetimeSeconds == 0) return;
+			// the sealed and the advertised lifetime must be the same number, or the server's own
+			// expiry check disagrees with the client's
+			long lifetimeMillis = lifetimeSeconds * 1000L;
+			long now = currentTimeMillis.getAsLong();
+			String origin = serverNameIndication != null ? serverNameIndication : NO_SERVER_NAME;
+
+			byte[] resumptionMaster = keySchedule.resumptionMasterSecret(transcript.hash());
+			List<byte[]> messages = new ArrayList<>();
+			for (int i = 0; i < sessionTicketsPerHandshake; i++) {
+				byte[] nonce = eightByteBigEndian(nextTicketNonce++);
+				byte[] psk = TlsKeySchedule.resumptionPsk(selectedSuite, resumptionMaster, nonce);
+				long ticketAgeAdd = randomUint32();
+				QuicSessionTicket ticket = QuicSessionTicket
+					.builder(origin, ALPN_H3, selectedSuite, psk)
+					.withIssuedAt(now)
+					.withLifetime(lifetimeMillis)
+					.withTicketAgeAdd(ticketAgeAdd)
+					.withTransportParameters(localTransportParameters)
+					.build();
+				Arrays.fill(psk, (byte) 0);
+				messages.add(serialize(new NewSessionTicketMessage(lifetimeSeconds, ticketAgeAdd, nonce,
+					keys.seal(ticket, now),
+					List.of(EarlyDataExt.ofMaxEarlyDataSize(EarlyDataExt.QUIC_MAX_EARLY_DATA_SIZE)))));
+			}
+			Arrays.fill(resumptionMaster, (byte) 0);
+			cryptoToSend.put(EncryptionLevel.ONE_RTT, concatenate(messages));
+			logger.debug("→ {} NewSessionTicket(s)", messages.size());
+		} catch (RuntimeException e) {
+			logger.warn("Issuing session tickets failed; this connection resumes nothing ({})",
+				e.getClass().getSimpleName());
+		}
+	}
+
+	private long randomUint32() {
+		byte[] bytes = new byte[4];
+		secureRandom.nextBytes(bytes);
+		return ((long) (bytes[0] & 0xFF) << 24) | ((bytes[1] & 0xFF) << 16) | ((bytes[2] & 0xFF) << 8) | (bytes[3] & 0xFF);
+	}
+
+	private static byte[] eightByteBigEndian(long value) {
+		byte[] bytes = new byte[8];
+		for (int i = 0; i < 8; i++) {
+			bytes[i] = (byte) (value >>> (56 - 8 * i));
+		}
+		return bytes;
+	}
+
+	/**
+	 * One flight buffer holding {@code messages} back to back. The messages are built as
+	 * {@code byte[]} first and the single {@link ByteBuf} is allocated last, so no partially-filled
+	 * buffer can escape on a failure path (DI-1).
+	 */
+	private static ByteBuf concatenate(List<byte[]> messages) {
+		int total = 0;
+		for (byte[] message : messages) {
+			total += message.length;
+		}
+		ByteBuf flight = ByteBufPool.allocate(total);
+		for (byte[] message : messages) {
+			flight.put(message);
+		}
+		return flight;
 	}
 
 	// ---- ClientHello negotiation (data-model.md order: versions, suites, groups, ALPN, qtp) ----
@@ -493,7 +816,8 @@ public final class TlsServerEngine implements TlsEngine {
 			buf.recycle();
 		}
 		for (CryptoReassembly reassembly : pending) {
-			reassembly.clear();
+			// null at the ZERO_RTT slot, which carries no CRYPTO stream.
+			if (reassembly != null) reassembly.clear();
 		}
 		zeroSecrets();
 		if (keySchedule != null) {
@@ -502,7 +826,16 @@ public final class TlsServerEngine implements TlsEngine {
 		}
 	}
 
+	private void zeroEarlySecret() {
+		byte[] secret = clientEarlyTrafficSecret;
+		if (secret != null) {
+			Arrays.fill(secret, (byte) 0);
+			clientEarlyTrafficSecret = null;
+		}
+	}
+
 	private void zeroSecrets() {
+		zeroEarlySecret();
 		if (clientHandshakeTrafficSecret != null) Arrays.fill(clientHandshakeTrafficSecret, (byte) 0);
 		if (serverHandshakeTrafficSecret != null) Arrays.fill(serverHandshakeTrafficSecret, (byte) 0);
 		if (clientApplicationTrafficSecret != null) Arrays.fill(clientApplicationTrafficSecret, (byte) 0);
@@ -555,10 +888,15 @@ public final class TlsServerEngine implements TlsEngine {
 		return ((data[offset] & 0xFF) << 16) | ((data[offset + 1] & 0xFF) << 8) | (data[offset + 2] & 0xFF);
 	}
 
+	/**
+	 * One {@code ordinal()}-indexed slot per encryption level, but a buffer only for the levels that
+	 * actually carry a CRYPTO stream: {@code ZERO_RTT}'s slot stays {@code null} by construction
+	 * (research D-5 audit (b)), because RFC 9000 §12.5 forbids a CRYPTO frame in a 0-RTT packet.
+	 */
 	private static CryptoReassembly[] newReassemblyBuffers() {
 		CryptoReassembly[] buffers = new CryptoReassembly[EncryptionLevel.values().length];
-		for (int i = 0; i < buffers.length; i++) {
-			buffers[i] = new CryptoReassembly();
+		for (EncryptionLevel level : EncryptionLevel.values()) {
+			if (level.hasCryptoStream()) buffers[level.ordinal()] = new CryptoReassembly();
 		}
 		return buffers;
 	}

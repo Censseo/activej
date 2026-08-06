@@ -23,9 +23,11 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayDeque;
 import java.util.EnumMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 
 /**
  * Frames awaiting transmission, in send order, one queue per encryption level (RFC 9000 §12.4 governs
@@ -73,6 +75,9 @@ public final class SendQueue {
 			throw new IllegalArgumentException("maxQueuedBytes must be positive, got " + maxQueuedBytes);
 		}
 		this.maxQueuedBytes = maxQueuedBytes;
+		// Research D-5 audit (a) verdict: ZERO_RTT belongs here. A queue is per *level*, not per
+		// packet number space — a frame queued for 0-RTT travels in a 0-RTT packet under its own keys
+		// and must not be drained into a 1-RTT one — so every level gets its own deque.
 		for (EncryptionLevel level : EncryptionLevel.values()) {
 			pending.put(level, new ArrayDeque<>());
 		}
@@ -132,6 +137,56 @@ public final class SendQueue {
 			deque.addFirst(entry);
 			queuedBytes += entry.encodedLength;
 		}
+	}
+
+	/**
+	 * Re-levels every frame still queued at {@code from} to {@code to}, preserving their order and
+	 * their {@code handlerOwned} flag (RFC 9001 §4.9.3).
+	 * <p>
+	 * The one caller is a client that has just installed 1-RTT keys: whatever it queued for 0-RTT and
+	 * did not manage to send must still be sent, and the level it was queued for no longer exists.
+	 * They go to the <b>front</b> of the target queue, because everything queued at 0-RTT was queued
+	 * before anything 1-RTT could have been, and a stream's bytes must not overtake each other.
+	 * <p>
+	 * {@code queuedBytes} is deliberately untouched: nothing left the queue, so nothing was freed.
+	 * A no-op once the queue has been dropped, exactly like {@link #enqueue} and {@link #requeue}.
+	 */
+	public void moveAll(EncryptionLevel from, EncryptionLevel to) {
+		if (dropped || from == to) return;
+		ArrayDeque<Entry> source = pending.get(from);
+		ArrayDeque<Entry> target = pending.get(to);
+		Entry entry;
+		while ((entry = source.pollLast()) != null) {
+			target.addFirst(entry);
+		}
+	}
+
+	/**
+	 * Removes every queued frame {@code filter} accepts, at <b>every</b> level, recycling each one — the
+	 * seam a layer above uses to purge the frames of state it has just discarded (spec FR-055).
+	 * <p>
+	 * Every level is swept rather than one, because {@link #moveAll} may already have re-levelled the
+	 * very frames the caller means. What is left keeps its order and its {@code handlerOwned} flag.
+	 * <p>
+	 * {@code queuedBytes} is decremented by exactly what leaves — unlike {@link #moveAll}, where nothing
+	 * leaves. A drift here would silently move the {@code maxSendQueueBytes} bound rather than fail.
+	 *
+	 * @param filter judged on the frame alone; this queue interprets nothing about it
+	 * @return how many frames were removed
+	 */
+	public int removeIf(Predicate<QuicFrame> filter) {
+		int removed = 0;
+		for (ArrayDeque<Entry> deque : pending.values()) {
+			for (Iterator<Entry> it = deque.iterator(); it.hasNext(); ) {
+				Entry entry = it.next();
+				if (!filter.test(entry.frame)) continue;
+				it.remove();
+				queuedBytes -= entry.encodedLength;
+				Recyclers.recycle(entry.frame);
+				removed++;
+			}
+		}
+		return removed;
 	}
 
 	/** Takes the next frame at this level, or {@code null} when there is none. Ownership passes to the caller. */
@@ -212,6 +267,7 @@ public final class SendQueue {
 	public String toString() {
 		return "SendQueue{" +
 			"initial=" + pending.get(EncryptionLevel.INITIAL).size() +
+			", zeroRtt=" + pending.get(EncryptionLevel.ZERO_RTT).size() +
 			", handshake=" + pending.get(EncryptionLevel.HANDSHAKE).size() +
 			", oneRtt=" + pending.get(EncryptionLevel.ONE_RTT).size() +
 			", queuedBytes=" + queuedBytes + '/' + maxQueuedBytes +

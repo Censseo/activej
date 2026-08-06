@@ -29,6 +29,7 @@ import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.Objects;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 
 /**
  * Immutable configuration of a client-side {@link TlsEngine} (data-model.md): the remote name
@@ -48,8 +49,29 @@ import java.util.function.Function;
  * configuration is immutable after {@code build()} and never mutated mid-handshake (spec §Data
  * &amp; State). RFC 9000 §18.2 makes {@code initial_source_connection_id} mandatory in the local
  * transport parameters — a missing one is a configuration error, not a mid-handshake surprise.
+ * <p>
+ * Resumption (spec FR-051b, research D-6): this configuration — never
+ * {@code QuicConnection.TlsEngineFactory}, whose signature is frozen — carries the ticket to offer
+ * ({@link Builder#withSessionTicket}), the store to fill with the tickets the server issues
+ * ({@link Builder#withSessionCache}), whether early data may be offered
+ * ({@link Builder#withEarlyDataEnabled}) and the two FR-043a bounds on an accepted ticket. With none
+ * of them set the engine performs a full handshake and behaves exactly as it did in phase 1.
  */
 public final class TlsClientConfig {
+
+	/**
+	 * Default bound on one sealed session ticket (spec FR-043a), matching
+	 * {@code QuicConnectionSettings.maxSessionTicketSize()}'s default — a deployment that tunes that
+	 * setting passes the value through {@link Builder#withMaxSessionTicketSize}.
+	 */
+	private static final MemSize DEFAULT_MAX_SESSION_TICKET_SIZE = MemSize.kilobytes(8);
+
+	/**
+	 * Default bound on the post-handshake {@code NewSessionTicket} messages one connection may
+	 * deliver (spec FR-043a), matching {@code QuicConnectionSettings.maxSessionTicketsPerConnection()}.
+	 */
+	private static final int DEFAULT_MAX_SESSION_TICKETS_PER_CONNECTION = 8;
+
 	private final String remoteName;
 	private final QuicTransportParameters localTransportParameters;
 	private @Nullable X509TrustManager trustManager;
@@ -58,6 +80,13 @@ public final class TlsClientConfig {
 	private SecureRandom secureRandom = new SecureRandom();
 	private Function<NamedGroup, KeyPair> ephemeralKeySource = TlsKeyExchanges::generateKeyPair;
 	private MemSize maxHandshakeMessageSize = TlsMessages.MAX_HANDSHAKE_MESSAGE_SIZE;
+	private @Nullable QuicSessionTicket sessionTicket;
+	private @Nullable QuicSessionCache sessionCache;
+	private int remotePort;
+	private boolean earlyDataEnabled;
+	private MemSize maxSessionTicketSize = DEFAULT_MAX_SESSION_TICKET_SIZE;
+	private int maxSessionTicketsPerConnection = DEFAULT_MAX_SESSION_TICKETS_PER_CONNECTION;
+	private LongSupplier currentTimeMillis = System::currentTimeMillis;
 
 	private TlsClientConfig(String remoteName, QuicTransportParameters localTransportParameters) {
 		this.remoteName = requireRemoteName(remoteName);
@@ -127,6 +156,74 @@ public final class TlsClientConfig {
 	 */
 	public MemSize maxHandshakeMessageSize() {
 		return maxHandshakeMessageSize;
+	}
+
+	/**
+	 * The ticket to offer as a pre-shared key (spec FR-044), or {@code null} for a full handshake —
+	 * the phase-1 behaviour. A ticket whose ALPN, server name or cipher suite does not match this
+	 * connection is <b>ignored</b> and a full handshake performed (spec FR-047); it is never a
+	 * configuration failure, because the safe direction of every resumption decision is the full
+	 * handshake.
+	 */
+	public @Nullable QuicSessionTicket sessionTicket() {
+		return sessionTicket;
+	}
+
+	/**
+	 * The store to fill with the tickets the server issues (spec FR-058), or {@code null} to keep
+	 * none — in which case {@link TlsEngineResult#issuedTickets()} is the only route to them.
+	 */
+	public @Nullable QuicSessionCache sessionCache() {
+		return sessionCache;
+	}
+
+	/**
+	 * The remote UDP port, which completes the {@code (server name, port, ALPN)} origin key
+	 * {@link #sessionCache()} is keyed by; {@code 0} when no store is configured. Supplied with the
+	 * store because it is meaningless without one.
+	 */
+	public int remotePort() {
+		return remotePort;
+	}
+
+	/**
+	 * Whether the ClientHello may offer {@code early_data} (spec FR-044). Default {@code false}: a
+	 * ticket alone resumes the session without sending anything in 0-RTT, and the decision to send
+	 * early data belongs to the layer that knows what it would send — for HTTP/3, one that has
+	 * remembered SETTINGS to obey (spec FR-062).
+	 */
+	public boolean earlyDataEnabled() {
+		return earlyDataEnabled;
+	}
+
+	/**
+	 * Bound on one sealed ticket arriving in a post-handshake {@code NewSessionTicket}
+	 * (spec FR-043a), default 8 KB. Exceeding it is a connection error, not a truncation.
+	 */
+	public MemSize maxSessionTicketSize() {
+		return maxSessionTicketSize;
+	}
+
+	/**
+	 * Bound on the tickets one connection may deliver (spec FR-043a), default 8; {@code 0} accepts
+	 * none. Without it a server could buy an unbounded number of PSK derivations on the client's
+	 * reactor thread.
+	 */
+	public int maxSessionTicketsPerConnection() {
+		return maxSessionTicketsPerConnection;
+	}
+
+	/**
+	 * The wall clock the engine reads for a ticket's issue time and for the RFC 8446 §4.2.11.1
+	 * obfuscated ticket age; {@code System::currentTimeMillis} by default.
+	 * <p>
+	 * Injected rather than read directly because {@code io.activej.quic.tls} is reactor-free by
+	 * construction (ADR-016) and may not reach {@code reactor.currentTimeMillis()}. A consumer that
+	 * also supplies a {@link QuicSessionCache} MUST give both the <b>same</b> supplier — expiry
+	 * decided against two different clocks is expiry decided at random.
+	 */
+	public LongSupplier currentTimeMillis() {
+		return currentTimeMillis;
 	}
 
 	static boolean isHostname(String remoteName) {
@@ -215,6 +312,76 @@ public final class TlsClientConfig {
 		public Builder withMaxHandshakeMessageSize(MemSize maxHandshakeMessageSize) {
 			checkNotBuilt(this);
 			TlsClientConfig.this.maxHandshakeMessageSize = Objects.requireNonNull(maxHandshakeMessageSize, "maxHandshakeMessageSize");
+			return this;
+		}
+
+		/**
+		 * Offers this ticket as a pre-shared key (spec FR-044). Absent, the engine performs a full
+		 * handshake; present but not matching this connection, it is ignored and a full handshake
+		 * performed (spec FR-047).
+		 */
+		public Builder withSessionTicket(QuicSessionTicket sessionTicket) {
+			checkNotBuilt(this);
+			TlsClientConfig.this.sessionTicket = Objects.requireNonNull(sessionTicket, "sessionTicket");
+			return this;
+		}
+
+		/**
+		 * The store the tickets this server issues are put into, and the remote port that completes
+		 * its {@code (server name, port, ALPN)} origin key (spec FR-058).
+		 * <p>
+		 * The store is read and written on the reactor thread only, and neither blocks nor returns a
+		 * {@code Promise} — see {@link QuicSessionCache}.
+		 */
+		public Builder withSessionCache(QuicSessionCache sessionCache, int remotePort) {
+			checkNotBuilt(this);
+			if (remotePort <= 0 || remotePort > 65535) {
+				throw new IllegalArgumentException("remotePort must be a usable UDP port, got " + remotePort);
+			}
+			TlsClientConfig.this.sessionCache = Objects.requireNonNull(sessionCache, "sessionCache");
+			TlsClientConfig.this.remotePort = remotePort;
+			return this;
+		}
+
+		/**
+		 * Allows the ClientHello to offer {@code early_data} beside the pre-shared key
+		 * (spec FR-044). Default {@code false}, which resumes without sending anything in 0-RTT.
+		 */
+		public Builder withEarlyDataEnabled(boolean earlyDataEnabled) {
+			checkNotBuilt(this);
+			TlsClientConfig.this.earlyDataEnabled = earlyDataEnabled;
+			return this;
+		}
+
+		/** Per-engine override of the FR-043a sealed-ticket size bound (default 8 KB). */
+		public Builder withMaxSessionTicketSize(MemSize maxSessionTicketSize) {
+			checkNotBuilt(this);
+			Objects.requireNonNull(maxSessionTicketSize, "maxSessionTicketSize");
+			if (maxSessionTicketSize.toLong() <= 0) {
+				throw new IllegalArgumentException("maxSessionTicketSize must be positive, got " + maxSessionTicketSize);
+			}
+			TlsClientConfig.this.maxSessionTicketSize = maxSessionTicketSize;
+			return this;
+		}
+
+		/** Per-engine override of the FR-043a tickets-per-connection bound (default 8; 0 accepts none). */
+		public Builder withMaxSessionTicketsPerConnection(int maxSessionTicketsPerConnection) {
+			checkNotBuilt(this);
+			if (maxSessionTicketsPerConnection < 0) {
+				throw new IllegalArgumentException(
+					"maxSessionTicketsPerConnection must not be negative, got " + maxSessionTicketsPerConnection);
+			}
+			TlsClientConfig.this.maxSessionTicketsPerConnection = maxSessionTicketsPerConnection;
+			return this;
+		}
+
+		/**
+		 * The clock behind ticket issue times and obfuscated ticket ages — pass the very supplier the
+		 * {@link QuicSessionCache} was built with (typically {@code reactor::currentTimeMillis}).
+		 */
+		public Builder withCurrentTimeMillis(LongSupplier currentTimeMillis) {
+			checkNotBuilt(this);
+			TlsClientConfig.this.currentTimeMillis = Objects.requireNonNull(currentTimeMillis, "currentTimeMillis");
 			return this;
 		}
 

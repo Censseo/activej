@@ -17,6 +17,9 @@
 package io.activej.quic.tls;
 
 import io.activej.quic.crypto.QuicKeys;
+import org.jetbrains.annotations.Nullable;
+
+import java.util.Objects;
 
 /**
  * One encryption level's per-direction key pair (data-model.md): the {@code QuicKeys} derived
@@ -24,15 +27,35 @@ import io.activej.quic.crypto.QuicKeys;
  * ({@link QuicKeys#fromTrafficSecret}). Carried to the caller inside a {@link KeyInstallation};
  * the caller owns the installation from that point (feature-01 {@code QuicKeys} contract:
  * immutable, atomically swapped).
+ * <p>
+ * {@code ZERO_RTT} is the one level with a single direction — RFC 9001 §4.1.4 derives 0-RTT keys
+ * from {@code client_early_traffic_secret} alone, and a server never sends a 0-RTT packet. Such an
+ * installation is built by {@link #ofClientOnly(QuicKeys)} and reports a {@code null}
+ * {@link #serverKeys()}; the missing direction is deliberately left <b>missing</b> rather than
+ * filled with a copy of the client's, because a copy would let a server-side assembler protect a
+ * packet under the client's early keys — key and nonce reuse.
  */
 public final class TlsKeys {
 	private final QuicKeys clientKeys;
-	private final QuicKeys serverKeys;
+	private final @Nullable QuicKeys serverKeys;
 
 	/** A pair of already-derived key sets, one per direction (client-issued / server-issued). */
 	public TlsKeys(QuicKeys clientKeys, QuicKeys serverKeys) {
-		this.clientKeys = clientKeys;
-		this.serverKeys = serverKeys;
+		this.clientKeys = Objects.requireNonNull(clientKeys, "clientKeys");
+		this.serverKeys = Objects.requireNonNull(serverKeys, "serverKeys");
+	}
+
+	private TlsKeys(QuicKeys clientKeys) {
+		this.clientKeys = Objects.requireNonNull(clientKeys, "clientKeys");
+		this.serverKeys = null;
+	}
+
+	/**
+	 * A one-directional installation for {@code ZERO_RTT}: only the client sends 0-RTT packets, so
+	 * only the client direction has keys (RFC 9001 §4.1.4).
+	 */
+	public static TlsKeys ofClientOnly(QuicKeys clientKeys) {
+		return new TlsKeys(clientKeys);
 	}
 
 	/** The key set protecting packets sent by the client (server side: opens them). */
@@ -40,8 +63,11 @@ public final class TlsKeys {
 		return clientKeys;
 	}
 
-	/** The key set protecting packets sent by the server (client side: opens them). */
-	public QuicKeys serverKeys() {
+	/**
+	 * The key set protecting packets sent by the server (client side: opens them), or {@code null}
+	 * for the one-directional {@code ZERO_RTT} installation of {@link #ofClientOnly(QuicKeys)}.
+	 */
+	public @Nullable QuicKeys serverKeys() {
 		return serverKeys;
 	}
 

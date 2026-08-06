@@ -100,6 +100,47 @@ explicitly.
   setting — 64 pieces per permitted range sits an order of magnitude above the
   ~220 pieces a full 256 KiB window of MTU-sized frames behind one gap produces,
   so ordinary loss and reordering never approach it.
+- **`Http3Settings` QPACK constants replaced.** The `public static final int`
+  constants `Http3Settings.QPACK_MAX_TABLE_CAPACITY` and
+  `Http3Settings.QPACK_BLOCKED_STREAMS`, each fixed at `0`, are removed and
+  replaced by the `ApplicationSettings`-backed
+  `Http3Settings.DEFAULT_QPACK_MAX_TABLE_CAPACITY` and
+  `Http3Settings.DEFAULT_QPACK_BLOCKED_STREAMS`, read per endpoint through the
+  accessors `qpackMaxTableCapacity()` / `qpackBlockedStreams()` and set through
+  the builder methods `withQpackMaxTableCapacity(...)` /
+  `withQpackBlockedStreams(...)`.
+
+  A `public static final int` is inlined into consumer bytecode by the Java
+  compiler, so replacing one is ordinarily a binary break that recompiling this
+  module cannot repair. It is safe here for one reason only: `activej-http3` has
+  never appeared in a published release — every `core-http3` entry in this file
+  is under **Unreleased** — so no consumer bytecode can be holding the old
+  values. Keeping the removed constants beside the new accessors would have left
+  two sources of truth for one number, with the fixed one reading as the
+  authoritative pair.
+
+  Both keys resolve against `Http3Settings`, so the fully qualified and the
+  short form work alike:
+  `-Dio.activej.http3.Http3Settings.qpackMaxTableCapacity=<value>` or
+  `-DHttp3Settings.qpackMaxTableCapacity=<value>`, and
+  `-Dio.activej.http3.Http3Settings.qpackBlockedStreams=<value>` or
+  `-DHttp3Settings.qpackBlockedStreams=<value>`.
+
+  **Nothing moved on the wire.** Both new constants resolve to the same `0` the
+  removed ones held, so the QPACK dynamic table stays disabled by default and
+  the SETTINGS frame a default `Http3Settings` produces is byte-for-byte what it
+  was. This entry records an API change and no behaviour change.
+- **`io.activej.quic.tls.EncryptionLevel` gains a `ZERO_RTT` constant**, appended
+  **last** so that `INITIAL`, `HANDSHAKE` and `ONE_RTT` keep their ordinals — the
+  enum's `ordinal()` sizes arrays in `QuicConnection`, `SendQueue` and both TLS
+  engines, and reordering it would have moved every one of them. Appending is
+  still a source-compatible-only change for anything switching exhaustively over
+  the enum: an exhaustive `switch` in consumer code stops compiling until the new
+  constant is handled. `ZERO_RTT` maps to the **Application** packet-number space
+  through `EncryptionLevel.packetNumberSpace()`, shared with `ONE_RTT`
+  (RFC 9000 §12.3) —
+  there is no fourth space — and it carries no CRYPTO stream, so
+  `hasCryptoStream()` is `false` for it alone.
 
 ### Notable fixes
 
@@ -112,6 +153,19 @@ explicitly.
   `content-type` and was normalised instead of refused. The QPACK decoder — the
   last place holding the received octets — now reports what they said, so the
   rule holds for the ~150 registered names and not only for unregistered ones.
+- **HTTP/3 QPACK: the static encoder now lowercases a field name it writes as a
+  literal**, per RFC 9114 §4.1.1. The send-side mirror of the fix above, and it
+  had the same cause: outbound names are lowercased into a `String`, then
+  re-interned through `HttpHeaders`, whose case-insensitive registry hands back
+  its own canonically-cased token — so `accept-charset` became `Accept-Charset`
+  again and the encoder copied those octets onto the wire. It never showed for
+  the 99 QPACK static-table names, which are sent as an index and never as
+  literal octets, so it bit only legal names absent from that table but present
+  in the registry (`Accept-Charset`, `Proxy-Authorization`, …). The lowercasing
+  now happens in `QpackField.lowercaseNameBytes()`, the one funnel every
+  `QpackEncoder` takes literal name octets from, so a future dynamic-table
+  encoder cannot reintroduce it. Static-table lookups are unaffected
+  (`HttpHeader` equality is already case-insensitive).
 - **HTTP/3 client: a `Content-Length` that disagrees with the body now fails
   with `MalformedHttpException`**, like every other malformed response, instead
   of a raw `Http3Exception`. The mismatch is only detectable once the body ends,
@@ -333,6 +387,294 @@ explicitly.
   a direction: no inspector call, log line, counter or exception message ever
   carries a field value, a body byte, a cookie, an authorization credential or
   key material. `core-http3` gains no `activej-jmxapi` edge for this.
+
+- **HTTP/3 QPACK dynamic table, configured but off by default.** `core-http3`
+  gains the RFC 9204 §3.2 dynamic table on both sides — the encoder inserts,
+  references and duplicates entries on its QPACK encoder stream, the decoder
+  applies a peer's insertions and answers on its decoder stream — so a repeated
+  field costs an index rather than its bytes. **Nothing changes for an existing
+  consumer**: the capacity default is `0`, which opens no QPACK stream, emits no
+  instruction, references nothing dynamic and produces the byte-for-byte SETTINGS
+  frame and field sections of the static-table implementation in the entry above.
+  One builder call enables it:
+  `Http3Settings.builder().withQpackMaxTableCapacity(MemSize.kilobytes(4))`. The
+  two `Http3Settings` constants that moved to make the capacity configurable are
+  recorded under **Breaking changes**.
+
+  All five settings are `ApplicationSettings` keys resolved against
+  `Http3Settings`, so the fully qualified and the short spelling work alike —
+  `-Dio.activej.http3.Http3Settings.qpackMaxTableCapacity=4kb` or
+  `-DHttp3Settings.qpackMaxTableCapacity=4kb`, and likewise for the other four.
+
+  | Setting | Default | What it does | Opt out with |
+  |---|---|---|---|
+  | `qpackMaxTableCapacity` | `0` (disabled) | advertised `SETTINGS_QPACK_MAX_TABLE_CAPACITY`; a non-zero value is the single switch that enables the table, per direction per connection | `…qpackMaxTableCapacity=0` / `withQpackMaxTableCapacity(MemSize.ZERO)` |
+  | `qpackBlockedStreams` | `16` | request streams this endpoint would permit to be blocked on an unreceived insertion; bounds `qpackBlockedStreams × maxFieldSectionSize` = 1 MB of held sections at the defaults | `…qpackBlockedStreams=0` / `withQpackBlockedStreams(0)` |
+  | `qpackNeverIndexedFields` | `authorization,proxy-authorization,set-cookie` | field names the encoder never indexes, emitting the RFC 9204 §7.1 never-indexed literal instead. **`cookie` is deliberately absent** — it is the largest repeated field in browser traffic and the main reason the table pays for itself; a deployment with a compression-oracle threat model adds it | `…qpackNeverIndexedFields=authorization,proxy-authorization,set-cookie,cookie` / `withQpackNeverIndexedFields(Set.of(…))` |
+  | `qpackMaxInstructionSize` | `16kb` | bounds one buffered encoder- or decoder-stream instruction, which arrives a few bytes at a time; past it the connection closes with `QPACK_ENCODER_STREAM_ERROR` (0x0201) or `QPACK_DECODER_STREAM_ERROR` (0x0202), whichever stream it was, rather than buffering on | `…qpackMaxInstructionSize=64kb` / `withQpackMaxInstructionSize(…)` |
+  | `qpackBlockedStreamTimeout` | `10s` | how long a field section blocked on an unreceived insertion is held before the connection closes with `QPACK_DECOMPRESSION_FAILED` (0x0200); `0` disables the timeout | `…qpackBlockedStreamTimeout=0s` / `withQpackBlockedStreamTimeout(Duration.ZERO)` |
+
+  Each of the last four is inert while the capacity is `0`: nothing is inserted,
+  so nothing is indexed, no instruction is buffered and no section can block.
+  `SETTINGS_QPACK_BLOCKED_STREAMS` is advertised as `0` whatever
+  `qpackBlockedStreams` says for as long as a blocked section has nowhere to
+  wait — a permission this endpoint cannot honour would cost conformance, while
+  advertising `0` costs only compression. `initial_max_streams_uni` stays `3`:
+  control plus both QPACK streams was always the right number, and the streams
+  being used now does not make them more numerous.
+
+  Three counters join each `Inspector`, **as defaulted methods**, so no existing
+  implementation breaks: `onQpackInsertions` and `onQpackEvictions` (which of
+  the connection's two tables, how many entries, and its RFC 9204 §3.2.1 size
+  afterwards) and `onQpackFieldSectionEncoded` (field lines and how many of them
+  came out of the table — the two numbers a hit rate is computed from, reported
+  per section so a consumer picks its own window). Every parameter is a number
+  or which-table: a field name or a field value has no way to reach an inspector.
+
+  Measured, on a Chrome-shaped 17-field request repeated over one connection at
+  the 4 KB capacity (`benchmarks/http3`, `-P examples`): request 1 costs 20 B of
+  field section plus 482 B of encoder stream, and requests 2..N cost **20 B each
+  — 96 % less than request 1 and 96 % less than the 493 B the static-table
+  encoder spends on every one of them**. A browsing sequence whose `:path` and
+  `referer` change scores 93 %. A **256 B** capacity is a pessimisation, not a
+  small win: entries are evicted before they are reused, so every request pays
+  its insertions again on the encoder stream and the connection sends about
+  twice what phase 1 would. Pick a capacity that holds the traffic's repeated
+  fields, or leave it at `0`.
+
+  Both dynamic-table lookups — by name and by name and value — are O(1) average
+  in the table's size, and are now measured to be
+  (`QpackDynamicTableLookupComplexityTest`). They index on a polynomial hash of
+  the field name's octets rather than on `HttpHeader.hashCode()`, which is the
+  *sum* of those octets: right for the open-addressed registry it was written
+  for, and a linear scan through the back door here, since 2 560 distinct names
+  produce only 83 distinct sums and `HttpHeader` is not `Comparable`, so
+  `HashMap` cannot treeify the bucket either.
+
+- **TLS 1.3 session resumption and HTTP/3 0-RTT, off by default.** `core-quic`
+  gains RFC 8446 §2.2 / §4.6.1 resumption — a server issues `NewSessionTicket`
+  messages sealed under its own `QuicTicketKeys`, a client stores them in a
+  `QuicSessionCache` and offers one back as a `pre_shared_key` — and, on top of
+  it, the RFC 9001 §4.6 0-RTT packet (long header, type `0x01`) in the
+  Application packet-number space. `core-http3` wires both together: with the
+  switch on, an `Http3Client` that has a usable ticket for an origin sends the
+  next request to it in a 0-RTT packet, a full round trip before the handshake
+  completes, and the `Http3Server` serves it there.
+  **Nothing changes for an existing consumer**: `zeroRttEnabled` defaults to
+  `false` on both endpoints, which offers no ticket, issues none, allocates no
+  ticket store and no sealing keys, and produces the byte-for-byte phase-1
+  handshake.
+
+  Two builder calls turn it on — `Http3Server.builder(…).withTicketKeys(…)` (or
+  none, letting `listen()` generate a set) and
+  `Http3Client.builder(…).withSessionCache(…)` (or none, for the bounded
+  in-memory default) — plus `withSettings(Http3Settings.builder()
+  .withZeroRttEnabled(true).build())` on each. A client that supplies its own
+  `withTlsEngineFactory` owns its `TlsClientConfig` and so opts out of resumption
+  entirely; `withTlsClientConfig(Initializer<TlsClientConfig.Builder>)` is the
+  new seam for decorating the config the client builds instead of replacing it.
+
+  **Why it is off by default, and what turning it on accepts.** Early data is
+  weaker than a fresh handshake in two ways that a deployment has to decide about
+  rather than inherit:
+
+  1. **Forward secrecy is delayed for the early data specifically.** The session
+     is resumed with `psk_dhe_ke` and never `psk_ke`, so the (EC)DHE exchange
+     always happens and the connection as a whole keeps forward secrecy — but the
+     0-RTT packets are protected under a key derived from the *stored ticket*,
+     which was derived before that exchange. Anything that recovers the ticket
+     recovers the early data with it, and the ticket sits in the client's store
+     for `sessionTicketLifetime` — longer if a consumer supplies a
+     `QuicSessionCache` that persists across restarts, which is exactly the
+     trade-off that interface exists to let them make.
+  2. **Early data is replayable, and the defence against it is a policy plus a
+     register.** An observer who captures a 0-RTT flight can send it again to the
+     same server, which has no handshake state to tell the copy from the
+     original. RFC 8470's answer is applied at the HTTP layer: a request whose
+     HEADERS arrived at `ZERO_RTT` is screened by the new `Http3EarlyDataPolicy`
+     after it is mapped and before it is dispatched, the default accepts only the
+     RFC 9110 §9.2.1 safe methods (`GET`, `HEAD`, `OPTIONS`, `TRACE`), and
+     anything else is answered `425 (Too Early)` **without the servlet being
+     invoked** — the client re-issues it once, transparently, at 1-RTT, so a
+     caller sees only the final outcome. A request the policy accepts reaches the
+     servlet carrying `Early-Data: 1` (RFC 8470 §5.1) — replacing any field of
+     that name the peer sent, so the indication is the server's verdict and not a
+     peer's claim — and application code can apply its own rule on top of it.
+     Replace the deployment-wide rule with
+     `Http3Server.builder(…).withEarlyDataPolicy(request -> …)`; an ordinary
+     1-RTT request never reaches the policy at all.
+
+     The other half — refusing a ticket that has already been used for early data
+     — is the bounded single-use register `QuicReplayGuard`, one per
+     `Http3Server`, consulted at the point the grant is actually made rather than
+     at pre-shared-key selection: a ticket is single-use for *early data*, not for
+     resumption, so a second presentation loses its early data and nothing else.
+     The pre-shared key still authenticates the connection, the certificate flight
+     is still skipped, and the handshake still completes at 1-RTT — failing it
+     instead would hand an attacker a denial-of-service primitive out of the
+     defence itself. It stores a SHA-256 digest of the sealed ticket identity, not
+     the identity, so the entry bound is a real memory bound (~4 MB at the
+     shipped 65 536) and no ticket material is held at rest; the lookup is
+     constant-time **including the not-found case**, the same
+     `MessageDigest.isEqual` primitive the PSK binder check uses. Eviction
+     **fails closed**: a live record is never dropped, so a register under
+     pressure degrades towards refusing every *new* 0-RTT grant rather than
+     towards admitting a replay — a register that treated an evicted record as
+     unseen would make its own bound the attack.
+
+     Early data **without** a register is refused outright rather than run
+     unprotected: `TlsServerConfig.Builder.build()` throws an
+     `IllegalStateException` naming both settings when `earlyDataEnabled` is on
+     and no `replayGuard` is set, so a direct `core-quic` consumer cannot reach a
+     replay-vulnerable 0-RTT server by omission. `Http3Server` sets the two in one
+     breath and is unaffected.
+
+     **Residual limitation, stated as one rather than dressed as a mitigation.**
+     The single-use register is **process-local** — and reactor-local: one per
+     `Http3Server` instance, not shared across workers, processes or nodes.
+     Behind a load balancer, an early-data flight replayed to a *different*
+     instance is **not caught by it**. What protects that case is the safe-method
+     default policy, which is why that default is not merely advisory and why
+     widening it widens the exposure of a whole deployment rather than of one
+     process. A deployment needing more must supply its own policy; a distributed
+     strike register is out of scope. Emptiness after a restart is not a gap:
+     `QuicTicketKeys` never persists its sealing keys, so no ticket issued before
+     a restart can be opened after one.
+
+  A request whose early data the server rejected — whether by omitting
+  `early_data` from EncryptedExtensions or by answering `425 (Too Early)` — is
+  re-issued once, transparently, on a fresh 1-RTT stream, and only the final
+  outcome reaches the caller. The retry is deliberately explicit rather than left
+  to QUIC loss recovery re-sending the frames once the 1-RTT keys exist: at most
+  one retry per request, whichever signal arrived, and it is reported through
+  `Http3Client.Inspector.onEarlyDataRetried` / `earlyDataRetried()`, which is the
+  one event that would otherwise make the fallback invisible.
+
+  The eight resumption bounds are `ApplicationSettings` keys resolved against
+  `QuicConnection`, so the fully qualified and the short spelling work alike —
+  `-Dio.activej.quic.connection.QuicConnection.sessionTicketLifetime=30m` or
+  `-DQuicConnection.sessionTicketLifetime=30m` — and the HTTP/3 switch resolves
+  against `Http3Settings` like every other one there.
+
+  | Setting | Default | What it does | Change it with |
+  |---|---|---|---|
+  | `zeroRttEnabled` | `false` | the outer switch, per HTTP/3 endpoint. Off: no ticket offered or issued, no sealing keys, no ticket store, phase-1 bytes | `-DHttp3Settings.zeroRttEnabled=true` / `withZeroRttEnabled(true)` |
+  | `sessionTicketLifetime` | `1h` | how long an issued ticket may be resumed, and how long a stored one is kept. It is also the replay window a deployment is accepting, so shortening it is the cheapest mitigation available | `-DQuicConnection.sessionTicketLifetime=15m` |
+  | `sessionTicketKeyRotation` | `6h` | how often the server generates a fresh sealing key. Two keys are retained, so `lifetime ≤ rotation` guarantees no valid ticket becomes unopenable purely because of a rotation; `QuicTicketKeys.create` refuses a pair that does not satisfy it, and `Http3Server.listen()` fails its promise with a named `IllegalStateException` rather than throwing out of a void path | `-DQuicConnection.sessionTicketKeyRotation=1h` |
+  | `sessionTicketsPerHandshake` | `2` | `NewSessionTicket` messages issued per completed handshake. More than one so a client can resume more than once without a fresh full handshake; `0` issues none | `-DQuicConnection.sessionTicketsPerHandshake=0` |
+  | `maxSessionTickets` | `256` entries | the client's bounded LRU of stored tickets, keyed by (server name, port, ALPN). Expired entries are discarded on lookup | `-DQuicConnection.maxSessionTickets=32` |
+  | `maxSessionTicketSize` | `8kb` | bounds one sealed ticket a server may send. A `NewSessionTicket` is untrusted input arriving *after* the handshake, and past this the connection closes rather than buffering on | `-DQuicConnection.maxSessionTicketSize=16kb` |
+  | `maxSessionTicketsPerConnection` | `8` | bounds how many post-handshake tickets one connection may deliver, so a server cannot buy an unbounded number of PSK derivations on the client's reactor thread | `-DQuicConnection.maxSessionTicketsPerConnection=2` |
+  | `ticketAgeTolerance` | `10s` | the window the server checks a ticket's obfuscated age against (RFC 8446 §4.2.11.1). Outside it the ticket is refused and the handshake falls back to a full one — never a failure | `-DQuicConnection.ticketAgeTolerance=30s` |
+  | `maxEarlyDataReplayRecords` | `65536` entries | ticket identities the single-use replay register holds — one register per `Http3Server`, built only when `zeroRttEnabled` is on. Eviction fails closed, so this is the point at which a saturated register starts refusing *new* 0-RTT grants (`zeroRttRefusedAtCapacity()`) rather than admitting a replay; size it against the ticket lifetime and the resumption rate | `-DQuicConnection.maxEarlyDataReplayRecords=262144` |
+
+  A ticket that cannot be opened, has expired, carries a different ALPN or server
+  name, or fails its age check produces a **full handshake**, never an error and
+  never an unauthenticated session. A server that accepts the ticket but declines
+  the early data signals that by *omitting* `early_data` from EncryptedExtensions,
+  which is likewise not a failure.
+
+  Nothing on this path reaches a log line, an exception message, a `toString()`
+  or an inspector: not a ticket byte, not a ticket identity, not a resumption
+  secret, not a PSK binder, not a sealing key. The counters that do join each
+  `Inspector` — **as defaulted methods**, so no existing implementation breaks —
+  are numbers and two enums: `onSessionTicketOffered` / `onSessionTicketStored` /
+  `onZeroRttAttempted` / `onZeroRttDecision` / `onEarlyDataRetried` on
+  `Http3Client.Inspector`, and `onSessionTicketsIssued` / `onSessionResumed` /
+  `onEarlyDataRefused` on `Http3Server.Inspector`, mirrored by the plain
+  accessors `sessionTicketsOffered()`, `sessionTicketsStored()`,
+  `zeroRttAttempted()`, `zeroRttAccepted()`, `zeroRttRejected()`,
+  `earlyDataRetried()`, `sessionTicketsIssued()`, `sessionsResumed()` and
+  `zeroRttAccepted()`.
+
+  "Why was 0-RTT refused" is deliberately four numbers rather than one, because a
+  deployment reacts to them differently. `onEarlyDataRefused` carries an
+  `Http3Connection.EarlyDataRefusal` — `REPLAYED` (the security signal: the
+  register had already granted that ticket identity a use), `AT_CAPACITY` (an
+  availability signal: `maxEarlyDataReplayRecords` is too small for the ticket
+  lifetime in force), `EXPIRED` (defence in depth; the TLS engine already skips
+  an expired ticket at pre-shared-key selection, so it stays 0) and `POLICY` (a
+  request answered `425` by the early-data policy, which under the default is
+  ordinary traffic meeting the safe-method rule). Each has its own accessor on
+  `Http3Server` — `zeroRttRefusedAsReplay()`, `zeroRttRefusedAtCapacity()`,
+  `zeroRttRefusedAsExpired()`, `earlyDataRequestsRefused()` — and those read the
+  register directly, so they are exact whether or not an inspector is attached.
+  All four stay 0 for the life of a server with `zeroRttEnabled` off. Bear the
+  process-local limit above in mind when reading `zeroRttRefusedAsReplay()`: it
+  counts the replays *this instance* caught, and is not a count of the replays
+  aimed at the deployment.
+
+- **HTTP/3 datagrams, off by default.** `core-quic` gains the RFC 9221 DATAGRAM
+  frame's semantics — the `max_datagram_frame_size` transport parameter (0x20), a
+  bounded outbound queue, and the per-encryption-level legality that keeps a
+  DATAGRAM out of Initial and Handshake packets — and `core-http3` gains RFC 9297
+  on top of it: `SETTINGS_H3_DATAGRAM` (0x33), the quarter-stream-ID payload
+  encoding, and `H3_DATAGRAM_ERROR` (0x33) on `Http3Errors`. (Setting identifier
+  `0x33` and error code `0x33` are two independent registries; the numeric
+  coincidence means nothing.) **Nothing changes for an existing consumer**:
+  `datagramsEnabled` defaults to `false` on both endpoints, which advertises no
+  transport parameter, sends no `SETTINGS_H3_DATAGRAM`, allocates no queue and
+  produces the byte-for-byte phase-1 connection.
+
+  One builder call on each endpoint turns it on —
+  `withSettings(Http3Settings.builder().withDatagramsEnabled(true).build())` — and
+  `Http3Server` / `Http3Client` derive the transport parameter from
+  `maxDatagramSize` themselves, so there is nothing else to configure.
+
+  The developer-facing surface is a **per-exchange handle** on the existing
+  `HttpMessage` attachment mechanism — the seam HTTP/3 trailers already use, so
+  **`core-http` is unchanged**. A servlet reaches it from the request it is
+  serving, a client caller from the request it issued or the response it received:
+  `Http3DatagramChannel datagrams = Http3Datagrams.of(message)`, `null` when
+  datagrams are off or the message is not an HTTP/3 one. It exposes
+  `isAvailable()` (queryable *before* the first send), `maxPayloadSize()`,
+  `send(ByteBuf)`, `poll()`, `setReceiveHandler(…)` and four counters. **No QUIC
+  stream ID appears anywhere in it**; the quarter stream ID is an internal
+  encoding detail.
+
+  `send` **takes ownership of the payload on every path, refusals included** — it
+  is recycled before the checked `Http3DatagramException` is thrown, and recycling
+  it again at the call site is a double free. The four refusal reasons are
+  `NOT_NEGOTIATED`, `OVERSIZE`, `QUEUE_FULL` and `EXCHANGE_ENDED`; none is a
+  protocol violation and none closes anything. An oversize payload is refused
+  **whole** rather than truncated or split, because RFC 9221 §3 permits neither. A
+  datagram is deliberately **not** a CSP channel: CSP promises a producer that a
+  withheld promise means "wait", and on a channel with no retransmission there is
+  nothing to wait for.
+
+  | Setting | Default | What it does | Change it with |
+  |---|---|---|---|
+  | `datagramsEnabled` | `false` | the outer switch, per HTTP/3 endpoint. Off: nothing advertised, nothing sent, no queue allocated, phase-1 bytes | `-DHttp3Settings.datagramsEnabled=true` / `withDatagramsEnabled(true)` |
+  | `maxInboundDatagramsPerStream` | `32` | the bounded per-exchange inbound queue. At the bound the **oldest** queued datagram is dropped and counted — never the connection, never unbounded growth. `0` accepts none | `-DHttp3Settings.maxInboundDatagramsPerStream=8` / `withMaxInboundDatagramsPerStream(8)` |
+  | `maxDatagramFrameSize` | `0` (disabled) | the RFC 9221 §3 transport parameter. `0` means *not supported* and is not advertised at all; an `Http3Server`/`Http3Client` with datagrams on sets it to the largest frame that fits `maxDatagramSize`, which is 1309 bytes at the 1350-byte default | `-DQuicConnection.maxDatagramFrameSize=1200` |
+  | `maxOutboundDatagrams` | `64` | the bounded outbound queue. At the bound the send is **refused** rather than queued, and a datagram that cannot be placed in the next packet within its bound is dropped and counted rather than held indefinitely | `-DQuicConnection.maxOutboundDatagrams=256` |
+
+  The two HTTP/3 settings resolve against `Http3Settings` and the two QUIC ones
+  against `QuicConnection`, so the fully qualified and the short spelling work
+  alike — `-Dio.activej.http3.Http3Settings.datagramsEnabled=true` or
+  `-DHttp3Settings.datagramsEnabled=true`, and likewise for the rest.
+
+  A lost DATAGRAM frame is **released, never retransmitted** (RFC 9221 §5), which
+  is what the existing `QuicFrameHandler.onFrameLost` default already did. A
+  datagram whose quarter stream ID names an exchange that has completed, been
+  reset or not yet been opened is **dropped silently and counted** — reordering
+  makes that normal on an unreliable channel, and it is not an error. What *is* an
+  error, closing the connection with `H3_DATAGRAM_ERROR`, is a quarter stream ID
+  that maps to a stream which is not client-initiated bidirectional, one whose
+  `× 4` would exceed 2^62−1, and a truncated varint; a `SETTINGS_H3_DATAGRAM`
+  value other than `0` or `1`, and a peer sending `1` without
+  `max_datagram_frame_size`, close with `H3_SETTINGS_ERROR` (0x0109) instead.
+
+  Five counters join each `Inspector`, **as defaulted methods**, so no existing
+  implementation breaks: `onDatagramSent`, `onDatagramReceived`,
+  `onDatagramDroppedByQueue`, `onDatagramDroppedByLoss` and
+  `onDatagramRefusedOversize`. Every parameter is a stream id, a size or a running
+  total — a payload byte has no way to reach an inspector, a log line or an
+  exception message.
+
+  RFC 9220 Extended CONNECT stays **refused** exactly as before: datagrams here
+  bind to ordinary request/response exchanges only, and WebTransport and MASQUE
+  remain out of scope.
 
 - **QUIC connection layer.** A new `io.activej.quic.connection` package in
   `core-quic` turns the wire codec and the TLS engines into a working transport:

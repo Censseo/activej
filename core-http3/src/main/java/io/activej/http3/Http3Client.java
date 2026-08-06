@@ -16,8 +16,10 @@
 
 package io.activej.http3;
 
+import io.activej.common.MemSize;
 import io.activej.common.builder.AbstractBuilder;
 import io.activej.common.inspector.BaseInspector;
+import io.activej.common.initializer.Initializer;
 import io.activej.dns.IDnsClient;
 import io.activej.dns.protocol.DnsResponse;
 import io.activej.http.HttpMethod;
@@ -27,6 +29,10 @@ import io.activej.http.IHttpClient;
 import io.activej.http.MalformedHttpException;
 import io.activej.http.Protocol;
 import io.activej.http3.Http3Connection.GoAwayDirection;
+import io.activej.http3.Http3Connection.QpackBlockedExit;
+import io.activej.http3.Http3Connection.QpackTable;
+import io.activej.http3.Http3Connection.ZeroRttOutcome;
+import io.activej.http3.frame.SettingsFrame;
 import io.activej.net.socket.udp.IUdpSocket;
 import io.activej.net.socket.udp.UdpSocket;
 import io.activej.promise.Promise;
@@ -36,7 +42,11 @@ import io.activej.quic.connection.QuicConnection.TlsEngineFactory;
 import io.activej.quic.connection.QuicConnectionSettings;
 import io.activej.quic.connection.QuicEndpoint;
 import io.activej.quic.connection.QuicFrameHandler;
+import io.activej.quic.tls.InMemoryQuicSessionCache;
+import io.activej.quic.tls.QuicSessionCache;
+import io.activej.quic.tls.QuicSessionTicket;
 import io.activej.quic.tls.QuicTls;
+import io.activej.quic.tls.QuicTransportParameters;
 import io.activej.quic.tls.TlsClientConfig;
 import io.activej.reactor.AbstractNioReactive;
 import io.activej.reactor.net.DatagramSocketSettings;
@@ -52,11 +62,13 @@ import java.net.InetSocketAddress;
 import java.nio.channels.DatagramChannel;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 
@@ -122,6 +134,21 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 	/** The port an {@code https} authority carries implicitly (RFC 9110 §4.2.2). */
 	private static final int DEFAULT_HTTPS_PORT = 443;
 
+	/** The only ALPN this client negotiates, and so the only one a session ticket is ever keyed under. */
+	private static final String ALPN_H3 = "h3";
+
+	/** RFC 8470 §5.2 — the server declined to process a request that arrived in early data. */
+	private static final int TOO_EARLY = 425;
+
+	/**
+	 * RFC 9110 §9.2.1's safe methods, the client-side default of FR-068 — deliberately the same set the
+	 * default server-side early-data policy accepts, so an ordinary application never provokes a
+	 * rejection round trip. Held here rather than on {@code HttpMethod}: safety is an HTTP semantic this
+	 * module reads, and `core-http` gains nothing from this feature (contracts/core-http-delta.md).
+	 */
+	private static final Set<HttpMethod> SAFE_METHODS =
+		EnumSet.of(HttpMethod.GET, HttpMethod.HEAD, HttpMethod.OPTIONS, HttpMethod.TRACE);
+
 	/**
 	 * The optional statistics hook of FR-062, the client's half of {@link Http3Server.Inspector} and
 	 * following the same {@code QuicConnection.Inspector} precedent: an interface declared by the
@@ -183,14 +210,191 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 		 * @param queueDepth requests still waiting after this one left
 		 */
 		void onRequestDequeued(Http3Client client, int queueDepth);
+
+		/**
+		 * Entries were inserted into one of a connection's two QPACK dynamic tables (FR-018) — by this
+		 * client's encoder ({@link QpackTable#ENCODER}) or by a peer's encoder stream
+		 * ({@link QpackTable#DECODER}). Silent on a connection whose negotiated capacity is 0, which is
+		 * the default and has no table to insert into.
+		 *
+		 * @param insertions entries inserted, always at least 1
+		 * @param tableBytes RFC 9204 §3.2.1 accounted size that table holds afterwards
+		 */
+		default void onQpackInsertions(Http3Client client, QpackTable table, int insertions, int tableBytes) {}
+
+		/**
+		 * Entries were evicted from one of them to make room (RFC 9204 §3.2.2).
+		 *
+		 * @param evictions  entries evicted, always at least 1
+		 * @param tableBytes RFC 9204 §3.2.1 accounted size that table holds afterwards
+		 */
+		default void onQpackEvictions(Http3Client client, QpackTable table, int evictions, int tableBytes) {}
+
+		/**
+		 * A request field section was encoded against the dynamic table: the numerator and denominator of
+		 * a dynamic-table hit rate, reported per section so a consumer picks its own window.
+		 *
+		 * @param fieldLines        field lines the section carried
+		 * @param dynamicReferences those of them emitted as a dynamic-table reference, not a literal
+		 */
+		default void onQpackFieldSectionEncoded(
+			Http3Client client, long streamId, int fieldLines, int dynamicReferences) {}
+
+		/**
+		 * A request stream became blocked: a field section of its arrived whole but referenced an insertion
+		 * the peer's encoder stream has not delivered yet (RFC 9204 §2.1.2, FR-033). Fired once per stream,
+		 * not once per section — a stream already blocked does not become blocked again.
+		 *
+		 * @param blockedStreams streams blocked now, this one included
+		 * @param heldBytes      bytes held across all of them, this section included
+		 */
+		default void onQpackStreamBlocked(Http3Client client, long streamId, int blockedStreams, long heldBytes) {}
+
+		/**
+		 * A blocked stream stopped being blocked, one of the four ways {@link QpackBlockedExit} names. Only
+		 * {@code DECODED} is the ordinary end of head-of-line blocking; the other three are a peer that
+		 * never sent what it referenced.
+		 *
+		 * @param blockedMillis  how long the stream was blocked — the delay FR-036 bounds
+		 * @param blockedStreams streams still blocked after this one left
+		 */
+		default void onQpackStreamUnblocked(
+			Http3Client client, long streamId, QpackBlockedExit exit, long blockedMillis, int blockedStreams) {}
+
+		/**
+		 * A field section was refused rather than held, because holding it would have exceeded a bound on
+		 * blocked sections — which closes the connection (FR-034, FR-035). The two numbers are what was
+		 * already held when it arrived, and so say which bound was reached.
+		 */
+		default void onQpackBlockedSectionRefused(
+			Http3Client client, long streamId, int blockedStreams, long heldBytes) {}
+
+		/**
+		 * A connection was dialled offering a stored session ticket (FR-058). Silent with
+		 * {@link Http3Settings#zeroRttEnabled()} off, and on the first dial to any origin, which has
+		 * nothing to offer.
+		 *
+		 * @param ticketsOffered tickets offered over this client's life, this one included
+		 */
+		default void onSessionTicketOffered(Http3Client client, long ticketsOffered) {}
+
+		/**
+		 * A session ticket was put into the {@linkplain Builder#withSessionCache ticket store}, carrying
+		 * the HTTP/3 SETTINGS of the connection that issued it (FR-062). Carries no ticket byte, no
+		 * resumption secret and no binder (SI-6).
+		 *
+		 * @param ticketsStored tickets stored over this client's life, this one included
+		 */
+		default void onSessionTicketStored(Http3Client client, long ticketsStored) {}
+
+		/**
+		 * Early data went out on a dialled connection: a stored ticket was offered <b>and</b> it carried
+		 * the remembered SETTINGS RFC 9114 §7.2.4.2 requires, so the request left in a 0-RTT packet
+		 * rather than waiting for the handshake (FR-051).
+		 *
+		 * @param attempted 0-RTT attempts over this client's life, this one included
+		 */
+		default void onZeroRttAttempted(Http3Client client, long attempted) {}
+
+		/**
+		 * The server's decision on one attempt, reported once per attempt when the handshake completes.
+		 * A rejection is not a failure — the session still resumed, and only the early data was refused.
+		 *
+		 * @param accepted attempts accepted over this client's life
+		 * @param rejected attempts rejected over this client's life
+		 */
+		default void onZeroRttDecision(
+			Http3Client client, ZeroRttOutcome outcome, long accepted, long rejected) {}
+
+		/**
+		 * A request whose early data was rejected has been re-issued on a fresh 1-RTT stream (FR-067) —
+		 * the one event that would otherwise make the fallback invisible, since the caller sees only the
+		 * final outcome and every other counter reads as though nothing happened.
+		 * <p>
+		 * Fired once per retry, after the superseded attempt has been let go of and before the new one
+		 * starts, for both rejection signals alike: a refused {@code early_data} extension and a
+		 * {@code 425 (Too Early)} answer. A retry is not counted twice and a retry that itself fails is
+		 * still counted — it was issued.
+		 * <p>
+		 * Carries numbers only: no ticket byte, no resumption secret, no binder (SI-6, FR-050).
+		 *
+		 * @param retried retries over this client's life, this one included
+		 */
+		default void onEarlyDataRetried(Http3Client client, long retried) {}
+
+		/**
+		 * An HTTP/3 datagram was handed to the transport for the exchange on {@code streamId} (FR-079).
+		 * Silent with {@link Http3Settings#datagramsEnabled()} off, which is the default and sends none.
+		 * <p>
+		 * "Sent" is not "delivered" and cannot be: RFC 9221 §5 neither retransmits a lost DATAGRAM frame
+		 * nor acknowledges it usefully, so {@link #onDatagramDroppedByLoss} is the only negative signal
+		 * there is, and even it is silent about a datagram lost without being noticed.
+		 *
+		 * @param payloadBytes the application payload's length — a size, never a byte of it (SI-6)
+		 * @param sent         datagrams sent over the connection carrying this exchange, this one included
+		 */
+		default void onDatagramSent(Http3Client client, long streamId, int payloadBytes, long sent) {}
+
+		/**
+		 * An HTTP/3 datagram arrived for the exchange on {@code streamId} and was routed to it. One whose
+		 * quarter stream ID named no live exchange is dropped rather than routed (FR-082) and is not
+		 * counted here.
+		 *
+		 * @param received datagrams routed over the connection carrying this exchange, this one included
+		 */
+		default void onDatagramReceived(Http3Client client, long streamId, int payloadBytes, long received) {}
+
+		/**
+		 * An exchange's inbound queue was at {@link Http3Settings#maxInboundDatagramsPerStream()}, so its
+		 * <b>oldest</b> datagram was dropped to make room (FR-085) — a reader falling behind, never a
+		 * protocol error and never a connection closing.
+		 *
+		 * @param droppedByQueue queue drops over that connection, this one included
+		 */
+		default void onDatagramDroppedByQueue(Http3Client client, long streamId, long droppedByQueue) {}
+
+		/**
+		 * A DATAGRAM frame carrying an HTTP/3 datagram was declared lost and released rather than
+		 * retransmitted (RFC 9221 §5). Carries no stream id: what is known lost is the frame, and its
+		 * payload is gone by the time anything could re-derive the exchange from it.
+		 *
+		 * @param droppedByLoss loss drops over that connection, this one included
+		 */
+		default void onDatagramDroppedByLoss(Http3Client client, long droppedByLoss) {}
+
+		/**
+		 * A send was refused whole because its payload exceeded what the peer's
+		 * {@code max_datagram_frame_size} leaves — RFC 9221 §3 forbids splitting a datagram, so truncating
+		 * it is not an option. The two sizes are the refusal.
+		 *
+		 * @param refusedOversize oversize refusals over that connection, this one included
+		 */
+		default void onDatagramRefusedOversize(
+			Http3Client client, long streamId, int payloadBytes, long maxPayloadBytes, long refusedOversize) {}
 	}
 
 	private final IDnsClient dnsClient;
 
 	private Http3Settings settings = Http3Settings.create();
-	private Function<String, TlsEngineFactory> tlsEngineFactory = Http3Client::defaultTlsEngineFactory;
+
+	/**
+	 * {@code null} means "the built-in default", which is what makes "a consumer set one" distinguishable
+	 * — and a consumer-supplied factory owns its own {@link TlsClientConfig} and so opts out of this
+	 * client's resumption plumbing entirely (FR-058, research D-6).
+	 */
+	private @Nullable Function<String, TlsEngineFactory> tlsEngineFactory;
+
+	/** Applied to every {@link TlsClientConfig} this client builds; a no-op unless a consumer set one. */
+	private Initializer<TlsClientConfig.Builder> tlsClientConfig = builder -> {};
+
 	private @Nullable Inspector inspector;
 	private @Nullable IUdpSocket socket;
+
+	/**
+	 * The ticket store: the consumer's, or the bounded in-memory default built lazily on first use — and
+	 * only when {@link Http3Settings#zeroRttEnabled()}, so 0-RTT off allocates nothing (SC-011).
+	 */
+	private @Nullable QuicSessionCache sessionCache;
 
 	private @Nullable QuicEndpoint endpoint;
 	private @Nullable Promise<QuicEndpoint> opening;
@@ -223,12 +427,20 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 	 */
 	private @Nullable Http3Connection justDialled;
 
+	/**
+	 * The {@link Resumption} built for the connection being dialled right now, handed to
+	 * {@link #onConnection} across the same single statement {@link #justDialled} is handed back over —
+	 * the frame-handler factory runs synchronously inside {@link QuicEndpoint#connectTo}, so it is
+	 * written and read within one call and never held.
+	 */
+	private @Nullable Resumption pendingResumption;
+
 	/** Exchanges in flight; an identity set, since two requests are never the same object. */
 	private final Set<Exchange> inFlight = Collections.newSetFromMap(new IdentityHashMap<>());
 
 	/**
 	 * What every connection this client dials reports through, forwarded to the {@link Inspector} if one
-	 * is attached — the four events a client cannot see for itself, because they happen on a connection or
+	 * is attached — the events a client cannot see for itself, because they happen on a connection or
 	 * on a stream rather than inside an exchange.
 	 */
 	private final Http3EventListener connectionEvents = new Http3EventListener() {
@@ -251,6 +463,76 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 		public void onStreamReset(long streamId, long errorCode) {
 			if (inspector != null) inspector.onStreamReset(Http3Client.this, streamId, errorCode);
 		}
+
+		@Override
+		public void onQpackInsertions(QpackTable table, int insertions, int tableBytes) {
+			if (inspector != null) inspector.onQpackInsertions(Http3Client.this, table, insertions, tableBytes);
+		}
+
+		@Override
+		public void onQpackEvictions(QpackTable table, int evictions, int tableBytes) {
+			if (inspector != null) inspector.onQpackEvictions(Http3Client.this, table, evictions, tableBytes);
+		}
+
+		@Override
+		public void onQpackFieldSectionEncoded(long streamId, int fieldLines, int dynamicReferences) {
+			if (inspector != null) {
+				inspector.onQpackFieldSectionEncoded(Http3Client.this, streamId, fieldLines, dynamicReferences);
+			}
+		}
+
+		@Override
+		public void onQpackStreamBlocked(long streamId, int blockedStreams, long heldBytes) {
+			if (inspector != null) {
+				inspector.onQpackStreamBlocked(Http3Client.this, streamId, blockedStreams, heldBytes);
+			}
+		}
+
+		@Override
+		public void onQpackStreamUnblocked(
+			long streamId, QpackBlockedExit exit, long blockedMillis, int blockedStreams
+		) {
+			if (inspector != null) {
+				inspector.onQpackStreamUnblocked(Http3Client.this, streamId, exit, blockedMillis, blockedStreams);
+			}
+		}
+
+		@Override
+		public void onQpackBlockedSectionRefused(long streamId, int blockedStreams, long heldBytes) {
+			if (inspector != null) {
+				inspector.onQpackBlockedSectionRefused(Http3Client.this, streamId, blockedStreams, heldBytes);
+			}
+		}
+
+		@Override
+		public void onDatagramSent(long streamId, int payloadBytes, long sent) {
+			if (inspector != null) inspector.onDatagramSent(Http3Client.this, streamId, payloadBytes, sent);
+		}
+
+		@Override
+		public void onDatagramReceived(long streamId, int payloadBytes, long received) {
+			if (inspector != null) inspector.onDatagramReceived(Http3Client.this, streamId, payloadBytes, received);
+		}
+
+		@Override
+		public void onDatagramDroppedByQueue(long streamId, long droppedByQueue) {
+			if (inspector != null) inspector.onDatagramDroppedByQueue(Http3Client.this, streamId, droppedByQueue);
+		}
+
+		@Override
+		public void onDatagramDroppedByLoss(long droppedByLoss) {
+			if (inspector != null) inspector.onDatagramDroppedByLoss(Http3Client.this, droppedByLoss);
+		}
+
+		@Override
+		public void onDatagramRefusedOversize(
+			long streamId, int payloadBytes, long maxPayloadBytes, long refusedOversize
+		) {
+			if (inspector != null) {
+				inspector.onDatagramRefusedOversize(
+					Http3Client.this, streamId, payloadBytes, maxPayloadBytes, refusedOversize);
+			}
+		}
 	};
 
 	/** Requests holding a withheld {@code openBidirectional()}; bounded by {@code maxQueuedRequests}. */
@@ -262,6 +544,12 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 	private long requestsTimedOut;
 	private long connectionsOpened;
 	private long connectionsEvicted;
+	private long sessionTicketsOffered;
+	private long sessionTicketsStored;
+	private long zeroRttAttempted;
+	private long zeroRttAccepted;
+	private long zeroRttRejected;
+	private long earlyDataRetried;
 
 	private Http3Client(NioReactor reactor, IDnsClient dnsClient) {
 		super(reactor);
@@ -295,10 +583,50 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 		 * hostname is what SNI carries and what RFC 6125 endpoint identification is checked against, and
 		 * the QUIC transport parameters a {@link TlsClientConfig} also needs exist only per connection —
 		 * so one shared config could serve neither. The default trusts the platform's PKIX store.
+		 * <p>
+		 * A factory supplied here owns its own {@link TlsClientConfig} and therefore <b>opts out of this
+		 * client's resumption plumbing</b>: no session ticket is offered, no ticket store is filled, and
+		 * {@link Builder#withSessionCache} has no effect. A consumer wanting both must plumb
+		 * {@code withSessionTicket} / {@code withSessionCache} / {@code withEarlyDataEnabled} onto its own
+		 * config (research D-6 — {@code TlsEngineFactory}'s signature is deliberately untouched).
 		 */
 		public Builder withTlsEngineFactory(Function<String, TlsEngineFactory> tlsEngineFactory) {
 			checkNotBuilt(this);
 			Http3Client.this.tlsEngineFactory = tlsEngineFactory;
+			return this;
+		}
+
+		/**
+		 * Applied to every {@link TlsClientConfig} this client builds — the seam for a private trust
+		 * store, a pinned leaf or a {@code SecureRandom} of the consumer's own, <b>without</b> giving up
+		 * the resumption plumbing that {@link #withTlsEngineFactory} opts out of.
+		 * <p>
+		 * It is the narrower of the two hooks on purpose: this client keeps building the config, so the
+		 * ticket to offer, the store to fill and the early-data switch stay where research D-6 put them.
+		 * It has no effect at all when a whole engine factory is supplied, which owns its own config.
+		 */
+		public Builder withTlsClientConfig(Initializer<TlsClientConfig.Builder> tlsClientConfig) {
+			checkNotBuilt(this);
+			Http3Client.this.tlsClientConfig = Objects.requireNonNull(tlsClientConfig, "tlsClientConfig");
+			return this;
+		}
+
+		/**
+		 * The store this client takes session tickets from and puts them into, keyed by
+		 * {@code (server name, port, ALPN)} — one a consumer can share between several {@link Http3Client}
+		 * instances in a process, or persist across restarts (FR-059).
+		 * <p>
+		 * Absent, a bounded in-memory LRU of {@link QuicConnectionSettings#maxSessionTickets()} entries is
+		 * built on first use, and only when {@link Http3Settings#zeroRttEnabled()} — with 0-RTT off,
+		 * nothing here is reached and nothing is allocated.
+		 * <p>
+		 * The store is read and written on the reactor thread only, and neither blocks nor returns a
+		 * {@code Promise}; <b>persisting tickets extends the replay window the consumer is accepting</b>.
+		 * See {@link QuicSessionCache}.
+		 */
+		public Builder withSessionCache(QuicSessionCache sessionCache) {
+			checkNotBuilt(this);
+			Http3Client.this.sessionCache = Objects.requireNonNull(sessionCache, "sessionCache");
 			return this;
 		}
 
@@ -372,6 +700,28 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 		return exchange.result;
 	}
 
+	/**
+	 * FR-068: whether {@code request} may be put in a 0-RTT packet, which is to say whether it is safe to
+	 * have sent it should the server then refuse the early data.
+	 * <p>
+	 * Two conditions, both necessary:
+	 * <ul>
+	 *   <li><b>Replayable.</b> No body — mechanical, and it applies to an opted-in request as much as to
+	 *       any other. A rejected request is re-issued by re-sending this very {@link HttpRequest}, and a
+	 *       message's body stream can be taken only once, so a retry of a body-bearing request would send
+	 *       the same request <i>without</i> its body rather than replaying it.</li>
+	 *   <li><b>Safe, or opted in.</b> A method that is safe per RFC 9110 §9.2.1 mirrors the default
+	 *       server-side policy of RFC 8470, so an ordinary application never provokes a rejection round
+	 *       trip; {@link Http3EarlyData#allow} is how a consumer says otherwise for one request.</li>
+	 * </ul>
+	 * A request this refuses is <b>held back</b> until the handshake completes, never failed: it was
+	 * never attempted, so it is never rejected and never retried.
+	 */
+	private static boolean permitsInEarlyData(HttpRequest request) {
+		if (request.hasBody()) return false;
+		return SAFE_METHODS.contains(request.getMethod()) || Http3EarlyData.isAllowed(request);
+	}
+
 	/** Takes ownership of {@code request} — a refusal owns the body nobody else will ever read. */
 	private Promise<HttpResponse> refuse(HttpRequest request, Exception e) {
 		requestsFailed++;
@@ -391,10 +741,29 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 		private final int port;
 
 		private final @Nullable ScheduledRunnable timeout;
+
+		/*
+		 * Per-attempt state. An exchange has one attempt, or — when its early data was refused — two
+		 * (FR-067). Everything below is reset by releaseAttempt(); everything above and below the next
+		 * comment block belongs to the exchange and survives a retry.
+		 */
 		private @Nullable PooledConnection connection;
 		private @Nullable Http3RequestStream requestStream;
 		private boolean queued;
 		private boolean requestSent;
+		/** Whether <i>this attempt</i> went out on a stream created while 0-RTT was the send level. */
+		private boolean sentAsEarlyData;
+
+		/**
+		 * The generation of the attempt in flight. An attempt that has been superseded — its stream
+		 * discarded, its promises failed on the way out — still reports its outcome, synchronously, from
+		 * inside the very call that supersedes it; comparing against this is what drops that outcome
+		 * instead of letting it complete the caller's promise with an internal failure.
+		 */
+		private int attempt;
+
+		/** FR-067's "at most once". Set before the discard that provokes the retry, never cleared. */
+		private boolean retried;
 
 		/**
 		 * Set by {@link #finish()} <b>before</b> the abort it precedes, because aborting fails whatever
@@ -419,10 +788,30 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 		}
 
 		void start() {
+			startAttempt();
+		}
+
+		/**
+		 * One attempt at this exchange: a connection, a stream on it, and the request/response pair over
+		 * that stream. Run once ordinarily, and a second time when the first attempt's early data was
+		 * refused (FR-067).
+		 * <p>
+		 * The generation is captured rather than read back, so a superseded attempt's outcome — which
+		 * arrives synchronously from inside the discard that superseded it — is dropped here rather than
+		 * reaching {@link #succeed} or {@link #fail}. That is the difference between a caller seeing the
+		 * retry's answer and a caller seeing the internal failure of an attempt nobody is waiting for.
+		 */
+		private void startAttempt() {
+			int myAttempt = attempt;
 			connectionTo(authority, host, port)
 				.then(this::openStream)
 				.then(this::exchange)
 				.subscribe((response, e) -> {
+					if (myAttempt != attempt) {
+						// This attempt has been superseded; its response, if any, is nobody's but ours.
+						if (response != null) Http3RequestStream.releaseMessage(response);
+						return;
+					}
 					if (e == null) {
 						succeed(response);
 					} else {
@@ -441,6 +830,14 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 			if (finished) {
 				// The timeout expired while the connect was in flight; nothing more is owed a stream.
 				return Promise.ofException(failure);
+			}
+			if (!pooled.handshake.isComplete() && !permitsInEarlyData(request)) {
+				// FR-068: held back, not refused. A stream opened now would put this request in a 0-RTT
+				// packet, and it is one that must not be replayed — so it waits for the handshake instead,
+				// which is one round trip rather than a rejection round trip. Nothing else changes: the
+				// request timeout still covers the wait (FR-052), and the connection is not held meanwhile,
+				// so it is not this exchange that keeps it out of an eviction.
+				return pooled.handshake.then(() -> openStream(pooled));
 			}
 			if (queuedRequests >= settings.maxQueuedRequests()) {
 				return Promise.ofException(new Http3Exception(Http3Errors.H3_REQUEST_REJECTED,
@@ -470,6 +867,9 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 
 		private Promise<HttpResponse> exchange(Http3RequestStream stream) {
 			requestStream = stream;
+			// The transport's own latch, read once: after the handshake it still reports where this stream
+			// came from, which is exactly the question a rejection asks (FR-055).
+			sentAsEarlyData = stream.isEarlyData();
 			if (finished) {
 				// Expired between the open resolving and this running; the stream is aborted rather than
 				// left holding a request nobody is waiting for.
@@ -484,7 +884,92 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 			return stream.sendRequest(request).then(() -> received);
 		}
 
+		// ------------------------------------------------------------ the two rejection signals (FR-067)
+
+		/**
+		 * The transport signal: the server accepted the pre-shared key and refused the early data, so
+		 * nothing this attempt sent was ever decrypted. Called for every in-flight exchange on the
+		 * connection that was refused; the ones this attempt does not own return immediately.
+		 * <p>
+		 * The <b>order</b> of the four steps is the whole of the correctness here, and it is the registry
+		 * anti-pattern this phase exists to avoid. {@code retried} and the generation move <i>first</i>,
+		 * because the discard two lines below fails this attempt's in-flight read and write
+		 * <b>synchronously</b> and their continuation is this exchange's own failure handler. With the
+		 * flag not yet set, that handler would complete the caller's promise with an internal failure and
+		 * the retry would never happen at all.
+		 */
+		private void retryAfterEarlyDataRejection(Http3Connection h3) {
+			if (finished || retried || !sentAsEarlyData) return;
+			PooledConnection pooled = connection;
+			if (pooled == null || pooled.h3 != h3) return;
+			Http3RequestStream stream = requestStream;
+			beginRetry();
+			releaseAttempt();
+			if (stream != null) h3.discardEarlyData(stream);
+			reactor.post(this::startAttempt);
+		}
+
+		/**
+		 * The {@code 425 (Too Early)} signal (RFC 8470 §5.2): the server took the early data but declined
+		 * to process this request from it. Re-issued on a fresh stream once the handshake is done.
+		 * <p>
+		 * The trigger is "this request went out in early data <b>and</b> the answer is 425", never the
+		 * status code alone. A 425 answering a request that carried no early data is an ordinary response
+		 * and belongs to the caller: retrying it would loop for ever against a server that answers 425
+		 * unconditionally.
+		 *
+		 * @return whether the response was taken over and the exchange re-issued
+		 */
+		private boolean retryAfterTooEarly(HttpResponse response) {
+			if (finished || retried || !sentAsEarlyData) return false;
+			if (response.getCode() != TOO_EARLY) return false;
+			PooledConnection pooled = connection;
+			if (pooled == null) return false;
+			Http3RequestStream stream = requestStream;
+			beginRetry();
+			// Nobody will ever be handed this response, so this is the path that owes its body a release.
+			Http3RequestStream.releaseMessage(response);
+			releaseAttempt();
+			// Unlike the transport signal, the server *has* seen this stream — it answered on it — so the
+			// ordinary abort is right and the silent discard would be wrong.
+			if (stream != null && !stream.isTerminated()) {
+				stream.abort(Http3Errors.H3_REQUEST_CANCELLED,
+					"The request was answered 425 (Too Early) and is being re-issued");
+			}
+			reactor.post(this::startAttempt);
+			return true;
+		}
+
+		/** The bookkeeping both signals share, before either of them touches anything that can fail. */
+		private void beginRetry() {
+			retried = true;
+			attempt++;
+			earlyDataRetried++;
+			if (inspector != null) inspector.onEarlyDataRetried(Http3Client.this, earlyDataRetried);
+		}
+
+		/**
+		 * Lets go of everything one attempt held — its queue slot, its connection slot, its stream — and
+		 * of nothing the exchange owns: the caller's promise, the request and the timeout that covers the
+		 * whole of it (FR-052) all survive into the next attempt.
+		 * <p>
+		 * The connection is <b>not</b> freed through {@link #connectionFreed}: the retry re-acquires it
+		 * through the ordinary pool path a tick later, and treating it as idle in between would invite an
+		 * eviction of the very connection the retry is about to ask for.
+		 */
+		private void releaseAttempt() {
+			dequeue();
+			PooledConnection pooled = connection;
+			connection = null;
+			requestStream = null;
+			requestSent = false;
+			sentAsEarlyData = false;
+			if (pooled != null && pooled.inFlight > 0) pooled.inFlight--;
+		}
+
 		private void succeed(HttpResponse response) {
+			// Before any bookkeeping: a 425 answering early data is not this exchange's outcome at all.
+			if (retryAfterTooEarly(response)) return;
 			// Read before finish(), whose continuations may complete the caller's promise and re-enter here.
 			Http3RequestStream stream = requestStream;
 			int statusCode = response.getCode();
@@ -563,6 +1048,15 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 	/** One pooled QUIC connection and the bookkeeping FR-049's eviction rule needs. */
 	private static final class PooledConnection {
 		private final Http3Connection h3;
+
+		/**
+		 * Completes when this connection's handshake has settled, one way or the other. Already complete
+		 * for every connection handed over the ordinary way, since that one waits for the handshake before
+		 * it is pooled at all; pending only for the 0-RTT hand-back of {@link #earlyDataConnection}, which
+		 * is the whole case it exists for — a request that may <b>not</b> travel in early data (FR-068)
+		 * waits on this rather than opening a stream that would.
+		 */
+		private final SettablePromise<Void> handshake = new SettablePromise<>();
 
 		/** Exchanges on this connection, each from the moment it asks for a stream to its response head. */
 		private int inFlight;
@@ -742,7 +1236,16 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 
 	private Promise<PooledConnection> connect(QuicEndpoint quicEndpoint, InetSocketAddress address, String host) {
 		justDialled = null;
-		Promise<QuicConnection> established = quicEndpoint.connectTo(address, tlsEngineFactory.apply(host));
+		Resumption resumption = resumptionFor(host, address.getPort());
+		pendingResumption = resumption;
+		Promise<QuicConnection> established;
+		try {
+			established = resumption == null ?
+				quicEndpoint.connectTo(address, tlsEngineFactory().apply(host)) :
+				quicEndpoint.connectTo(address, resumption.tlsEngineFactory(), resumption.rememberedParameters());
+		} finally {
+			pendingResumption = null;
+		}
 		Http3Connection h3 = justDialled;
 		justDialled = null;
 		if (h3 == null) {
@@ -752,7 +1255,88 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 				e :
 				new Http3Exception(Http3Errors.H3_INTERNAL_ERROR, "The dialled QUIC connection carries no HTTP/3 layer")));
 		}
-		return established.map($ -> new PooledConnection(h3));
+		if (h3.permitsEarlyData()) {
+			return Promise.of(earlyDataConnection(h3, established));
+		}
+		return established.map($ -> {
+			PooledConnection pooled = new PooledConnection(h3);
+			// Nothing was ever held back on this path: the handshake is already over by the time anybody
+			// can hold this connection at all.
+			pooled.handshake.set(null);
+			return pooled;
+		});
+	}
+
+	/**
+	 * FR-051: hands the caller a connection whose handshake is still running, which is the whole of
+	 * 0-RTT. The request that follows opens its stream against the {@linkplain
+	 * QuicConnection#earlyTransportParameters() remembered} transport parameters and leaves in a 0-RTT
+	 * packet rather than waiting for a {@code Finished} it does not need.
+	 * <p>
+	 * Reached only when {@link Http3Connection#permitsEarlyData()} holds — a stored ticket was offered
+	 * <b>and</b> it carried the remembered HTTP/3 SETTINGS of RFC 9114 §7.2.4.2 — which is false for
+	 * every dial made with {@link Http3Settings#zeroRttEnabled()} off, so the default path is phase 1's
+	 * verbatim (SC-011).
+	 * <p>
+	 * A handshake that then <b>fails</b> loses nothing: {@code QuicConnection} closes,
+	 * {@code QuicStreamManager} fails every stream and every withheld open with the transport
+	 * exception, and that is what the caller's promise carries — the same failure it would have carried
+	 * from the dial, arriving through the stream instead. What it does need is the close below: the
+	 * dial's promise no longer reports the failure to anybody, so a connection that died handshaking
+	 * would otherwise sit in the pool reading as usable and be handed to every later request for that
+	 * authority.
+	 * <p>
+	 * A handshake that succeeds while <b>refusing</b> the early data is a different matter and is
+	 * <b>US4's</b> (Phase 6, T093–T096): this reports the decision and nothing more, so the request
+	 * rides QUIC loss recovery back out at 1-RTT rather than being re-created on a fresh stream. That
+	 * is the reason {@code zeroRttEnabled} ships {@code false}.
+	 */
+	private PooledConnection earlyDataConnection(Http3Connection h3, Promise<QuicConnection> established) {
+		zeroRttAttempted++;
+		if (inspector != null) inspector.onZeroRttAttempted(this, zeroRttAttempted);
+		PooledConnection pooled = new PooledConnection(h3);
+		// One subscription on the dial, not two: everything this connection owes the handshake's outcome is
+		// settled from inside it, in order.
+		established.whenComplete((quicConnection, e) -> {
+			if (e != null) {
+				// Closed first, settled second: a request held back from early data resumes on this
+				// promise, and it must find a connection that is already gone rather than open a stream on
+				// one that is about to be.
+				h3.close();
+				pooled.handshake.trySetException(e);
+				return;
+			}
+			boolean accepted = quicConnection.isEarlyDataAccepted();
+			if (accepted) {
+				zeroRttAccepted++;
+			} else {
+				zeroRttRejected++;
+			}
+			if (inspector != null) {
+				inspector.onZeroRttDecision(this,
+					accepted ? ZeroRttOutcome.ACCEPTED : ZeroRttOutcome.REJECTED,
+					zeroRttAccepted, zeroRttRejected);
+			}
+			// Last: it releases the requests that were held back from early data (FR-068), and they open
+			// streams — which must find every counter of this connection already settled.
+			pooled.handshake.trySet(null);
+		});
+		return pooled;
+	}
+
+	/**
+	 * One connection's early data was refused (FR-067). Every exchange in flight <b>on that connection</b>
+	 * that went out in early data takes itself back and re-issues on a fresh 1-RTT stream; everything else
+	 * — a different connection's exchange, one that was held back from early data, one already retried —
+	 * returns untouched.
+	 * <p>
+	 * Over a copy of the set, because a retry lets go of its attempt and that removes nothing from
+	 * {@link #inFlight} but does run continuations that can.
+	 */
+	private void onEarlyDataRejected(Http3Connection h3) {
+		for (Exchange exchange : new ArrayList<>(inFlight)) {
+			exchange.retryAfterEarlyDataRejection(h3);
+		}
 	}
 
 	private Promise<InetAddress> resolve(String host) {
@@ -806,30 +1390,255 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 	}
 
 	/**
-	 * FR-058b: the two stream-related transport parameters this feature depends on are supplied as
-	 * <i>values</i>; encoding them is the transport's job and no part of this module's. A client advertises
-	 * them for the streams a <i>server</i> might open toward it — which in HTTP/3 is its control and QPACK
-	 * streams and nothing else.
+	 * FR-058b: the transport parameters this feature depends on are supplied as <i>values</i>; encoding
+	 * them is the transport's job and no part of this module's. Two are unconditional — the stream-related
+	 * pair, which a client advertises for the streams a <i>server</i> might open toward it, in HTTP/3 its
+	 * control and QPACK streams and nothing else — and one is conditional on an {@link Http3Settings}
+	 * switch. This private mapping is deliberately the <b>only</b> way an H3-level setting reaches the
+	 * transport: there is no public {@code withQuicSettings} pass-through, because a consumer handed the
+	 * whole {@link QuicConnectionSettings} could set a parameter that contradicts what this layer requires
+	 * — {@code initialMaxStreamsUni < 3} alone breaks the control stream plus both QPACK streams (FR-017).
+	 * <p>
+	 * With {@link Http3Settings#datagramsEnabled()} false — the default (FR-089) — nothing conditional is
+	 * called at all, so the builder produces exactly the value phase 1 produced, keeping
+	 * {@code max_datagram_frame_size} unadvertised (SC-011). Guarding rather than passing an explicit 0
+	 * is the point: 0 happens to be {@link QuicConnectionSettings#DEFAULT_MAX_DATAGRAM_FRAME_SIZE} today,
+	 * and the default path must not depend on that staying true.
+	 * <p>
+	 * {@link Http3Settings#zeroRttEnabled()} is <b>deliberately not mapped here</b>, and its absence is a
+	 * decision rather than an omission: 0-RTT needs a ticket store, sealing keys and a replay register,
+	 * none of which is a connection setting — they arrive on the TLS configs and the {@code QuicConnection}
+	 * builder in the 0-RTT slice (research D-6). The eight session-resumption bounds already on
+	 * {@code QuicConnectionSettings} are the transport's own defaults and stay untouched until then.
+	 * <p>
+	 * Three further {@link Http3Settings} fields have no counterpart by construction:
+	 * {@code maxInboundDatagramsPerStream} is per-exchange H3 state owned by {@code Http3RequestStream}
+	 * and never a QUIC parameter, {@code maxOutboundDatagrams} is QUIC-level with its own default and no
+	 * H3 switch, and the five QPACK settings are H3-only — they travel in SETTINGS, not in the handshake.
 	 */
 	private QuicConnectionSettings quicSettings() {
-		return QuicConnectionSettings.builder()
+		QuicConnectionSettings.Builder builder = QuicConnectionSettings.builder()
 			.withInitialMaxStreamsBidi(settings.maxConcurrentRequestStreams())
-			.withInitialMaxStreamsUni(settings.maxUniStreams())
-			.build();
+			.withInitialMaxStreamsUni(settings.maxUniStreams());
+		if (settings.datagramsEnabled()) {
+			builder.withMaxDatagramFrameSize(MemSize.bytes(QuicConnectionSettings.maxDatagramFrameSizeFor(
+				QuicConnectionSettings.DEFAULT_MAX_DATAGRAM_SIZE.toInt())));
+		}
+		return builder.build();
 	}
 
-	/** One {@link Http3Connection} per dialled QUIC connection; its stream manager is the frame handler. */
+	/**
+	 * One {@link Http3Connection} per dialled QUIC connection, which answers with the frame handler: its
+	 * stream manager alone, or, with {@link Http3Settings#datagramsEnabled()}, a composite that also
+	 * routes RFC 9221 DATAGRAM frames.
+	 */
 	private QuicFrameHandler onConnection(QuicConnection quicConnection) {
-		Http3Connection h3 = Http3Connection.builder(reactor, quicConnection)
+		Http3Connection.Builder builder = Http3Connection.builder(reactor, quicConnection)
 			.withSettings(settings)
 			.withEventListener(connectionEvents)
-			.build();
+			.withEarlyDataRejectionListener(this::onEarlyDataRejected);
+		Resumption resumption = pendingResumption;
+		if (resumption != null) {
+			SettingsFrame remembered = resumption.rememberedSettings();
+			if (remembered != null) builder.withRememberedSettings(remembered);
+			builder.withPeerSettingsListener(resumption::onPeerSettings);
+		}
+		Http3Connection h3 = builder.build();
 		justDialled = h3;
-		return h3.startAndGetStreamManager();
+		return h3.startAndGetFrameHandler();
 	}
 
-	private static TlsEngineFactory defaultTlsEngineFactory(String host) {
-		return params -> QuicTls.clientEngine(TlsClientConfig.builder(host, params).build());
+	private Function<String, TlsEngineFactory> tlsEngineFactory() {
+		Function<String, TlsEngineFactory> configured = tlsEngineFactory;
+		return configured != null ? configured : this::defaultTlsEngineFactory;
+	}
+
+	private TlsEngineFactory defaultTlsEngineFactory(String host) {
+		return params -> {
+			TlsClientConfig.Builder builder = TlsClientConfig.builder(host, params);
+			tlsClientConfig.initialize(builder);
+			return QuicTls.clientEngine(builder.build());
+		};
+	}
+
+	// ---------------------------------------------------------------- 0-RTT (FR-058, FR-059, FR-062)
+
+	/**
+	 * The store tickets are taken from and put into: the consumer's, else a bounded in-memory LRU built
+	 * on first use.
+	 * <p>
+	 * The clock is {@code reactor::currentTimeMillis} — the very supplier every {@link TlsClientConfig}
+	 * built here is given, which {@code TlsClientConfig}'s Javadoc requires, so that a ticket's issue
+	 * time and the store's expiry check are read off one clock.
+	 */
+	private QuicSessionCache sessionCache() {
+		QuicSessionCache cache = sessionCache;
+		if (cache == null) {
+			cache = InMemoryQuicSessionCache.create(quicSettings().maxSessionTickets(), reactor::currentTimeMillis);
+			sessionCache = cache;
+		}
+		return cache;
+	}
+
+	/**
+	 * The resumption attempt for one dial, or {@code null} when this client is not making one — which is
+	 * every dial with {@link Http3Settings#zeroRttEnabled()} off (the default), and every dial made with
+	 * a consumer-supplied TLS engine factory, which owns its own {@link TlsClientConfig}.
+	 * <p>
+	 * With 0-RTT off the caller's path is literally phase 1's: today's {@code defaultTlsEngineFactory}
+	 * and today's two-argument {@code connectTo}, byte for byte (SC-011).
+	 */
+	private @Nullable Resumption resumptionFor(String host, int port) {
+		if (!settings.zeroRttEnabled() || tlsEngineFactory != null) return null;
+		return new Resumption(host, port, sessionCache());
+	}
+
+	/**
+	 * One dialled connection's resumption state, and the {@link QuicSessionCache} the TLS engine writes
+	 * its tickets into — the two are one unit deliberately: the transport parameters a ticket remembers
+	 * and the HTTP/3 SETTINGS it remembers must never be stored apart, because using either without the
+	 * other is a protocol violation waiting to happen (FR-062, RFC 9114 §7.2.4.2).
+	 */
+	private final class Resumption implements QuicSessionCache {
+		private final String host;
+		private final int port;
+		private final QuicSessionCache store;
+
+		private final @Nullable QuicSessionTicket offered;
+		private final @Nullable SettingsFrame remembered;
+
+		/** This connection's own SETTINGS, once its control stream has delivered them. */
+		private @Nullable SettingsFrame peerSettings;
+
+		/**
+		 * Tickets that arrived before the peer's SETTINGS did — the orders are independent. Bounded by
+		 * the same per-connection ticket count the TLS engine enforces, so a server cannot grow it by
+		 * sending tickets and never sending SETTINGS (SI-3).
+		 */
+		private final List<QuicSessionTicket> pending = new ArrayList<>();
+		private final int maxPending;
+
+		/**
+		 * FR-043a's two bounds on post-handshake {@code NewSessionTicket} input, read from the transport's
+		 * settings once per dial and handed to the {@link TlsClientConfig} that enforces them. Read here
+		 * rather than in {@link #tlsEngineFactory()} so that {@link #maxPending} and the engine's own count
+		 * bound cannot come from two lookups that disagree.
+		 */
+		private final MemSize maxSessionTicketSize;
+		private final int maxSessionTicketsPerConnection;
+
+		Resumption(String host, int port, QuicSessionCache store) {
+			this.host = host;
+			this.port = port;
+			this.store = store;
+			QuicConnectionSettings quic = quicSettings();
+			this.maxSessionTicketSize = MemSize.bytes(quic.maxSessionTicketSize());
+			this.maxSessionTicketsPerConnection = quic.maxSessionTicketsPerConnection();
+			this.maxPending = maxSessionTicketsPerConnection;
+
+			QuicSessionTicket taken = store.take(host, port, ALPN_H3);
+			if (taken != null && taken.isExpiredAt(reactor.currentTimeMillis())) taken = null;
+			this.offered = taken;
+			// FR-062's single decision point: a ticket with no remembered SETTINGS still resumes the
+			// session, it just may not carry early data.
+			this.remembered = taken == null ? null : Http3RememberedSettings.of(taken, settings.maxControlFrameSize());
+		}
+
+		@Nullable SettingsFrame rememberedSettings() {
+			return remembered;
+		}
+
+		/** RFC 9000 §7.4.1: what 0-RTT data must be bounded by, and what the server may not reduce below. */
+		@Nullable QuicTransportParameters rememberedParameters() {
+			return offered == null ? null : offered.transportParameters();
+		}
+
+		/**
+		 * Research D-6: this is the <b>only</b> place resumption is plumbed. {@code TlsEngineFactory}'s
+		 * signature is untouched; the ticket to offer, the store to fill and the early-data switch all
+		 * travel on {@link TlsClientConfig}.
+		 * <p>
+		 * FR-043a's two bounds are applied <b>before</b> {@link Builder#withTlsClientConfig}'s initializer,
+		 * so a consumer that names either explicitly still wins; the transport's setting is the default
+		 * they replace, not a value written over theirs.
+		 */
+		TlsEngineFactory tlsEngineFactory() {
+			return params -> {
+				TlsClientConfig.Builder builder = TlsClientConfig.builder(host, params)
+					.withMaxSessionTicketSize(maxSessionTicketSize)
+					.withMaxSessionTicketsPerConnection(maxSessionTicketsPerConnection);
+				tlsClientConfig.initialize(builder);
+				builder.withCurrentTimeMillis(reactor::currentTimeMillis).withSessionCache(this, port);
+				if (offered != null) {
+					builder.withSessionTicket(offered);
+					sessionTicketsOffered++;
+					if (inspector != null) inspector.onSessionTicketOffered(Http3Client.this, sessionTicketsOffered);
+				}
+				// FR-062: no remembered SETTINGS, no early data — valid ticket or not.
+				if (remembered != null) builder.withEarlyDataEnabled(true);
+				return QuicTls.clientEngine(builder.build());
+			};
+		}
+
+		void onPeerSettings(SettingsFrame settingsFrame) {
+			peerSettings = settingsFrame;
+			if (pending.isEmpty()) return;
+			List<QuicSessionTicket> flushing = new ArrayList<>(pending);
+			pending.clear();
+			for (QuicSessionTicket ticket : flushing) {
+				store(ticket, settingsFrame);
+			}
+		}
+
+		/**
+		 * Never called: {@code TlsClientEngine} reads the ticket to offer from
+		 * {@code TlsClientConfig.withSessionTicket} and takes nothing from the store itself — this client
+		 * has already taken it, in this object's constructor. Answering {@code null} rather than
+		 * delegating keeps a second take (and so a second replay-window consumption) impossible.
+		 */
+		@Override
+		public @Nullable QuicSessionTicket take(String serverName, int remotePort, String alpn) {
+			return null;
+		}
+
+		@Override
+		public void put(String serverName, int remotePort, String alpn, QuicSessionTicket ticket) {
+			SettingsFrame settingsFrame = peerSettings;
+			if (settingsFrame == null) {
+				if (pending.size() >= maxPending) {
+					logger.debug("Discarding a session ticket for {}: {} are already awaiting this peer's SETTINGS",
+						host, pending.size());
+					return;
+				}
+				pending.add(ticket);
+				return;
+			}
+			store(ticket, settingsFrame);
+		}
+
+		/**
+		 * Re-issues {@code ticket} carrying the peer's SETTINGS and hands it to the real store. Everything
+		 * else is preserved verbatim — identity, issue time, lifetime, {@code ticket_age_add}, transport
+		 * parameters, server name, ALPN, cipher suite and resumption secret — so what is stored differs
+		 * from what the engine built in exactly one field.
+		 */
+		private void store(QuicSessionTicket ticket, SettingsFrame settingsFrame) {
+			QuicSessionTicket withSettings = QuicSessionTicket
+				.builder(ticket.serverName(), ticket.alpn(), ticket.cipherSuite(), ticket.resumptionSecret())
+				.withIdentity(ticket.identity())
+				.withIssuedAt(ticket.issuedAtMillis())
+				.withLifetime(ticket.lifetimeMillis())
+				.withTicketAgeAdd(ticket.ticketAgeAdd())
+				.withTransportParameters(ticket.transportParameters())
+				.withApplicationSettings(Http3RememberedSettings.encode(settingsFrame))
+				.build();
+			// Keyed by the ticket's own server name and ALPN, which is what InMemoryQuicSessionCache.put
+			// checks the ticket against — and which equals (host, "h3") by construction, since the engine
+			// takes the first from the TlsClientConfig built above and negotiates only the second.
+			store.put(withSettings.serverName(), port, withSettings.alpn(), withSettings);
+			sessionTicketsStored++;
+			if (inspector != null) inspector.onSessionTicketStored(Http3Client.this, sessionTicketsStored);
+		}
 	}
 
 	// ---------------------------------------------------------------- lifecycle
@@ -864,6 +1673,7 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 		}
 		retired.clear();
 		justDialled = null;
+		pendingResumption = null;
 		queuedRequests = 0;
 
 		if (endpoint != null) {
@@ -972,6 +1782,64 @@ public final class Http3Client extends AbstractNioReactive implements IHttpClien
 	public int activeRequests() {
 		checkInReactorThread(this);
 		return inFlight.size();
+	}
+
+	/**
+	 * Connections dialled offering a session ticket for resumption (FR-058). Zero with
+	 * {@link Http3Settings#zeroRttEnabled()} off, and zero on the first connection to any origin.
+	 */
+	public long sessionTicketsOffered() {
+		checkInReactorThread(this);
+		return sessionTicketsOffered;
+	}
+
+	/**
+	 * Session tickets put into the {@linkplain Builder#withSessionCache ticket store}, each carrying the
+	 * HTTP/3 SETTINGS of the connection that issued it (FR-062). A ticket the peer sent but whose
+	 * SETTINGS never arrived is not counted, because it was never stored.
+	 */
+	public long sessionTicketsStored() {
+		checkInReactorThread(this);
+		return sessionTicketsStored;
+	}
+
+	/**
+	 * Connections dialled with early data actually going out on them (FR-051): a ticket was offered and
+	 * it carried the remembered SETTINGS RFC 9114 §7.2.4.2 requires. Never greater than
+	 * {@link #sessionTicketsOffered()}, and 0 with {@link Http3Settings#zeroRttEnabled()} off.
+	 */
+	public long zeroRttAttempted() {
+		checkInReactorThread(this);
+		return zeroRttAttempted;
+	}
+
+	/** Attempts whose early data the server took, decided once per attempt at handshake completion. */
+	public long zeroRttAccepted() {
+		checkInReactorThread(this);
+		return zeroRttAccepted;
+	}
+
+	/**
+	 * Attempts whose early data the server refused. Not a failure — the session resumed, and every
+	 * request that went out in that early data is re-created on a fresh 1-RTT stream (FR-055, FR-067),
+	 * which {@link #earlyDataRetried()} counts.
+	 */
+	public long zeroRttRejected() {
+		checkInReactorThread(this);
+		return zeroRttRejected;
+	}
+
+	/**
+	 * Requests re-issued because their early data was rejected (FR-067), counting both signals — a
+	 * refused {@code early_data} extension and a {@code 425 (Too Early)} answer.
+	 * <p>
+	 * Per <b>request</b>, unlike {@link #zeroRttRejected()}, which is per connection: a rejected
+	 * connection carrying no request retries nothing, and one carrying several retries each of them. At
+	 * most one retry per request, so this can never exceed {@link #requestsIssued()}.
+	 */
+	public long earlyDataRetried() {
+		checkInReactorThread(this);
+		return earlyDataRetried;
 	}
 
 	@Override

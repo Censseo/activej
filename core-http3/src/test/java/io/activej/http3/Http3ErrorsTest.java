@@ -16,12 +16,14 @@
 
 package io.activej.http3;
 
+import io.activej.http3.frame.SettingsFrame;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 
 /**
- * Asserts every {@link Http3Errors} constant against its RFC 9114 §8.1 / RFC 9204 §6 value.
+ * Asserts every {@link Http3Errors} constant against its RFC 9114 §8.1 / RFC 9204 §6 / RFC 9297 §5
+ * value.
  */
 public class Http3ErrorsTest {
 	@Test
@@ -50,5 +52,19 @@ public class Http3ErrorsTest {
 		assertEquals(0x0200, Http3Errors.QPACK_DECOMPRESSION_FAILED);
 		assertEquals(0x0201, Http3Errors.QPACK_ENCODER_STREAM_ERROR);
 		assertEquals(0x0202, Http3Errors.QPACK_DECODER_STREAM_ERROR);
+	}
+
+	@Test
+	public void rfc9297DatagramErrorCode() {
+		assertEquals(0x33, Http3Errors.H3_DATAGRAM_ERROR);
+	}
+
+	/**
+	 * Error code 0x33 and setting identifier 0x33 are equal numbers in two registries RFC 9297 assigns
+	 * independently. Asserting the coincidence keeps a future reader from "fixing" one of them.
+	 */
+	@Test
+	public void theErrorCodeAndTheSettingIdentifierShareANumberAndNothingElse() {
+		assertEquals(Http3Errors.H3_DATAGRAM_ERROR, SettingsFrame.H3_DATAGRAM);
 	}
 }

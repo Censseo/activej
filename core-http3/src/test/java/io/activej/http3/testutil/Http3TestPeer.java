@@ -79,7 +79,9 @@ public final class Http3TestPeer {
 			h3 = Http3Connection.builder(Reactor.getCurrentReactor(), connection)
 				.withSettings(settings)
 				.build();
-			return h3.startAndGetStreamManager();
+			// Not startAndGetStreamManager(): with Http3Settings.datagramsEnabled() the stream manager alone
+			// is not the frame handler, and this peer is used with datagrams both off and on.
+			return h3.startAndGetFrameHandler();
 		});
 	}
 

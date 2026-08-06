@@ -19,6 +19,7 @@
     <module>datastream</module>
     <module>inject</module>
     <module>http</module>
+    <module>http3</module>
     <module>net</module>
     <module>promise</module>
     <module>rpc</module>

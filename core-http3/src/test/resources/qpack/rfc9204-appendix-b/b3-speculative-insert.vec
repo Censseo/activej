@@ -1,0 +1,54 @@
+# RFC 9204 Appendix B.3 -- Speculative Insert
+#
+# "The encoder inserts a header into the dynamic table with a literal name.  The decoder
+#  acknowledges receipt of the entry.  The encoder does not send any encoded field
+#  sections."
+#
+# Transcribed byte-for-byte from https://www.rfc-editor.org/rfc/rfc9204.txt (2026-08-04).
+# See ./README.md for the file format.
+
+name: B.3
+title: Speculative Insert
+rfc: RFC 9204 Appendix B.3
+continues-from: B.2
+stream: none
+
+max-table-capacity: 220
+table-capacity-before: 220
+table-capacity-after: 220
+max-entries: 6
+blocked-streams: 0
+delivery-order: encoder-stream, decoder-stream
+
+[encoder-stream]
+# Insert With Literal Name (custom-key=custom-value)
+# 0x4a = 0100_1010 -> pattern 01, H=0, 5-bit prefix name length = 10
+4a
+# "custom-key"
+63 75 73 74 6f 6d 2d 6b 65 79
+# 0x0c = H=0, value length 12
+0c
+# "custom-value"
+63 75 73 74 6f 6d 2d 76 61 6c 75 65
+
+[field-section]
+# empty -- this example sends no encoded field section
+
+[expected-fields]
+# empty
+
+[decoder-stream]
+# Insert Count Increment (1)
+# 0x01 = 0000_0001 -> pattern 00, 6-bit prefix increment = 1
+01
+
+[expected-table]
+# abs ref name value
+0 0 :authority www.example.com
+1 0 :path /sample/path
+2 0 custom-key custom-value
+
+[expected-state]
+insert-count: 3
+known-received-count: 3
+size: 160

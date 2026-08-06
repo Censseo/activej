@@ -16,6 +16,7 @@
 
 package io.activej.http3;
 
+import io.activej.common.MemSize;
 import io.activej.http.AsyncServlet;
 import io.activej.http.HttpResponse;
 import io.activej.http3.Http3Headers.Field;
@@ -25,6 +26,7 @@ import io.activej.http3.testutil.Http3TestTls;
 import io.activej.http3.testutil.Http3WirePair;
 import io.activej.http3.testutil.ManualEventloop;
 import io.activej.promise.Promise;
+import io.activej.quic.connection.QuicConnectionSettings;
 import io.activej.quic.stream.QuicStreamResetException;
 import io.activej.quic.stream.QuicStreamStopSendingException;
 import io.activej.reactor.Reactor;
@@ -62,6 +64,10 @@ import static org.junit.Assert.assertTrue;
 public final class Http3ExtendedConnectRefusalTest {
 	@ClassRule
 	public static final ByteBufRule byteBufRule = new ByteBufRule();
+
+	private static final Http3Settings DATAGRAMS_ON = Http3Settings.builder()
+		.withDatagramsEnabled(true)
+		.build();
 
 	/** Every path a servlet was asked for — empty is the assertion, in every test here. */
 	private final List<String> served = new ArrayList<>();
@@ -195,24 +201,83 @@ public final class Http3ExtendedConnectRefusalTest {
 		assertEquals("one QUIC connection carried both", 1, server.connectionsAccepted());
 	}
 
+	// ---------------------------------------------------------------- with HTTP/3 datagrams on
+
+	/**
+	 * T136, spec FR-087: RFC 9220 extended CONNECT is what WebTransport and MASQUE are built on, and
+	 * RFC 9297 datagrams are the other half of both — so the one configuration in which a reader might
+	 * expect the refusal to have quietly relaxed is the one where datagrams are enabled. It has not.
+	 * Datagrams here bind to ordinary request/response exchanges and to nothing else.
+	 */
+	@Test
+	public void anExtendedConnectIsRefusedUnchangedWithDatagramsEnabled() {
+		start(DATAGRAMS_ON);
+		assertTrue("the negotiation this case exists to be independent of did happen",
+			peer.connection().datagramsAvailable());
+
+		List<Field> fields = Http3TestBytes.requestFields("CONNECT", "/chat");
+		fields.add(new Field(":protocol", "webtransport"));
+		Promise<Http3TestPeer.Response> refused = peer.request(fields, null);
+		wire.driveUntil(refused::isComplete);
+
+		assertTrue("the request stream was reset: " + refused, refused.isException());
+		assertEquals(Http3Errors.H3_REQUEST_REJECTED, applicationErrorCodeOf(refused.getException()));
+		assertTrue("FR-087: the servlet never sees one, datagrams or no datagrams", served.isEmpty());
+		assertEquals("the refusal is a stream error and carried no datagram", 0, server.requestsServed());
+	}
+
+	@Test
+	public void aPlainConnectIsRefusedUnchangedWithDatagramsEnabled() {
+		start(DATAGRAMS_ON);
+
+		Promise<Http3TestPeer.Response> refused =
+			peer.request(Http3TestBytes.requestFields("CONNECT", "/tunnel"), null);
+		wire.driveUntil(refused::isComplete);
+
+		assertTrue(refused.isException());
+		assertEquals(Http3Errors.H3_REQUEST_REJECTED, applicationErrorCodeOf(refused.getException()));
+		assertTrue(served.isEmpty());
+
+		// And the connection is still usable, exactly as with datagrams off.
+		Promise<Http3TestPeer.Response> ordinary = peer.get("/ok");
+		wire.driveUntil(ordinary::isComplete);
+		assertEquals(200, ordinary.getResult().status());
+	}
+
 	// ---------------------------------------------------------------- harness
 
 	private void start() {
+		start(Http3Settings.create());
+	}
+
+	private void start(Http3Settings settings) {
 		AsyncServlet servlet = request -> {
 			served.add(request.getPath());
 			return HttpResponse.ok200().withBody("fine".getBytes(UTF_8)).toPromise();
 		};
 		wire = new Http3WirePair(loop);
-		peer = new Http3TestPeer(wire);
-		wire.withServerFactory(socket -> {
+		peer = new Http3TestPeer(wire, settings);
+		wire.withClientSettings(quicSettings(settings))
+			.withServerFactory(socket -> {
 				server = Http3Server.builder(reactor(), servlet)
 					.withSocket(socket)
 					.withServerIdentity(Http3TestTls.devIdentity())
+					.withSettings(settings)
 					.build();
 				server.listen();
 				return server;
 			})
 			.connect();
+	}
+
+	/** The peer's transport half of the datagram negotiation; {@code Http3Server} derives its own. */
+	private static QuicConnectionSettings quicSettings(Http3Settings settings) {
+		QuicConnectionSettings.Builder builder = QuicConnectionSettings.builder();
+		if (settings.datagramsEnabled()) {
+			builder.withMaxDatagramFrameSize(MemSize.bytes(QuicConnectionSettings.maxDatagramFrameSizeFor(
+				QuicConnectionSettings.DEFAULT_MAX_DATAGRAM_SIZE.toInt())));
+		}
+		return builder.build();
 	}
 
 	/** The application error code the server's reset carried, whatever shape the stream layer reported it in. */
