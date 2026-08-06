@@ -38,7 +38,13 @@ import io.activej.quic.codec.QuicVarInts;
  * that can see stream state (spec FR-082).
  * <p>
  * Buffers are borrowed on every method here: {@link #read} advances the payload's head past the varint
- * and leaves ownership where it found it, and a failed read leaves the head untouched.
+ * it consumes, leaving ownership where it found it. <b>A failed read does not always leave the head
+ * where it found it</b> — a truncated varint consumes nothing, because {@link QuicVarInts#read} checks
+ * the remaining length before advancing, but a range failure ({@link #decode}) is only discovered
+ * after the varint has been consumed in full, so the head has already moved past it. Every caller of
+ * {@link #read} is expected to abandon the buffer on either failure rather than keep reading it — the
+ * one caller in this package closes the connection instead — so the exact resting position is never
+ * relied upon.
  *
  * @see <a href="https://www.rfc-editor.org/rfc/rfc9297#section-2.1">RFC 9297 §2.1 — HTTP/3 Datagrams</a>
  */

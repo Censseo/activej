@@ -105,6 +105,10 @@ public class Http3QuarterStreamIdTest {
 
 		Http3Exception e = assertThrows(Http3Exception.class, () -> Http3QuarterStreamId.read(payload));
 		assertEquals(Http3Errors.H3_DATAGRAM_ERROR, e.errorCode());
+		// Unlike a truncated varint, the range check fires only after QuicVarInts.read has already
+		// consumed the (well-formed) varint — so, unlike the truncated case below, the head has moved.
+		// No caller relies on this; the class Javadoc says so explicitly.
+		assertEquals(3, payload.readRemaining());
 		payload.recycle();
 	}
 
