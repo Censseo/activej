@@ -33,6 +33,7 @@
     <module>core/datastream</module>
     <module>core/promise</module>
     <module>core/http</module>
+    <module>core/http3</module>
     <module>core/eventloop</module>
     <module>core/inject</module>
     <module>core/inject-2</module>

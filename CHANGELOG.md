@@ -215,6 +215,15 @@ explicitly.
 
 ### Notable additions
 
+- **`activej-test` gains `io.activej.test.EventloopThread`.** An `Eventloop` that
+  owns a dedicated daemon thread, with a blocking submit bridge and an idempotent,
+  time-bounded teardown (`keepAlive` released, thread joined, `breakEventloop()` as
+  a last resort). It is the tool for a test whose JUnit thread must *block* — on a
+  subprocess, on a second reactor, on a promise only that loop can complete — where
+  `EventloopRule`, which puts a loop on the current thread, cannot serve. Resources
+  are registered for teardown with `onClose(...)`, run on the loop in reverse
+  registration order. Purely additive; no existing rule or helper changed.
+
 - **HTTP/3 core, foundations.** A new leaf module `core-http3` (`activej-http3`,
   package `io.activej.http3`) begins RFC 9114 HTTP/3 with static-table RFC 9204
   QPACK, sitting above both `core-http` and `core-quic`. This entry covers the
@@ -733,3 +742,21 @@ explicitly.
   key schedule, certificate verification, ALPN and QUIC transport parameter
   negotiation. The engine is synchronous (non-reactive) per the QUIC module
   convention; thread confinement is the caller's contract.
+
+- **HTTP/3 launcher and examples.** Two new modules make HTTP/3 runnable as an
+  application rather than a library. `launchers/http3` (`activej-launchers-http3`,
+  default build) ships `Http3ServerLauncher` — a `Launcher` subclass wiring DI,
+  the service graph, `Config` and a `Http3ServerServiceAdapter` that bridges
+  `listen()`/`close()` into the service lifecycle — plus `Initializers`
+  (`ofHttp3Server(Config)` / `ofHttp3Settings(Config)`) and a demo `main`.
+  `examples/core/http3` (`examples-http3`, `-P examples`) ships `Http3HelloWorld`
+  and `Http3ClientExample` with a committed development-only self-signed
+  certificate (openssl command recorded beside it). The `core-http3` interop
+  harness additionally gains an automated, skipping regression suite
+  (`Http3CurlInteropTest`, `Http3RealSocketInteropTest`) that drives a real
+  foreign curl across seven cases when one is available.
+
+  **No default changed and no new `ApplicationSettings` limit was added.** Every
+  launcher config key falls back to `Http3Settings`' own defaults (or is
+  required, for the certificate pair); the feature only adds the two modules
+  above, so nothing that previously ran behaves differently after upgrading.
