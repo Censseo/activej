@@ -16,7 +16,6 @@
 
 package io.activej.http3.interop;
 
-import io.activej.async.callback.AsyncComputation;
 import io.activej.bytebuf.ByteBuf;
 import io.activej.common.function.SupplierEx;
 import io.activej.dns.IDnsClient;
@@ -24,7 +23,6 @@ import io.activej.dns.protocol.DnsQuery;
 import io.activej.dns.protocol.DnsResourceRecord;
 import io.activej.dns.protocol.DnsResponse;
 import io.activej.dns.protocol.DnsTransaction;
-import io.activej.eventloop.Eventloop;
 import io.activej.http.HttpRequest;
 import io.activej.http.HttpResponse;
 import io.activej.http.HttpVersion;
@@ -33,8 +31,8 @@ import io.activej.http3.Http3Exception;
 import io.activej.http3.testutil.Http3TestTls;
 import io.activej.promise.Promise;
 import io.activej.promise.SettablePromise;
+import io.activej.test.EventloopThread;
 import io.activej.test.rules.ByteBufRule;
-import org.jetbrains.annotations.Nullable;
 import org.junit.ClassRule;
 import org.junit.Test;
 
@@ -42,7 +40,6 @@ import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -69,7 +66,7 @@ import static org.junit.Assert.fail;
  * IPv4/IPv6 loopback preference.
  * <p>
  * <b>Threading</b> (FR-012): the server lives on the fixture's reactor thread; the client lives on
- * its own {@link Eventloop} thread (a {@link ClientLoop}), so the JUnit thread never touches a
+ * its own {@link EventloopThread}, so the JUnit thread never touches a
  * reactive component and the client survives the fixture's teardown — which
  * {@link #abruptServerCloseFailsPendingRequestUnwrapped} needs: the server is closed while an
  * exchange is in flight, and the client's pending promise fails when the closed server's
@@ -118,7 +115,8 @@ public final class Http3RealSocketInteropTest {
 	@Test
 	public void get() {
 		String caseName = "get";
-		try (Http3ServerReactorFixture fixture = newFixture(); ClientLoop loop = new ClientLoop()) {
+		try (Http3ServerReactorFixture fixture = newFixture();
+			EventloopThread loop = EventloopThread.create("http3-interop-client")) {
 			Http3Client client = newClient(loop, fixture);
 			HttpResponse response = awaitRequest(loop, client,
 				HttpRequest.get(url(fixture, "/")).build(), caseName + " — GET /");
@@ -138,7 +136,8 @@ public final class Http3RealSocketInteropTest {
 	@Test
 	public void largeBodyBothDirections() {
 		String caseName = "largeBodyBothDirections";
-		try (Http3ServerReactorFixture fixture = newFixture(); ClientLoop loop = new ClientLoop()) {
+		try (Http3ServerReactorFixture fixture = newFixture();
+			EventloopThread loop = EventloopThread.create("http3-interop-client")) {
 			Http3Client client = newClient(loop, fixture);
 			byte[] body = InteropBodies.patternBody(LARGE_BODY_SIZE, 0x5A);
 			HttpResponse response = awaitRequest(loop, client,
@@ -160,7 +159,8 @@ public final class Http3RealSocketInteropTest {
 	@Test
 	public void concurrentRequestsShareOneConnection() {
 		String caseName = "concurrentRequestsShareOneConnection";
-		try (Http3ServerReactorFixture fixture = newFixture(); ClientLoop loop = new ClientLoop()) {
+		try (Http3ServerReactorFixture fixture = newFixture();
+			EventloopThread loop = EventloopThread.create("http3-interop-client")) {
 			Http3Client client = newClient(loop, fixture);
 			List<byte[]> bodies = new ArrayList<>();
 			List<HttpRequest> requests = new ArrayList<>();
@@ -224,7 +224,7 @@ public final class Http3RealSocketInteropTest {
 				served.set(true);
 				return new SettablePromise<>();
 			});
-			ClientLoop loop = new ClientLoop()) {
+			EventloopThread loop = EventloopThread.create("http3-interop-client")) {
 			Http3Client client = newClient(loop, fixture);
 			Promise<HttpResponse> pending = loop.submit(() ->
 				client.request(HttpRequest.get(url(fixture, "/held")).build()));
@@ -259,7 +259,7 @@ public final class Http3RealSocketInteropTest {
 	 * handshake are real. The client trusts exactly the dev leaf, so RFC 6125 hostname verification
 	 * stays live against the certificate's {@code localhost} SAN.
 	 */
-	private static Http3Client newClient(ClientLoop loop, Http3ServerReactorFixture fixture) {
+	private static Http3Client newClient(EventloopThread loop, Http3ServerReactorFixture fixture) {
 		IDnsClient dns = new IDnsClient() {
 			@Override
 			public Promise<DnsResponse> resolve(DnsQuery query) {
@@ -276,19 +276,21 @@ public final class Http3RealSocketInteropTest {
 				.withTlsClientConfig(config -> config.withTrustManager(
 					Http3TestTls.trustingLeaf(Http3TestTls.devIdentity().leaf())))
 				.build());
-		loop.attach(client);
+		loop.onClose(client::close);
 		return client;
 	}
 
 	/** Issues {@code request} on the client's reactor thread and awaits its response. */
-	private static HttpResponse awaitRequest(ClientLoop loop, Http3Client client,
+	private static HttpResponse awaitRequest(EventloopThread loop, Http3Client client,
 		HttpRequest request, String what) {
 		return await(loop.submit(() -> client.request(request)), what);
 	}
 
 	/** Loads the response body on the client's reactor thread and returns its bytes, recycled. */
-	private static byte[] loadBody(ClientLoop loop, HttpResponse response) {
-		ByteBuf body = await(loop.submit(response::loadBody), "the response body");
+	private static byte[] loadBody(EventloopThread loop, HttpResponse response) {
+		// an explicit lambda, not response::loadBody: loadBody is overloaded, so the method reference
+		// is inexact and submit(RunnableEx) / submit(SupplierEx) become ambiguous
+		ByteBuf body = await(loop.submit(() -> response.loadBody()), "the response body");
 		try {
 			return toBytes(body);
 		} finally {
@@ -359,98 +361,5 @@ public final class Http3RealSocketInteropTest {
 		byte[] bytes = new byte[buf.readRemaining()];
 		System.arraycopy(buf.array(), buf.head(), bytes, 0, bytes.length);
 		return bytes;
-	}
-
-	/**
-	 * The client's reactor: one {@link Eventloop} on a dedicated daemon thread, mirroring the
-	 * fixture's shape (FR-012) so the JUnit thread never touches a reactive component. The loop is
-	 * held open with {@code keepAlive(true)} for its whole life and driven from the JUnit thread
-	 * through the same {@link AsyncComputation} submit bridge the fixture uses. Teardown is
-	 * idempotent and runs on every path: the attached {@link Http3Client} is closed on the loop
-	 * (its socket's selector key would otherwise hold the loop open), the loop is released and the
-	 * thread joined, with {@code breakEventloop()} as the last resort — so a failed assertion or a
-	 * timeout still leaves nothing behind.
-	 */
-	private static final class ClientLoop implements AutoCloseable {
-		private static final long CALL_TIMEOUT_SECONDS = 10;
-		private static final long JOIN_TIMEOUT_MILLIS = 10_000;
-		private static final long BREAK_JOIN_TIMEOUT_MILLIS = 2_000;
-
-		private final Eventloop eventloop = Eventloop.create();
-		private final Thread thread;
-
-		private @Nullable Http3Client client;
-		private boolean closed;
-
-		ClientLoop() {
-			eventloop.keepAlive(true);
-			thread = new Thread(eventloop, "http3-interop-client");
-			thread.setDaemon(true);
-			thread.start();
-		}
-
-		Eventloop eventloop() {
-			return eventloop;
-		}
-
-		void attach(Http3Client client) {
-			this.client = client;
-		}
-
-		/** Runs a computation on the loop's reactor thread and blocks the caller on the result (FR-012). */
-		<T> T submit(SupplierEx<T> computation) {
-			return await(eventloop.submit(AsyncComputation.of(computation)));
-		}
-
-		@Override
-		public void close() {
-			if (closed) return;
-			closed = true;
-			Exception failure = null;
-			if (client != null) {
-				try {
-					eventloop.submit(client::close).get(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-				} catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-					failure = e;
-				} catch (ExecutionException | TimeoutException e) {
-					failure = e;
-				}
-			}
-			eventloop.keepAlive(false);
-			try {
-				thread.join(JOIN_TIMEOUT_MILLIS);
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-				failure = failure == null ? e : failure;
-			}
-			if (thread.isAlive()) {
-				eventloop.breakEventloop();
-				try {
-					thread.join(BREAK_JOIN_TIMEOUT_MILLIS);
-				} catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-					// a stray interrupt at this last resort must not read as a clean teardown
-					failure = failure == null ? e : failure;
-				}
-			}
-			if (failure != null) {
-				throw new IllegalStateException("Client loop teardown did not complete cleanly", failure);
-			}
-		}
-
-		private static <T> T await(CompletableFuture<T> future) {
-			try {
-				return future.get(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-				throw new IllegalStateException("Interrupted while waiting for the client reactor", e);
-			} catch (ExecutionException e) {
-				throw new IllegalStateException("The client reactor task failed", e.getCause());
-			} catch (TimeoutException e) {
-				throw new IllegalStateException("The client reactor did not answer within " +
-					CALL_TIMEOUT_SECONDS + " seconds", e);
-			}
-		}
 	}
 }

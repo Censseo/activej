@@ -215,6 +215,15 @@ explicitly.
 
 ### Notable additions
 
+- **`activej-test` gains `io.activej.test.EventloopThread`.** An `Eventloop` that
+  owns a dedicated daemon thread, with a blocking submit bridge and an idempotent,
+  time-bounded teardown (`keepAlive` released, thread joined, `breakEventloop()` as
+  a last resort). It is the tool for a test whose JUnit thread must *block* — on a
+  subprocess, on a second reactor, on a promise only that loop can complete — where
+  `EventloopRule`, which puts a loop on the current thread, cannot serve. Resources
+  are registered for teardown with `onClose(...)`, run on the loop in reverse
+  registration order. Purely additive; no existing rule or helper changed.
+
 - **HTTP/3 core, foundations.** A new leaf module `core-http3` (`activej-http3`,
   package `io.activej.http3`) begins RFC 9114 HTTP/3 with static-table RFC 9204
   QPACK, sitting above both `core-http` and `core-quic`. This entry covers the

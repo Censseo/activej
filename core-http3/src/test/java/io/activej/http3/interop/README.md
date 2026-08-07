@@ -537,20 +537,45 @@ and a `bindZeroPort`-shaped launcher test, will both want `Http3Server.getBoundA
 recorded as an open question in `core-http3/CLAUDE.md` as well, since that is where the next feature
 will look.
 
-### Open finding — the dedicated-reactor-loop pattern is triplicated across test scopes (feature 007 review)
+### Resolved — the dedicated-reactor-loop pattern is now `io.activej.test.EventloopThread`
 
-`ClientProbe` (`launchers/http3` test scope), `Http3ServerReactorFixture` and
-`Http3RealSocketInteropTest`'s `ClientLoop` (both `core-http3` test scope) each hand-roll the same
-"own `Eventloop` on a daemon thread, submit-bridge, idempotent bounded close" helper. Module layering
-forces three copies — `launchers/http3` test scope has no dependency on `core-http3`'s test-jar, and
-no module in the reactor consumes another's test-jar today — so deduplicating means introducing that
-build edge or a new test-scope helper module. Deferred as a build-architecture decision, not a
-correctness fix: the 2026-08-06 review's teardown divergence (one copy swallowed an
-`InterruptedException` at the last-resort forced join) was instead fixed in all three copies. The same
-review's `trustingLeaf` duplication — `Http3ClientExample`'s copy is main-scope and can never depend
-on a test-scope class — is the same question one level up: a main-scope "trust exactly one leaf
-certificate" helper would serve any self-signed-cert example, but lives in no module FR-034 allows
-this feature to touch.
+The 2026-08-06 review found the "own an `Eventloop` on a daemon thread, submit-bridge, idempotent
+bounded close" helper hand-rolled three times: `ClientProbe` (`launchers/http3` test scope),
+`Http3ServerReactorFixture` and `Http3RealSocketInteropTest`'s `ClientLoop` (both `core-http3` test
+scope). It was first deferred on the grounds that deduplicating needed either a test-jar build edge
+or a new test-scope helper module.
+
+**That reasoning was wrong, and the finding is now closed.** The helper module already exists: `test`
+(`activej-test`) is a *main*-scope library of test utilities that both `core-http3` and
+`launchers/http3` already declare at test scope, and it already compiles against `activej-eventloop`
+(→ `Eventloop`, `AsyncComputation`) and, transitively, `activej-common` (→ `RunnableEx`,
+`SupplierEx`) — every type the three copies were built from. Extracting
+[`io.activej.test.EventloopThread`](../../../../../../../../test/src/main/java/io/activej/test/EventloopThread.java)
+there cost **no new build edge, no new module and no new dependency**, and it is not a `core-quic` or
+`core-http3` main-source change, so FR-034 was never in play.
+
+All three call sites now delegate to it, and the divergences the review flagged are gone rather than
+merely patched: teardown reports a stray `InterruptedException` instead of swallowing it,
+`ExecutionException` is unwrapped to its cause everywhere, and a setup failure unwinds through the
+full `close()` — including the last-resort `breakEventloop()` that `ClientProbe`'s hand-rolled unwind
+used to skip. A resource is registered for teardown with `onClose(...)`, which runs on the loop in
+reverse registration order; that is what absorbs the fixture's three-stage server/socket/channel
+cascade without the helper knowing anything about HTTP/3.
+
+Two notes for whoever touches this next:
+
+- The ~21 other tests in the repo that stand an `Eventloop` up on a thread (`HttpServerTest` alone has
+  eight) were **deliberately left alone**. They use unbounded joins and non-daemon threads; migrating
+  them is a separate, larger change. The helper is available to them.
+- `submit` is overloaded on `RunnableEx` and `SupplierEx`, so an **inexact** method reference (one
+  naming an overloaded or generic method, e.g. `response::loadBody`) is ambiguous by JLS 15.12.2.5 and
+  must be written as an explicit lambda. `javac` happens to accept some of these; ECJ does not.
+
+The same review's `trustingLeaf` duplication — `Http3ClientExample`'s copy is main-scope and can never
+depend on a test-scope class — is the same question one level up, and is **not** closed: a main-scope
+"trust exactly one leaf certificate" helper would serve any self-signed-cert example, but lives in no
+module FR-034 allows this feature to touch. It is planned for feature 008 alongside the bound-address
+accessor below.
 
 ### 2026-08-05 (T144) — the phase-1 `Http3Client` ↔ quic-go gap is **closed**, and Slice A does not touch it
 

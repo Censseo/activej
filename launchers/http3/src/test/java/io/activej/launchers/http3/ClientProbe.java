@@ -24,29 +24,26 @@ import io.activej.dns.IDnsClient;
 import io.activej.eventloop.Eventloop;
 import io.activej.http3.Http3Client;
 import io.activej.quic.tls.TlsClientConfig;
-
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import io.activej.test.EventloopThread;
 
 /**
  * The test-side bridge into the two reactors of a launcher test (T036/T037).
  * <p>
- * The {@link Http3Client} runs on its <b>own dedicated {@link Eventloop} thread</b> — the
- * {@code Http3RealSocketInteropTest} shape — not on the launcher's reactor. This is a recorded
- * divergence from the plan's shared-reactor wiring: under a saturated {@code -T1C verify} the
- * launcher's single reactor thread could not complete a QUIC handshake within the client's 10 s
- * bound when it also carried the server endpoint (observed 3×10 s timeouts in
- * task-results/T039.md), while the split-loop interop suite passed in the same run. The client is
+ * The {@link Http3Client} runs on its <b>own dedicated {@link Eventloop} thread</b> (an
+ * {@link EventloopThread}) — the {@code Http3RealSocketInteropTest} shape — not on the launcher's
+ * reactor. This is a recorded divergence from the plan's shared-reactor wiring: under a saturated
+ * {@code -T1C verify} the launcher's single reactor thread could not complete a QUIC handshake
+ * within the client's 10 s bound when it also carried the server endpoint (observed 3×10 s timeouts
+ * in task-results/T039.md), while the split-loop interop suite passed in the same run. The client is
  * still created by the test subclass's scanned {@code @Provides} (the launcher's DI graph), with
  * the TLS initializer supplied by the test — RFC 6125 stays live against the dev leaf.
  * <p>
- * The JUnit thread never touches a reactive component (SI-9): everything runs through
- * {@link Eventloop#submit(AsyncComputation)}, which posts to the owning reactor thread and blocks
- * the caller on the resulting future. Blocking is safe because both reactors run on their own
- * threads. {@link #onLauncher(...)} targets the launcher's reactor (servlet-side work);
- * {@link #onClient(...)} targets the client's (requests, bodies, close).
+ * The JUnit thread never touches a reactive component (SI-9): everything runs through a submit
+ * bridge that posts to the owning reactor thread and blocks the caller on the resulting future.
+ * Blocking is safe because both reactors run on their own threads. {@link #onLauncher(RunnableEx)}
+ * targets the launcher's reactor (servlet-side work), which this probe does <b>not</b> own — hence
+ * the static {@link EventloopThread#await} bridge rather than an owned loop;
+ * {@link #onClient(RunnableEx)} targets the client's, which it does.
  * <p>
  * The client is deliberately <b>not</b> a service: {@code Http3Client} is never bound as a DI key —
  * it is constructed inside {@code create(...)} on its own eventloop and reachable only through this
@@ -55,50 +52,39 @@ import java.util.concurrent.TimeoutException;
  * daemon thread.
  */
 public final class ClientProbe {
-	private static final long CALL_TIMEOUT_SECONDS = 10;
-	private static final long JOIN_TIMEOUT_MILLIS = 10_000;
-	private static final long BREAK_JOIN_TIMEOUT_MILLIS = 2_000;
-
 	private final Eventloop launcherEventloop;
-	private final Eventloop clientEventloop;
+	private final EventloopThread clientLoop;
 	private final Http3Client client;
-	private final Thread clientThread;
-	private boolean closed;
 
-	private ClientProbe(Eventloop launcherEventloop, Eventloop clientEventloop, Http3Client client, Thread clientThread) {
+	private ClientProbe(Eventloop launcherEventloop, EventloopThread clientLoop, Http3Client client) {
 		this.launcherEventloop = launcherEventloop;
-		this.clientEventloop = clientEventloop;
+		this.clientLoop = clientLoop;
 		this.client = client;
-		this.clientThread = clientThread;
 	}
 
 	/**
 	 * Starts the client loop and builds the {@link Http3Client} on it (WI-2: the client must be
 	 * constructed on its own reactor thread). A failure of the build — or of the bounded await —
-	 * unwinds the already-started loop: {@code keepAlive(true)} is reset and the thread reaped, so
-	 * no loop is left parked for the rest of the JVM.
+	 * unwinds the already-started loop through {@link EventloopThread#close()}, so no loop is left
+	 * parked for the rest of the JVM.
 	 */
 	public static ClientProbe create(Eventloop launcherEventloop, IDnsClient dnsClient,
 		Initializer<TlsClientConfig.Builder> tlsConfig) {
-		Eventloop clientEventloop = Eventloop.create();
-		clientEventloop.keepAlive(true);
-		Thread clientThread = new Thread(clientEventloop, "http3-launcher-test-client");
-		clientThread.setDaemon(true);
-		clientThread.start();
+		EventloopThread clientLoop = EventloopThread.create("http3-launcher-test-client");
 		try {
-			Http3Client client = await(clientEventloop.submit(AsyncComputation.of(() ->
-				Http3Client.builder(clientEventloop, dnsClient)
+			Http3Client client = clientLoop.submit(() ->
+				Http3Client.builder(clientLoop.eventloop(), dnsClient)
 					.withTlsClientConfig(tlsConfig)
-					.build())));
-			return new ClientProbe(launcherEventloop, clientEventloop, client, clientThread);
+					.build());
+			// its socket's selector key would otherwise hold the loop open past closeClient()
+			clientLoop.onClose(client::close);
+			return new ClientProbe(launcherEventloop, clientLoop, client);
 		} catch (RuntimeException | Error e) {
-			// The build failed or timed out: nothing on the loop holds it open, so releasing the
-			// keep-alive lets the loop exit and the (daemon) thread terminate on its own.
-			clientEventloop.keepAlive(false);
 			try {
-				clientThread.join(JOIN_TIMEOUT_MILLIS);
-			} catch (InterruptedException interrupted) {
-				Thread.currentThread().interrupt();
+				clientLoop.close();
+			} catch (RuntimeException | Error teardown) {
+				// a teardown that also fails must not mask what actually broke the build
+				e.addSuppressed(teardown);
 			}
 			throw e;
 		}
@@ -106,22 +92,23 @@ public final class ClientProbe {
 
 	/** Runs a computation on the <b>launcher's</b> reactor thread and returns its result. */
 	public <T> T onLauncher(SupplierEx<T> computation) {
-		return await(launcherEventloop.submit(AsyncComputation.of(computation)));
+		return EventloopThread.await(
+			launcherEventloop.submit(AsyncComputation.of(computation)), "the launcher reactor");
 	}
 
 	/** Runs an action on the <b>launcher's</b> reactor thread and blocks the caller until it ran. */
 	public void onLauncher(RunnableEx action) {
-		await(launcherEventloop.submit(action));
+		EventloopThread.await(launcherEventloop.submit(action), "the launcher reactor");
 	}
 
 	/** Runs a computation on the <b>client's</b> reactor thread and returns its result. */
 	public <T> T onClient(SupplierEx<T> computation) {
-		return await(clientEventloop.submit(AsyncComputation.of(computation)));
+		return clientLoop.submit(computation);
 	}
 
 	/** Runs an action on the <b>client's</b> reactor thread and blocks the caller until it ran. */
 	public void onClient(RunnableEx action) {
-		await(clientEventloop.submit(action));
+		clientLoop.submit(action);
 	}
 
 	public Http3Client client() {
@@ -135,49 +122,6 @@ public final class ClientProbe {
 	 * holds here too, since the client's socket lives on its own selector).
 	 */
 	public void closeClient() {
-		if (closed) return;
-		closed = true;
-		Exception failure = null;
-		try {
-			clientEventloop.submit(client::close).get(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			failure = e;
-		} catch (ExecutionException | TimeoutException e) {
-			failure = e;
-		}
-		clientEventloop.keepAlive(false);
-		try {
-			clientThread.join(JOIN_TIMEOUT_MILLIS);
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			failure = failure == null ? e : failure;
-		}
-		if (clientThread.isAlive()) {
-			clientEventloop.breakEventloop();
-			try {
-				clientThread.join(BREAK_JOIN_TIMEOUT_MILLIS);
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-				failure = failure == null ? e : failure;
-			}
-		}
-		if (failure != null) {
-			throw new IllegalStateException("Client loop teardown did not complete cleanly", failure);
-		}
-	}
-
-	private static <T> T await(CompletableFuture<T> future) {
-		try {
-			return future.get(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			throw new IllegalStateException("Interrupted while waiting for a launcher-test reactor", e);
-		} catch (ExecutionException e) {
-			throw new IllegalStateException("A launcher-test reactor task failed", e.getCause());
-		} catch (TimeoutException e) {
-			throw new IllegalStateException("A launcher-test reactor did not answer within " +
-				CALL_TIMEOUT_SECONDS + " seconds", e);
-		}
+		clientLoop.close();
 	}
 }
