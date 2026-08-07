@@ -34,11 +34,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -154,7 +151,7 @@ public final class Http3CurlInteropTest {
 			List<String> command = curlCommand("https://127.0.0.1:" + fixture.port() + "/");
 			Invocation invocation = CurlProbe.invoke(command);
 			byte[] expectedBody = InteropTestServlet.FIXED_BODY.getBytes(StandardCharsets.UTF_8);
-			verify(caseName, command, invocation, 200, expectedBody.length, sha256Hex(expectedBody));
+			verify(caseName, command, invocation, 200, expectedBody.length, InteropBodies.sha256Hex(expectedBody));
 		} finally {
 			fixture.close();
 		}
@@ -170,12 +167,12 @@ public final class Http3CurlInteropTest {
 		Http3ServerReactorFixture fixture = newFixture();
 		Path bodyFile = null;
 		try {
-			byte[] body = patternBody(SMALL_BODY_SIZE, 0x2A);
+			byte[] body = InteropBodies.patternBody(SMALL_BODY_SIZE, 0x2A);
 			bodyFile = writeBodyFile(body);
 			List<String> command = curlCommand("--data-binary", "@" + bodyFile,
 				"https://127.0.0.1:" + fixture.port() + "/echo");
 			Invocation invocation = CurlProbe.invoke(command);
-			verify(caseName, command, invocation, 200, body.length, sha256Hex(body));
+			verify(caseName, command, invocation, 200, body.length, InteropBodies.sha256Hex(body));
 		} finally {
 			fixture.close();
 			if (bodyFile != null) {
@@ -195,12 +192,12 @@ public final class Http3CurlInteropTest {
 		Http3ServerReactorFixture fixture = newFixture();
 		Path bodyFile = null;
 		try {
-			byte[] body = patternBody(LARGE_BODY_SIZE, 0x5A);
+			byte[] body = InteropBodies.patternBody(LARGE_BODY_SIZE, 0x5A);
 			bodyFile = writeBodyFile(body);
 			List<String> command = curlCommand("--data-binary", "@" + bodyFile,
 				"https://127.0.0.1:" + fixture.port() + "/echo");
 			Invocation invocation = CurlProbe.invoke(command);
-			verify(caseName, command, invocation, 200, body.length, sha256Hex(body));
+			verify(caseName, command, invocation, 200, body.length, InteropBodies.sha256Hex(body));
 		} finally {
 			fixture.close();
 			if (bodyFile != null) {
@@ -238,7 +235,7 @@ public final class Http3CurlInteropTest {
 			}
 			// The -o file holds the last transfer's body — GET / again.
 			byte[] expectedBody = InteropTestServlet.FIXED_BODY.getBytes(StandardCharsets.UTF_8);
-			verify(caseName, command, invocation, 200, expectedBody.length, sha256Hex(expectedBody));
+			verify(caseName, command, invocation, 200, expectedBody.length, InteropBodies.sha256Hex(expectedBody));
 
 			// Counters are read only now, with the process reaped (spec §Edge Cases).
 			assertEquals(failureMessage(caseName, command, invocation) +
@@ -265,13 +262,13 @@ public final class Http3CurlInteropTest {
 			for (int seed = 0; seed < CONCURRENT_PROCESSES; seed++) {
 				int finalSeed = seed;
 				futures.add(pool.submit(() -> {
-					byte[] body = patternBody(SMALL_BODY_SIZE, finalSeed);
+					byte[] body = InteropBodies.patternBody(SMALL_BODY_SIZE, finalSeed);
 					Path bodyFile = writeBodyFile(body);
 					try {
 						List<String> command = curlCommand("--data-binary", "@" + bodyFile,
 							"https://127.0.0.1:" + fixture.port() + "/echo");
 						Invocation invocation = CurlProbe.invoke(command);
-						verify(caseName + "#" + finalSeed, command, invocation, 200, body.length, sha256Hex(body));
+						verify(caseName + "#" + finalSeed, command, invocation, 200, body.length, InteropBodies.sha256Hex(body));
 						return invocation;
 					} finally {
 						Files.deleteIfExists(bodyFile);
@@ -317,7 +314,7 @@ public final class Http3CurlInteropTest {
 				"https://127.0.0.1:" + fixture.port() + "/headers");
 			Invocation invocation = CurlProbe.invoke(command);
 			byte[] expectedBody = HEADERS_BODY.getBytes(StandardCharsets.UTF_8);
-			verify(caseName, command, invocation, 200, expectedBody.length, sha256Hex(expectedBody));
+			verify(caseName, command, invocation, 200, expectedBody.length, InteropBodies.sha256Hex(expectedBody));
 
 			Map<String, String> responseFields = responseFields(invocation.stdout);
 			assertFieldEchoed(caseName, command, invocation, responseFields, REQUEST_FIELD_1, REQUEST_FIELD_VALUE_1);
@@ -340,7 +337,7 @@ public final class Http3CurlInteropTest {
 			List<String> command = curlCommand("https://127.0.0.1:" + fixture.port() + "/");
 			Invocation invocation = CurlProbe.invoke(command);
 			byte[] expectedBody = InteropTestServlet.FIXED_BODY.getBytes(StandardCharsets.UTF_8);
-			verify(caseName, command, invocation, 200, expectedBody.length, sha256Hex(expectedBody));
+			verify(caseName, command, invocation, 200, expectedBody.length, InteropBodies.sha256Hex(expectedBody));
 
 			long closeStarted = System.nanoTime();
 			fixture.close();
@@ -505,26 +502,9 @@ public final class Http3CurlInteropTest {
 		};
 	}
 
-	/** A deterministic body: distinct seeds give distinct bytes, so a mixed-up exchange is a mismatch. */
-	private static byte[] patternBody(int length, int seed) {
-		byte[] body = new byte[length];
-		for (int i = 0; i < length; i++) {
-			body[i] = (byte) (seed + i * 31);
-		}
-		return body;
-	}
-
 	private static Path writeBodyFile(byte[] body) throws IOException {
 		Path file = Files.createTempFile("activej-interop-request-", ".body");
 		Files.write(file, body);
 		return file;
-	}
-
-	private static String sha256Hex(byte[] bytes) {
-		try {
-			return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
-		} catch (NoSuchAlgorithmException e) {
-			throw new AssertionError("SHA-256 is always available", e);
-		}
 	}
 }

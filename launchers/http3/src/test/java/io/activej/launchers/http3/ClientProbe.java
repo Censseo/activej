@@ -74,7 +74,9 @@ public final class ClientProbe {
 
 	/**
 	 * Starts the client loop and builds the {@link Http3Client} on it (WI-2: the client must be
-	 * constructed on its own reactor thread).
+	 * constructed on its own reactor thread). A failure of the build — or of the bounded await —
+	 * unwinds the already-started loop: {@code keepAlive(true)} is reset and the thread reaped, so
+	 * no loop is left parked for the rest of the JVM.
 	 */
 	public static ClientProbe create(Eventloop launcherEventloop, IDnsClient dnsClient,
 		Initializer<TlsClientConfig.Builder> tlsConfig) {
@@ -83,11 +85,23 @@ public final class ClientProbe {
 		Thread clientThread = new Thread(clientEventloop, "http3-launcher-test-client");
 		clientThread.setDaemon(true);
 		clientThread.start();
-		Http3Client client = await(clientEventloop.submit(AsyncComputation.of(() ->
-			Http3Client.builder(clientEventloop, dnsClient)
-				.withTlsClientConfig(tlsConfig)
-				.build())));
-		return new ClientProbe(launcherEventloop, clientEventloop, client, clientThread);
+		try {
+			Http3Client client = await(clientEventloop.submit(AsyncComputation.of(() ->
+				Http3Client.builder(clientEventloop, dnsClient)
+					.withTlsClientConfig(tlsConfig)
+					.build())));
+			return new ClientProbe(launcherEventloop, clientEventloop, client, clientThread);
+		} catch (RuntimeException | Error e) {
+			// The build failed or timed out: nothing on the loop holds it open, so releasing the
+			// keep-alive lets the loop exit and the (daemon) thread terminate on its own.
+			clientEventloop.keepAlive(false);
+			try {
+				clientThread.join(JOIN_TIMEOUT_MILLIS);
+			} catch (InterruptedException interrupted) {
+				Thread.currentThread().interrupt();
+			}
+			throw e;
+		}
 	}
 
 	/** Runs a computation on the <b>launcher's</b> reactor thread and returns its result. */

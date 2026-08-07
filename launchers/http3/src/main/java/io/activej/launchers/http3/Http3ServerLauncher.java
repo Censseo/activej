@@ -122,23 +122,33 @@ public abstract class Http3ServerLauncher extends Launcher {
 	 * path</b> — never any part of the key material (FR-025, SI-6). There is no default identity:
 	 * a missing key is a required-key failure, and {@code TlsServerIdentity.fromPem}'s own messages
 	 * already carry only the path (verified), so the wrapping adds no secret.
+	 * <p>
+	 * Two failure shapes are wrapped here that are not "missing": a value {@code Paths.get} cannot
+	 * parse (an {@code InvalidPathException}, which {@code ConfigConverters.ofPath}'s
+	 * {@code SimpleConfigConverter} rethrows as a plain {@code IllegalArgumentException}) and a
+	 * signing-probe failure inside {@code TlsServerIdentity}'s constructor (a
+	 * {@code SignatureException} that {@code TlsSignatures} wraps in an {@code IllegalStateException}
+	 * which {@code fromPem}'s {@code throws} clause does not declare). Both must name the offending
+	 * key just as a missing one does.
 	 */
 	private static TlsServerIdentity loadIdentity(Config http3) {
 		Path certificateChain;
 		try {
 			certificateChain = http3.get(ofPath(), "certificateChain");
-		} catch (NoSuchElementException e) {
-			throw new RuntimeException("Required config key http3.certificateChain is not set", e);
+		} catch (NoSuchElementException | IllegalArgumentException e) {
+			throw new RuntimeException(
+				"Required config key http3.certificateChain is not set, or its value is not a valid path", e);
 		}
 		Path privateKey;
 		try {
 			privateKey = http3.get(ofPath(), "privateKey");
-		} catch (NoSuchElementException e) {
-			throw new RuntimeException("Required config key http3.privateKey is not set", e);
+		} catch (NoSuchElementException | IllegalArgumentException e) {
+			throw new RuntimeException(
+				"Required config key http3.privateKey is not set, or its value is not a valid path", e);
 		}
 		try {
 			return TlsServerIdentity.fromPem(certificateChain, privateKey);
-		} catch (IOException | IllegalArgumentException e) {
+		} catch (IOException | IllegalArgumentException | IllegalStateException e) {
 			throw new RuntimeException(
 				"Failed to load the HTTP/3 server identity: " +
 					"config key http3.certificateChain=" + certificateChain +
@@ -156,8 +166,8 @@ public abstract class Http3ServerLauncher extends Launcher {
 
 	/**
 	 * Registers the {@link Http3ServerServiceAdapter} so the service graph starts the server
-	 * ({@code listen()}) and stops it ({@code close()}) — see the adapter's Javadoc for why
-	 * {@code stop()} completes immediately.
+	 * ({@code listen()}) and stops it ({@code close()}) — see the adapter's Javadoc: its
+	 * {@code stop()} waits for the GOAWAY drain itself, bounded by the drain ceiling.
 	 */
 	@ProvidesIntoSet
 	Initializer<ServiceGraphModuleSettings> serviceGraphInitializer() {

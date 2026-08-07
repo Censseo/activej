@@ -59,6 +59,8 @@ public final class CurlProbe {
 	/** The per-invocation timeout property, seconds (contracts §6). */
 	public static final String TIMEOUT_PROPERTY = "activej.interop.timeoutSeconds";
 	public static final long DEFAULT_TIMEOUT_SECONDS = 30;
+	/** How long the captured-output readers may still be blocked after the process died. */
+	private static final long READER_JOIN_TIMEOUT_MILLIS = 2_000;
 
 	/** Resolved once per JVM, like an {@code ApplicationSettings} tunable — never mutated afterwards. */
 	public static final long TIMEOUT_SECONDS =
@@ -299,8 +301,19 @@ public final class CurlProbe {
 				process.destroyForcibly();
 				process.waitFor();
 			}
-			stdoutThread.join();
-			stderrThread.join();
+			// destroyForcibly() kills only the direct child; a wrapper script whose real client is a
+			// grandchild inheriting the output pipes keeps them open past the process's death, and
+			// the readers' readAllBytes() would then block forever. Bound the joins and, on expiry,
+			// close the pipes from this side so the readers fail out with what they captured — the
+			// reader threads are daemons, so nothing else is left to hang.
+			try {
+				stdoutThread.join(READER_JOIN_TIMEOUT_MILLIS);
+				if (stdoutThread.isAlive()) process.getInputStream().close();
+				stderrThread.join(READER_JOIN_TIMEOUT_MILLIS);
+				if (stderrThread.isAlive()) process.getErrorStream().close();
+			} catch (IOException e) {
+				// Closing a dead process's streams can fail; the readers are daemons — nothing to do.
+			}
 
 			return new ProcessOutcome(false, process.exitValue(), stdout.text, stderr.text, !finished);
 		} catch (IOException e) {

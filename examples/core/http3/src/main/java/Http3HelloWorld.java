@@ -120,11 +120,18 @@ public final class Http3HelloWorld extends Http3ServerLauncher {
 			return; // an explicit -Dconfig.* override replaces the dev identity entirely
 		}
 		Path dir = Files.createTempDirectory("activej-http3-example");
+		// deleteOnExit deletes in reverse registration order, so the directory is registered first
+		// (while empty) and the files it is about to hold after — otherwise the non-empty directory
+		// is never deleted and every run leaves the dev identity behind in the temp directory.
 		dir.toFile().deleteOnExit();
-		extractResource(DEV_CERT, dir.resolve(DEV_CERT));
-		extractResource(DEV_KEY, dir.resolve(DEV_KEY));
-		System.setProperty("config.http3.certificateChain", dir.resolve(DEV_CERT).toString());
-		System.setProperty("config.http3.privateKey", dir.resolve(DEV_KEY).toString());
+		Path cert = dir.resolve(DEV_CERT);
+		Path key = dir.resolve(DEV_KEY);
+		extractResource(DEV_CERT, cert);
+		extractResource(DEV_KEY, key);
+		cert.toFile().deleteOnExit();
+		key.toFile().deleteOnExit();
+		System.setProperty("config.http3.certificateChain", cert.toString());
+		System.setProperty("config.http3.privateKey", key.toString());
 	}
 
 	private static void extractResource(String name, Path target) throws IOException {

@@ -54,7 +54,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
+import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -86,6 +88,8 @@ public class Http3ServerLauncherTest {
 	private static final Path DEV_KEY_PATH = fixture("ecdsa-key.pem");
 	/** Per-promise await bound for cross-reactor promises (the launcher's reactor is another thread). */
 	private static final long AWAIT_TIMEOUT_SECONDS = 45;
+	/** How long a condition (e.g. "the exchange reached the servlet") is polled for. */
+	private static final long POLL_TIMEOUT_SECONDS = 10;
 
 	@ClassRule
 	public static final EventloopRule eventloopRule = new EventloopRule();
@@ -191,6 +195,47 @@ public class Http3ServerLauncherTest {
 	}
 
 	/**
+	 * T033, case C — FR-025: a certificate-chain value that is not even a valid path fails startup
+	 * naming the <b>config key</b>, with no key material in the message, and no socket was ever
+	 * bound. {@code ConfigConverters.ofPath} rethrows {@code Paths.get}'s {@code InvalidPathException}
+	 * as a plain {@code IllegalArgumentException}, so the launcher must wrap it with the key name
+	 * rather than letting it escape raw.
+	 */
+	@Test
+	public void certificatePathValueUnparseable() {
+		int port = TestUtils.getFreePort();
+		Throwable[] error = new Throwable[1];
+		Http3ServerLauncher launcher = new Http3ServerLauncher() {
+			@Provides
+			public AsyncServlet servlet() {
+				return request -> HttpResponse.ok200().toPromise();
+			}
+
+			@Override
+			Config config() {
+				// a value Paths.get cannot parse: an embedded NUL is an InvalidPathException on every OS
+				return super.config().overrideWith(Config.create()
+					.with("http3.listenAddresses", "localhost:" + port)
+					.with("http3.certificateChain", "bad\u0000path")
+					.with("http3.privateKey", DEV_KEY_PATH.toString()));
+			}
+
+			@Override
+			protected void onFatalError(Throwable throwable) {
+				error[0] = throwable;
+			}
+		};
+
+		launchCapturing(launcher, error);
+
+		assertStartupFailed(error,
+			"the message must name the config key",
+			"http3.certificateChain");
+		assertNoKeyMaterial(error);
+		assertNoServerWasBound(launcher);
+	}
+
+	/**
 	 * T036 — the serve test: a launched {@link Http3ServerLauncher} serves one request over HTTP/3
 	 * on an explicitly chosen port (never {@code :0} — {@code Http3Server} exposes no bound-address
 	 * accessor, research D11), and shuts down. The client half is wired <b>through the launcher's
@@ -203,6 +248,7 @@ public class Http3ServerLauncherTest {
 	public void servesOneRequest() {
 		int port = TestUtils.getFreePort();
 		probe = null;
+		Throwable[] fatal = new Throwable[1];
 		Http3ServerLauncher launcher = new Http3ServerLauncher() {
 			@Provides
 			AsyncServlet servlet() {
@@ -231,49 +277,71 @@ public class Http3ServerLauncherTest {
 					.with("http3.certificateChain", DEV_CERT_PATH.toString())
 					.with("http3.privateKey", DEV_KEY_PATH.toString()));
 			}
+
+			@Override
+			protected void onFatalError(Throwable throwable) {
+				// the launcher's default onFatalError is System.exit(-1) — capture instead, so a
+				// fatal error fails this test rather than killing the whole Surefire JVM
+				fatal[0] = throwable;
+			}
 		};
 
 		launchOnThread(launcher);
+		try {
+			// Launcher futures must be awaited with TestUtils.await: Promise.ofCompletionStage hops back
+			// into the *current* reactor (EventloopRule's), so the loop must be pumped while waiting —
+			// a bare toCompletableFuture().get() would deadlock (the launch thread is not a reactor).
+			await(ofCompletionStage(launcher.getStartFuture()));
 
-		// Launcher futures must be awaited with TestUtils.await: Promise.ofCompletionStage hops back
-		// into the *current* reactor (EventloopRule's), so the loop must be pumped while waiting —
-		// a bare toCompletableFuture().get() would deadlock (the launch thread is not a reactor).
-		await(ofCompletionStage(launcher.getStartFuture()));
+			ClientProbe probe = Http3ServerLauncherTest.probe;
+			assertNotNull("the test's @Eager ClientProbe must have been created during launch", probe);
 
-		ClientProbe probe = Http3ServerLauncherTest.probe;
-		assertNotNull("the test's @Eager ClientProbe must have been created during launch", probe);
+			HttpResponse response = requestWithHandshakeRetry(probe, "https://localhost:" + port + "/", "GET / over HTTP/3");
+			assertEquals("the response must report the exact HTTP_3_0 version enum value",
+				HttpVersion.HTTP_3_0, response.getVersion());
+			ByteBuf body = awaitBounded(probe.onClient(() -> {
+				return response.loadBody();
+			}), "the response body");
+			// asArray() recycles the buffer itself (CSP ownership: the body is ours)
+			assertArrayEquals("the body must be byte-identical to the servlet's fixed text",
+				FIXED_TEXT.getBytes(StandardCharsets.UTF_8),
+				body.asArray());
+			assertNoFatalError(fatal);
 
-		HttpResponse response = requestWithHandshakeRetry(probe, "https://localhost:" + port + "/", "GET / over HTTP/3");
-		assertEquals("the response must report the exact HTTP_3_0 version enum value",
-			HttpVersion.HTTP_3_0, response.getVersion());
-		ByteBuf body = awaitBounded(probe.onClient(() -> {
-			return response.loadBody();
-		}), "the response body");
-		// asArray() recycles the buffer itself (CSP ownership: the body is ours)
-		assertArrayEquals("the body must be byte-identical to the servlet's fixed text",
-			FIXED_TEXT.getBytes(StandardCharsets.UTF_8),
-			body.asArray());
-
-		probe.closeClient();
-		launcher.shutdown();
-		await(ofCompletionStage(launcher.getCompleteFuture()));
+			probe.closeClient();
+			launcher.shutdown();
+			await(ofCompletionStage(launcher.getCompleteFuture()));
+		} finally {
+			// A failure between launch and shutdown must not park anything: closeClient() and
+			// shutdown() are idempotent, the launch thread is a daemon, and the complete future is
+			// deliberately NOT awaited here — a failed test reports its own error instead of waiting
+			// on a launcher that may never complete.
+			if (Http3ServerLauncherTest.probe != null) {
+				try {
+					Http3ServerLauncherTest.probe.closeClient();
+				} catch (Exception ignored) {
+					// the test already failed; the daemon client thread cannot hang the JVM
+				}
+			}
+			launcher.shutdown();
+		}
 	}
 
 	/**
 	 * T037 — the D5 stop-contract property (SC-006a): an exchange <b>in flight</b> when the
 	 * launcher is stopped completes rather than being severed, and the JVM is left with no
-	 * non-daemon thread. This is what makes {@link Http3ServerServiceAdapter#stop}'s immediate
-	 * completion a tested property: the server's {@code close()} announces GOAWAY and starts the
-	 * drain (bounded by {@code http3.settings.shutdownTimeout}), the Eventloop service stopped
-	 * after the server joins the reactor thread, and that thread cannot exit while the drain's
-	 * scheduled task and the open sockets hold it — so the in-flight exchange finishes, and only
-	 * then does the launch complete.
+	 * non-daemon thread. {@link Http3ServerServiceAdapter#stop} makes this a tested property on
+	 * its own, without relying on the graph's stop ordering: it calls {@code close()}, releases the
+	 * reactor, and joins its thread — which {@code Eventloop}'s liveness rule keeps from exiting
+	 * while the drain's scheduled task and the endpoint's socket key exist, so the join returns
+	 * exactly when the GOAWAY drain (bounded by {@code http3.settings.shutdownTimeout}) has
+	 * finished — and only then does the launch complete.
 	 * <p>
-	 * Ordering is the assertion: the servlet's response promise is completed <b>after</b>
+	 * The assertion is temporal: the servlet's response promise is completed <b>after</b>
 	 * {@code shutdown()} was requested, and the request still resolves {@code 200} with the body.
-	 * The client is closed on the reactor <b>after</b> the response completes — its UDP socket's
-	 * selector key would otherwise hold the eventloop join (and closing it after
-	 * {@code getCompleteFuture()} would hang, the loop being gone).
+	 * The client is closed <b>after</b> the response completes — on the client's own loop, which is
+	 * independent of the launcher's, and closing it first is what lets the server's drain finish
+	 * early instead of riding out its ceiling.
 	 */
 	@Test
 	public void gracefulStopFinishesInFlightExchange() {
@@ -281,6 +349,7 @@ public class Http3ServerLauncherTest {
 		AtomicBoolean served = new AtomicBoolean();
 		SettablePromise<HttpResponse> heldResponse = new SettablePromise<>();
 		probe = null;
+		Throwable[] fatal = new Throwable[1];
 		Http3ServerLauncher launcher = new Http3ServerLauncher() {
 			@Provides
 			AsyncServlet servlet() {
@@ -312,66 +381,104 @@ public class Http3ServerLauncherTest {
 					// a generous GOAWAY drain ceiling: the exchange must survive the stop
 					.with("http3.settings.shutdownTimeout", "10 seconds"));
 			}
+
+			@Override
+			protected void onFatalError(Throwable throwable) {
+				// the launcher's default onFatalError is System.exit(-1) — capture instead, so a
+				// fatal error fails this test rather than killing the whole Surefire JVM
+				fatal[0] = throwable;
+			}
 		};
 
 		launchOnThread(launcher);
+		try {
+			await(ofCompletionStage(launcher.getStartFuture()));
 
-		await(ofCompletionStage(launcher.getStartFuture()));
+			ClientProbe probe = Http3ServerLauncherTest.probe;
+			assertNotNull("the test's @Eager ClientProbe must have been created during launch", probe);
 
-		ClientProbe probe = Http3ServerLauncherTest.probe;
-		assertNotNull("the test's @Eager ClientProbe must have been created during launch", probe);
-
-		String url = "https://localhost:" + port + "/";
-		Promise<HttpResponse> inFlight = null;
-		for (int attempt = 1; attempt <= 3; attempt++) {
-			inFlight = probe.onClient(() -> probe.client().request(HttpRequest.get(url).build()));
-			// wait for either the servlet invocation (the exchange is established) or a terminal
-			// promise failure (the dial failed before reaching the application)
-			while (!served.get() && !inFlight.isException()) {
+			String url = "https://localhost:" + port + "/";
+			Promise<HttpResponse> inFlight = null;
+			for (int attempt = 1; attempt <= 3; attempt++) {
+				inFlight = probe.onClient(() -> probe.client().request(HttpRequest.get(url).build()));
+				// Wait for either the servlet invocation (the exchange is established) or a terminal
+				// promise failure (the dial failed before reaching the application). The promise
+				// completes on the client's reactor thread, so only its CompletableFuture view is
+				// safe to poll from the JUnit thread (core-promise: never read a Promise's state
+				// across threads); the deadline keeps the poll itself from hanging a broken dial.
+				CompletableFuture<HttpResponse> future = inFlight.toCompletableFuture();
+				long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(POLL_TIMEOUT_SECONDS);
+				while (!served.get() && !future.isDone() && System.nanoTime() < deadline) {
+					try {
+						Thread.sleep(10);
+					} catch (InterruptedException e) {
+						Thread.currentThread().interrupt();
+						throw new AssertionError("Interrupted while awaiting the servlet invocation", e);
+					}
+				}
+				if (served.get()) {
+					break;
+				}
+				Exception failure;
 				try {
-					Thread.sleep(10);
+					future.get(0, TimeUnit.SECONDS);
+					throw new AssertionError("the request completed without reaching the servlet");
+				} catch (ExecutionException e) {
+					failure = (Exception) e.getCause();
+				} catch (TimeoutException e) {
+					throw new AssertionError("the request neither reached the servlet nor failed within " +
+						POLL_TIMEOUT_SECONDS + " seconds");
 				} catch (InterruptedException e) {
 					Thread.currentThread().interrupt();
 					throw new AssertionError("Interrupted while awaiting the servlet invocation", e);
 				}
+				if (isHandshakeTimeout(failure)) {
+					// a QUIC handshake that did not complete within the client's 10 s bound under a
+					// saturated parallel build is environmental — dial again; anything else is a bug
+					continue;
+				}
+				throw new AssertionError("the request failed before reaching the servlet: " + failure, failure);
 			}
-			if (served.get()) {
-				break;
+			if (!served.get()) {
+				throw new AssertionError("the request never reached the servlet after 3 dial attempts");
 			}
-			Exception failure = inFlight.getException();
-			if (isHandshakeTimeout(failure)) {
-				// a QUIC handshake that did not complete within the client's 10 s bound under a
-				// saturated parallel build is environmental — dial again; anything else is a bug
-				continue;
+
+			// stop requested while the exchange is in flight — the servlet's promise is still pending
+			launcher.shutdown();
+
+			// complete the servlet's response on the reactor, after the stop was requested: the drain
+			// must deliver the in-flight exchange, not sever it
+			probe.onLauncher(() -> heldResponse.set(
+				HttpResponse.ok200().withPlainText(FIXED_TEXT).build()));
+
+			HttpResponse response = awaitBounded(inFlight, "the in-flight exchange after launcher.shutdown()");
+			assertEquals("the drained exchange must resolve with the exact HTTP_3_0 version enum value",
+				HttpVersion.HTTP_3_0, response.getVersion());
+			ByteBuf body = awaitBounded(probe.onClient(() -> {
+				return response.loadBody();
+			}), "the in-flight exchange's body");
+			assertArrayEquals("the drained exchange must carry the servlet's fixed text",
+				FIXED_TEXT.getBytes(StandardCharsets.UTF_8),
+				body.asArray());
+			assertNoFatalError(fatal);
+
+			probe.closeClient();
+			await(ofCompletionStage(launcher.getCompleteFuture()));
+			assertNoNonDaemonThreadsLeft();
+		} finally {
+			// A failure between launch and shutdown must not park anything: closeClient() and
+			// shutdown() are idempotent, the launch thread is a daemon, and the complete future is
+			// deliberately NOT awaited here — a failed test reports its own error instead of waiting
+			// on a launcher that may never complete.
+			if (Http3ServerLauncherTest.probe != null) {
+				try {
+					Http3ServerLauncherTest.probe.closeClient();
+				} catch (Exception ignored) {
+					// the test already failed; the daemon client thread cannot hang the JVM
+				}
 			}
-			throw new AssertionError("the request failed before reaching the servlet: " + failure, failure);
+			launcher.shutdown();
 		}
-		if (!served.get()) {
-			throw new AssertionError("the request never reached the servlet after 3 dial attempts");
-		}
-
-		// stop requested while the exchange is in flight — the servlet's promise is still pending
-		launcher.shutdown();
-
-		// complete the servlet's response on the reactor, after the stop was requested: the drain
-		// must deliver the in-flight exchange, not sever it
-		probe.onLauncher(() -> heldResponse.set(
-			HttpResponse.ok200().withPlainText(FIXED_TEXT).build()));
-
-		HttpResponse response = awaitBounded(inFlight, "the in-flight exchange after launcher.shutdown()");
-		assertEquals("the drained exchange must resolve with the exact HTTP_3_0 version enum value",
-			HttpVersion.HTTP_3_0, response.getVersion());
-		ByteBuf body = awaitBounded(probe.onClient(() -> {
-			return response.loadBody();
-		}), "the in-flight exchange's body");
-		assertArrayEquals("the drained exchange must carry the servlet's fixed text",
-			FIXED_TEXT.getBytes(StandardCharsets.UTF_8),
-			body.asArray());
-
-		probe.closeClient();
-		await(ofCompletionStage(launcher.getCompleteFuture()));
-
-		assertNoNonDaemonThreadsLeft();
 	}
 
 	/**
@@ -404,7 +511,11 @@ public class Http3ServerLauncherTest {
 
 	// ---------------------------------------------------------------- helpers
 
-	/** Launches {@code launcher} on a dedicated thread, so the JUnit thread never blocks the reactor. */
+	/**
+	 * Launches {@code launcher} on a dedicated <b>daemon</b> thread, so the JUnit thread never
+	 * blocks the reactor — and a test failure that leaves {@code launch()} parked in
+	 * {@code awaitShutdown()} (no {@code try/finally} is airtight) cannot hang the Surefire JVM.
+	 */
 	private static void launchOnThread(Http3ServerLauncher launcher) {
 		Thread thread = new Thread(() -> {
 			try {
@@ -413,6 +524,7 @@ public class Http3ServerLauncherTest {
 				throw new AssertionError(e);
 			}
 		});
+		thread.setDaemon(true);
 		thread.start();
 	}
 
@@ -437,18 +549,17 @@ public class Http3ServerLauncherTest {
 
 	/**
 	 * Asserts the JVM is left with no non-daemon thread beyond the test's own thread and the
-	 * surefire JVM's {@code main}. The launcher's eventloop thread is joined by the Eventloop
-	 * service stop, the launch thread exits when {@code launch()} returns, and the service graph's
+	 * surefire JVM's {@code main}. The launcher's eventloop thread is joined by the adapter's stop
+	 * wait, the launch thread exits when {@code launch()} returns, and the service graph's
 	 * pool threads die after ~10 ms idle — so the assertion is retried briefly rather than racing
-	 * the pool's keep-alive.
+	 * the pool's keep-alive. Threads are enumerated through the root {@link ThreadGroup}, which
+	 * costs nothing like the JVM-wide stack snapshot of {@code Thread.getAllStackTraces()} would.
 	 */
 	private static void assertNoNonDaemonThreadsLeft() {
 		Thread current = Thread.currentThread();
 		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
 		while (true) {
-			List<Thread> offenders = Thread.getAllStackTraces().keySet().stream()
-				.filter(t -> !t.isDaemon() && t.isAlive() && t != current && !t.getName().equals("main"))
-				.toList();
+			List<Thread> offenders = nonDaemonThreadsExcept(current);
 			if (offenders.isEmpty()) {
 				return;
 			}
@@ -462,6 +573,33 @@ public class Http3ServerLauncherTest {
 				Thread.currentThread().interrupt();
 				throw new AssertionError("Interrupted while awaiting thread reaping", e);
 			}
+		}
+	}
+
+	private static List<Thread> nonDaemonThreadsExcept(Thread except) {
+		ThreadGroup root = Thread.currentThread().getThreadGroup();
+		while (root.getParent() != null) {
+			root = root.getParent();
+		}
+		Thread[] threads;
+		int count;
+		do {
+			// activeCount is an estimate; enumerate may silently truncate to the array length — retry
+			// with a bigger array until the count proves nothing was cut off
+			int estimate = root.activeCount() + 16;
+			threads = new Thread[estimate];
+			count = root.enumerate(threads, true);
+		} while (count == threads.length);
+		return Arrays.stream(threads, 0, count)
+			.filter(thread -> !thread.isDaemon() && thread.isAlive() &&
+				thread != except && !thread.getName().equals("main"))
+			.toList();
+	}
+
+	/** Asserts the launcher's {@code onFatalError} never fired (it would have killed the JVM by default). */
+	private static void assertNoFatalError(Throwable[] fatal) {
+		if (fatal[0] != null) {
+			throw new AssertionError("a fatal error escaped the launcher's launch flow", fatal[0]);
 		}
 	}
 

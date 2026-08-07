@@ -40,10 +40,7 @@ import org.junit.Test;
 
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -143,7 +140,7 @@ public final class Http3RealSocketInteropTest {
 		String caseName = "largeBodyBothDirections";
 		try (Http3ServerReactorFixture fixture = newFixture(); ClientLoop loop = new ClientLoop()) {
 			Http3Client client = newClient(loop, fixture);
-			byte[] body = patternBody(LARGE_BODY_SIZE, 0x5A);
+			byte[] body = InteropBodies.patternBody(LARGE_BODY_SIZE, 0x5A);
 			HttpResponse response = awaitRequest(loop, client,
 				HttpRequest.post(url(fixture, "/echo")).withBody(body).build(),
 				caseName + " — " + LARGE_BODY_SIZE + "-byte POST to /echo");
@@ -168,7 +165,7 @@ public final class Http3RealSocketInteropTest {
 			List<byte[]> bodies = new ArrayList<>();
 			List<HttpRequest> requests = new ArrayList<>();
 			for (int i = 0; i < CONCURRENT_REQUESTS; i++) {
-				byte[] body = patternBody(CONCURRENT_BODY_SIZE, i);
+				byte[] body = InteropBodies.patternBody(CONCURRENT_BODY_SIZE, i);
 				bodies.add(body);
 				requests.add(HttpRequest.post(url(fixture, "/echo")).withBody(body).build());
 			}
@@ -300,8 +297,8 @@ public final class Http3RealSocketInteropTest {
 	}
 
 	private static void assertBody(String what, byte[] expected, byte[] actual) {
-		String expectedDigest = sha256Hex(expected);
-		String actualDigest = sha256Hex(actual);
+		String expectedDigest = InteropBodies.sha256Hex(expected);
+		String actualDigest = InteropBodies.sha256Hex(actual);
 		if (expected.length != actual.length || !expectedDigest.equals(actualDigest)) {
 			fail(what + " — body mismatch: expected " + expected.length + " bytes, sha256 " +
 				expectedDigest + "; got " + actual.length + " bytes, sha256 " + actualDigest);
@@ -358,27 +355,10 @@ public final class Http3RealSocketInteropTest {
 		throw new AssertionError(what + " was not observed within " + POLL_TIMEOUT_SECONDS + " seconds");
 	}
 
-	/** A deterministic body: distinct seeds give distinct bytes, so a mixed-up exchange is a mismatch. */
-	private static byte[] patternBody(int length, int seed) {
-		byte[] body = new byte[length];
-		for (int i = 0; i < length; i++) {
-			body[i] = (byte) (seed + i * 31);
-		}
-		return body;
-	}
-
 	private static byte[] toBytes(ByteBuf buf) {
 		byte[] bytes = new byte[buf.readRemaining()];
 		System.arraycopy(buf.array(), buf.head(), bytes, 0, bytes.length);
 		return bytes;
-	}
-
-	private static String sha256Hex(byte[] bytes) {
-		try {
-			return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
-		} catch (NoSuchAlgorithmException e) {
-			throw new AssertionError("SHA-256 is always available", e);
-		}
 	}
 
 	/**
@@ -450,6 +430,8 @@ public final class Http3RealSocketInteropTest {
 					thread.join(BREAK_JOIN_TIMEOUT_MILLIS);
 				} catch (InterruptedException e) {
 					Thread.currentThread().interrupt();
+					// a stray interrupt at this last resort must not read as a clean teardown
+					failure = failure == null ? e : failure;
 				}
 			}
 			if (failure != null) {

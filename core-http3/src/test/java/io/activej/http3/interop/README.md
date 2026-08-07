@@ -537,6 +537,21 @@ and a `bindZeroPort`-shaped launcher test, will both want `Http3Server.getBoundA
 recorded as an open question in `core-http3/CLAUDE.md` as well, since that is where the next feature
 will look.
 
+### Open finding — the dedicated-reactor-loop pattern is triplicated across test scopes (feature 007 review)
+
+`ClientProbe` (`launchers/http3` test scope), `Http3ServerReactorFixture` and
+`Http3RealSocketInteropTest`'s `ClientLoop` (both `core-http3` test scope) each hand-roll the same
+"own `Eventloop` on a daemon thread, submit-bridge, idempotent bounded close" helper. Module layering
+forces three copies — `launchers/http3` test scope has no dependency on `core-http3`'s test-jar, and
+no module in the reactor consumes another's test-jar today — so deduplicating means introducing that
+build edge or a new test-scope helper module. Deferred as a build-architecture decision, not a
+correctness fix: the 2026-08-06 review's teardown divergence (one copy swallowed an
+`InterruptedException` at the last-resort forced join) was instead fixed in all three copies. The same
+review's `trustingLeaf` duplication — `Http3ClientExample`'s copy is main-scope and can never depend
+on a test-scope class — is the same question one level up: a main-scope "trust exactly one leaf
+certificate" helper would serve any self-signed-cert example, but lives in no module FR-034 allows
+this feature to touch.
+
 ### 2026-08-05 (T144) — the phase-1 `Http3Client` ↔ quic-go gap is **closed**, and Slice A does not touch it
 
 The symptom on record — "handshake and SETTINGS succeed, the request never reaches the peer's

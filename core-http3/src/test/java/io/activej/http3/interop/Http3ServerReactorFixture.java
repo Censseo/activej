@@ -189,6 +189,8 @@ public final class Http3ServerReactorFixture implements AutoCloseable {
 				reactorThread.join(BREAK_JOIN_TIMEOUT_MILLIS);
 			} catch (InterruptedException e) {
 				Thread.currentThread().interrupt();
+				// a stray interrupt at this last resort must not read as a clean teardown
+				failure = failure == null ? e : failure;
 			}
 		}
 		if (failure != null) {
