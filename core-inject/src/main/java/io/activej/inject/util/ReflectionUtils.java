@@ -29,6 +29,7 @@ import io.activej.types.Types;
 import org.jetbrains.annotations.Nullable;
 
 import java.lang.annotation.Annotation;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReferenceArray;
@@ -54,6 +55,14 @@ public final class ReflectionUtils {
 	private static final Pattern PACKAGE_AND_PARENT = Pattern.compile(PACKAGE.pattern() + "(?:" + IDENT + "\\$\\d*)?");
 	private static final Pattern ARRAY_SIGNATURE = Pattern.compile("\\[L(.*?);");
 	private static final Pattern RAW_PART = Pattern.compile("^" + IDENT);
+
+	/**
+	 * The enclosing instance that {@link #getOuterClassInstance} falls back to when the reflective
+	 * {@code this$0} lookup comes up empty. Held weakly, and only ever accepted when it is an
+	 * instance of the lexically enclosing class, so a stale entry resolves nothing rather than
+	 * resolving something wrong.
+	 */
+	private static final ThreadLocal<WeakReference<Object>> ENCLOSING_INSTANCE_HINT = new ThreadLocal<>();
 
 	public static String getDisplayName(Type type) {
 		Class<?> raw = Types.getRawType(type);
@@ -96,7 +105,35 @@ public final class ReflectionUtils {
 				throw new RuntimeException(e);
 			}
 		}
-		return null;
+		// javac emits the synthetic this$0 field only up to source level 17. From 18 on it omits the
+		// field whenever the anonymous class never reads the enclosing instance — which is exactly the
+		// shape of `new Key<A>() {}`. The instance is then unrecoverable by reflection: it is still
+		// passed to the constructor, but discarded rather than stored. So fall back to what the module
+		// publishes about itself while it is being constructed and while its configure() runs.
+		WeakReference<Object> hintRef = ENCLOSING_INSTANCE_HINT.get();
+		Object hint = hintRef != null ? hintRef.get() : null;
+		return enclosingClass.isInstance(hint) ? hint : null;
+	}
+
+	/**
+	 * Publishes {@code hint} as the enclosing instance that anonymous {@link Key} and
+	 * {@link KeyPattern} subclasses created on this thread resolve their type variables against,
+	 * returning whatever was published before so the caller can restore it.
+	 * <p>
+	 * This exists because javac stopped emitting the synthetic {@code this$0} field at source level
+	 * 18 — see {@link #getOuterClassInstance}, which consults this only after the reflective lookup
+	 * fails, and only when the hint is an instance of the lexically enclosing class. Binding then
+	 * substitutes exactly the type variables that class actually declares, so a hint that does not
+	 * fit leaves the type untouched and the usual "should not contain a type variable" error stands.
+	 */
+	public static @Nullable Object setEnclosingInstanceHint(@Nullable Object hint) {
+		WeakReference<Object> previous = ENCLOSING_INSTANCE_HINT.get();
+		if (hint == null) {
+			ENCLOSING_INSTANCE_HINT.remove();
+		} else {
+			ENCLOSING_INSTANCE_HINT.set(new WeakReference<>(hint));
+		}
+		return previous != null ? previous.get() : null;
 	}
 
 	public static @Nullable Object qualifierOf(AnnotatedElement annotatedElement) {

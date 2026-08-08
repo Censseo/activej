@@ -68,6 +68,12 @@ public abstract class AbstractModule implements Module {
 			.findFirst()
 			.orElse(null));
 		this.builder = new ModuleBuilderImpl<>(getName(), location);
+		// A subclass's field initializers run immediately after this constructor returns, so a
+		// `Key<A> key = new Key<>() {}` field is constructed under this hint. It is deliberately not
+		// restored afterwards — there is no point where that could be hooked — which is why the hint
+		// is held weakly and is only honoured for an instance of the anonymous class's own enclosing
+		// class. See ReflectionUtils.setEnclosingInstanceHint.
+		ReflectionUtils.setEnclosingInstanceHint(this);
 	}
 
 	/**
@@ -263,7 +269,14 @@ public abstract class AbstractModule implements Module {
 		builder.scan(getClass().getSuperclass(), this);
 		ReflectionUtils.scanClassInto(getClass(), this, builder); // so that provider methods and dsl bindings are in one 'export area'
 
-		configure();
+		// configure() is the other place user code writes `new Key<C>() {}` against the module's own
+		// type variables; unlike the constructor this one brackets cleanly.
+		Object previousHint = ReflectionUtils.setEnclosingInstanceHint(this);
+		try {
+			configure();
+		} finally {
+			ReflectionUtils.setEnclosingInstanceHint(previousHint);
+		}
 
 		Module module = builder.build();
 		builder = null;
