@@ -18,9 +18,11 @@ package io.activej.quic.connection;
 
 import io.activej.bytebuf.ByteBuf;
 import io.activej.bytebuf.ByteBufPool;
+import io.activej.net.socket.udp.IUdpSocket;
 import io.activej.promise.Promise;
 import io.activej.quic.codec.QuicFrame;
 import io.activej.quic.codec.StreamFrame;
+import io.activej.quic.connection.testutil.LossyUdpSocket;
 import io.activej.quic.connection.testutil.QuicEndpointFixture;
 import io.activej.quic.tls.EncryptionLevel;
 import io.activej.test.rules.ActivePromisesRule;
@@ -109,6 +111,15 @@ public final class QuicEndpointFrameHandlerFactoryTest {
 		// reach — the client's own connection came from connectTo and was never in this endpoint.
 		assertSame(server.connectionOf(connecting.getResult().peerConnectionId()), built.get(0));
 		assertTrue(built.get(0).hasFrameHandler());
+
+		// The fixture's sockets answer their address through the IUdpSocket interface: the @Override
+		// on LossyUdpSocket.getLocalAddress() must be a real override — a later signature drift (or a
+		// dropped @Override) would silently fall back to the default's null, and this gate fails
+		// rather than letting that go unnoticed. Self-equality between the two reference types is
+		// tautological; non-null through the interface is the claim that guards the rename.
+		LossyUdpSocket socket = fixture.lastSocket();
+		assertNotNull("the address must be reachable through the IUdpSocket interface",
+			((IUdpSocket) socket).getLocalAddress());
 	}
 
 	@Test

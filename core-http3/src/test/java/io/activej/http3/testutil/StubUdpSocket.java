@@ -127,7 +127,8 @@ public final class StubUdpSocket implements IUdpSocket {
 		}
 	}
 
-	public InetSocketAddress localAddress() {
+	@Override
+	public InetSocketAddress getLocalAddress() {
 		return localAddress;
 	}
 

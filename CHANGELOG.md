@@ -760,3 +760,9 @@ explicitly.
   launcher config key falls back to `Http3Settings`' own defaults (or is
   required, for the certificate pair); the feature only adds the two modules
   above, so nothing that previously ran behaves differently after upgrading.
+  One new failure mode is worth noting: `Http3ServerLauncher.onStart()` logs
+  the actually bound address through a **bounded** submit bridge to the
+  server's reactor (10 seconds), because the accessor is reactor-thread-guarded
+  and the hook runs on the launcher thread — a wedged reactor now fails startup
+  with `TimeoutException` rather than logging a stale configured address.
+

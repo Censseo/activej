@@ -79,6 +79,13 @@ public final class QuicEndpointFixture implements AutoCloseable {
 		return network;
 	}
 
+	/** The socket the most recently created endpoint was built over — the {@link LossyUdpSocket} the
+	 * fixture bound for it. A test that needs the socket itself (rather than the endpoint above it)
+	 * reaches it here instead of building its own. */
+	public LossyUdpSocket lastSocket() {
+		return sockets.get(sockets.size() - 1);
+	}
+
 	/** The TLS factory a server endpoint needs, using the dev ECDSA identity. */
 	public static TlsEngineFactory serverEngineFactory() {
 		TlsServerIdentity identity = QuicTestPeers.devIdentity();

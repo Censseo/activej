@@ -16,6 +16,7 @@
 
 package io.activej.launchers.http3;
 
+import io.activej.async.callback.AsyncComputation;
 import io.activej.config.Config;
 import io.activej.config.ConfigModule;
 import io.activej.eventloop.Eventloop;
@@ -40,6 +41,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
 import java.util.NoSuchElementException;
+import java.util.concurrent.TimeUnit;
 
 import static io.activej.config.Config.ofClassPathProperties;
 import static io.activej.config.Config.ofSystemProperties;
@@ -92,12 +94,11 @@ public abstract class Http3ServerLauncher extends Launcher {
 	public static final String HOSTNAME = "localhost";
 	public static final int PORT = 4433;
 	public static final String PROPERTIES_FILE = "http3-server.properties";
+	/** How long {@link #onStart()} waits for the reactor to answer the bound-address read before failing startup. */
+	private static final long BOUND_ADDRESS_TIMEOUT_SECONDS = 10;
 
 	@Inject
 	Http3Server http3Server;
-
-	@Inject
-	Config config;
 
 	@Provides
 	NioReactor reactor(Config config, OptionalDependency<ThrottlingController> throttlingController) {
@@ -193,21 +194,19 @@ public abstract class Http3ServerLauncher extends Launcher {
 	}
 
 	/**
-	 * Logs the address this server is available at — read from {@code Config}, the only source
-	 * there is: {@code Http3Server} exposes no bound-address accessor (research D11).
-	 * <p>
-	 * This must happen in {@code onStart()}, <b>not</b> in {@code run()}: {@code ConfigModule}
-	 * wraps every {@code Config} in a {@code ProtectedConfig} that refuses reads once the
-	 * launcher's {@code @OnStart} stage completes — which is exactly when {@code run()} executes.
-	 * {@code onStart()} runs before that stage completes, so the read is still "application
-	 * start-up time" there. {@code HttpServerLauncher} avoids the problem with a runtime accessor
-	 * ({@code getHttpAddresses()}); this launcher has none.
+	 * Logs the address this server is <b>actually bound</b> to, read through a bounded submit
+	 * bridge to the server's reactor: {@code getBoundAddress()} carries the reactor-thread guard
+	 * (FR-010), and this hook runs on the launcher's own thread (FR-021). The read stays in
+	 * {@code onStart()}, not {@code run()}: {@code Launcher} runs {@code startServices(...)} first,
+	 * so the server is already listening here (A-4) — and there is no {@code Config} read-back left
+	 * to protect.
 	 */
 	@Override
 	protected void onStart() throws Exception {
 		if (logger.isInfoEnabled()) {
-			InetSocketAddress address = config.get(ofInetSocketAddress(), "http3.listenAddresses",
-				new InetSocketAddress(HOSTNAME, PORT));
+			InetSocketAddress address = http3Server.getReactor()
+				.submit(AsyncComputation.of(() -> http3Server.getBoundAddress()))
+				.get(BOUND_ADDRESS_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 			logger.info("HTTP/3 Server is now available at https://{}", address);
 		}
 	}
