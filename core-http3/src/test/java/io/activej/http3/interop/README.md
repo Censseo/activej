@@ -580,10 +580,12 @@ Two notes for whoever touches this next:
   must be written as an explicit lambda. `javac` happens to accept some of these; ECJ does not.
 
 The same review's `trustingLeaf` duplication — `Http3ClientExample`'s copy is main-scope and can never
-depend on a test-scope class — is the same question one level up, and is **not** closed: a main-scope
-"trust exactly one leaf certificate" helper would serve any self-signed-cert example, but lives in no
-module FR-034 allows this feature to touch. It is planned for feature 008 alongside the bound-address
-accessor below.
+depend on a test-scope class — was the same question one level up, and is **closed by feature 008**:
+`TlsClientConfig.Builder.withTrustedCertificate(X509Certificate)`, placed beside
+`insecureTrustAll()` in `core-quic`, is the single implementation — trust exactly one end-entity
+certificate, with RFC 6125 hostname verification still on and client authentication refused — and
+all five copies migrated to it, this module's `Http3TestTls`/`Http3ClientFixture` and the main-scope
+`Http3ClientExample` copy included.
 
 ### 2026-08-05 (T144) — the phase-1 `Http3Client` ↔ quic-go gap is **closed**, and Slice A does not touch it
 

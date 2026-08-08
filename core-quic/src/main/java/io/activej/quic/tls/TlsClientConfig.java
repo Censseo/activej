@@ -27,6 +27,8 @@ import java.security.KeyPair;
 import java.security.KeyStore;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
 import java.util.Objects;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
@@ -42,8 +44,10 @@ import java.util.function.LongSupplier;
  * default PKIX {@link X509TrustManager} and — when the remote name is a hostname — the leaf
  * certificate must also pass RFC 6125 endpoint identification against that hostname. Both can be
  * tuned: {@link Builder#withTrustManager(X509TrustManager)} substitutes the chain validator,
- * {@link Builder#withEndpointIdentification(boolean)} toggles identification, and the explicitly
- * named {@link Builder#insecureTrustAll()} disables <b>both</b> — for development only.
+ * {@link Builder#withEndpointIdentification(boolean)} toggles identification,
+ * {@link Builder#withTrustedCertificate(X509Certificate)} pins the chain to exactly one
+ * development leaf while keeping identification on, and the explicitly named
+ * {@link Builder#insecureTrustAll()} disables <b>both</b> — for development only.
  * <p>
  * Built once via the one-shot {@link Builder} ({@code AbstractBuilder} convention); the
  * configuration is immutable after {@code build()} and never mutated mid-handshake (spec §Data
@@ -260,6 +264,39 @@ public final class TlsClientConfig {
 	}
 
 	/**
+	 * The trust manager behind {@link Builder#withTrustedCertificate}: accepts exactly the pinned
+	 * end-entity certificate — the leaf a self-signed development server presents — and nothing
+	 * else, and refuses client authentication. Deliberately the same accept/reject shape the
+	 * {@code trustingLeaf} test managers implement: chain element 0 must equal the pin (an empty
+	 * chain or any other end-entity certificate is rejected), the pin's validity window is
+	 * still checked (an expired or not-yet-valid pinned certificate is rejected, exactly as
+	 * the platform PKIX manager would reject it), and RFC 6125 endpoint identification
+	 * is <b>not</b> this manager's concern — it stays the engine's, applied after this validator
+	 * passes (unlike {@link Builder#insecureTrustAll()}, which skips both).
+	 */
+	private static X509TrustManager pinnedTrustManager(X509Certificate certificate) {
+		return new X509TrustManager() {
+			@Override
+			public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+				throw new CertificateException("Client authentication is not used");
+			}
+
+			@Override
+			public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+				if (chain.length == 0 || !chain[0].equals(certificate)) {
+					throw new CertificateException("Untrusted server chain");
+				}
+				chain[0].checkValidity();
+			}
+
+			@Override
+			public X509Certificate[] getAcceptedIssuers() {
+				return new X509Certificate[0];
+			}
+		};
+	}
+
+	/**
 	 * The one-shot {@code AbstractBuilder} for {@link TlsClientConfig}: every {@code withXxx}
 	 * is optional (safe defaults per FR-011/FR-017), {@code build()} freezes the configuration.
 	 */
@@ -284,6 +321,27 @@ public final class TlsClientConfig {
 			checkNotBuilt(this);
 			TlsClientConfig.this.trustAll = true;
 			TlsClientConfig.this.trustManager = null;
+			return this;
+		}
+
+		/**
+		 * Trusts exactly this certificate — the leaf a self-signed development server presents — and
+		 * nothing else. The certificate's validity window is still checked: an expired or
+		 * not-yet-valid pin is rejected.
+		 * <p>
+		 * Unlike {@link #insecureTrustAll()}, RFC 6125 endpoint identification is left at its
+		 * default (on for hostnames, off for IP literals — toggleable with
+		 * {@link #withEndpointIdentification(boolean)}). This is a pinning policy, not a bypass.
+		 * <p>
+		 * The peer's <b>end-entity</b> certificate must equal {@code certificate}; a chain merely
+		 * anchored at it is not accepted, because a self-signed development leaf anchors nothing. Client
+		 * authentication is refused. For a private CA, build an {@link X509TrustManager} from it and use
+		 * {@link #withTrustManager(X509TrustManager)}.
+		 */
+		public Builder withTrustedCertificate(X509Certificate certificate) {
+			checkNotBuilt(this);
+			TlsClientConfig.this.trustManager = pinnedTrustManager(Objects.requireNonNull(certificate, "certificate"));
+			TlsClientConfig.this.trustAll = false; // last call wins: the pin replaces a prior insecureTrustAll()
 			return this;
 		}
 

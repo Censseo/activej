@@ -26,10 +26,6 @@ import java.io.IOException;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.file.Path;
-import java.security.cert.CertificateException;
-import java.security.cert.X509Certificate;
-
-import javax.net.ssl.X509TrustManager;
 
 /**
  * The dev TLS identity an {@link Http3WirePair} handshakes with, plus the two {@link TlsEngineFactory}
@@ -78,37 +74,12 @@ public final class Http3TestTls {
 	public static TlsEngineFactory clientEngineFactory(String serverName) {
 		TlsServerIdentity identity = devIdentity();
 		return params -> QuicTls.clientEngine(TlsClientConfig.builder(serverName, params)
-			.withTrustManager(trustingLeaf(identity.leaf()))
+			.withTrustedCertificate(identity.leaf())
 			.build());
 	}
 
 	public static TlsEngineFactory clientEngineFactory() {
 		return clientEngineFactory(SERVER_NAME);
-	}
-
-	/**
-	 * A trust manager accepting exactly {@code leaf} — unlike {@code TlsClientConfig}'s
-	 * {@code insecureTrustAll}, which would also disable the endpoint-identification check.
-	 */
-	public static X509TrustManager trustingLeaf(X509Certificate leaf) {
-		return new X509TrustManager() {
-			@Override
-			public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-				throw new CertificateException("Client authentication is not used");
-			}
-
-			@Override
-			public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-				if (chain.length == 0 || !chain[0].equals(leaf)) {
-					throw new CertificateException("Untrusted server chain");
-				}
-			}
-
-			@Override
-			public X509Certificate[] getAcceptedIssuers() {
-				return new X509Certificate[0];
-			}
-		};
 	}
 
 	/** Resolves a fixture from {@code /io/activej/http3/testutil/} on the test classpath. */

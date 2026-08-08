@@ -108,7 +108,7 @@ public final class TlsResumptionSecretsStayOutOfLogsTest {
 		ScriptedTlsServer server = new ScriptedTlsServer(identity);
 		InMemoryQuicSessionCache cache = InMemoryQuicSessionCache.create(256, () -> NOW);
 		TlsEngine client = QuicTls.clientEngine(TlsClientConfig.builder("example.test", CLIENT_PARAMS)
-			.withTrustManager(trustingLeaf(identity.leaf()))
+			.withTrustedCertificate(identity.leaf())
 			.withSessionCache(cache, 443)
 			.withCurrentTimeMillis(() -> NOW)
 			.build());
@@ -262,7 +262,7 @@ public final class TlsResumptionSecretsStayOutOfLogsTest {
 
 	private static TlsEngine resumingClient(TlsServerIdentity identity, QuicSessionTicket ticket, boolean earlyData) {
 		return QuicTls.clientEngine(TlsClientConfig.builder("example.test", CLIENT_PARAMS)
-			.withTrustManager(trustingLeaf(identity.leaf()))
+			.withTrustedCertificate(identity.leaf())
 			.withSessionTicket(ticket)
 			.withEarlyDataEnabled(earlyData)
 			.withCurrentTimeMillis(() -> NOW)
@@ -271,7 +271,7 @@ public final class TlsResumptionSecretsStayOutOfLogsTest {
 
 	private static TlsEngine ticketAcceptingClient(TlsServerIdentity identity) {
 		return QuicTls.clientEngine(TlsClientConfig.builder("example.test", CLIENT_PARAMS)
-			.withTrustManager(trustingLeaf(identity.leaf()))
+			.withTrustedCertificate(identity.leaf())
 			.withCurrentTimeMillis(() -> NOW)
 			.build());
 	}

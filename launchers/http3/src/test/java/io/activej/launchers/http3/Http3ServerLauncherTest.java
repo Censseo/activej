@@ -46,14 +46,12 @@ import org.junit.ClassRule;
 import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
-import javax.net.ssl.X509TrustManager;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.Arrays;
 import java.util.List;
@@ -271,7 +269,7 @@ public class Http3ServerLauncherTest {
 			@Eager
 			ClientProbe probe(NioReactor launcherReactor, IDnsClient dnsClient) {
 				Http3ServerLauncherTest.probe = ClientProbe.create((Eventloop) launcherReactor, dnsClient,
-					config -> config.withTrustManager(trustingLeaf(devLeaf())));
+					config -> config.withTrustedCertificate(devLeaf()));
 				return Http3ServerLauncherTest.probe;
 			}
 
@@ -373,7 +371,7 @@ public class Http3ServerLauncherTest {
 			@Eager
 			ClientProbe probe(NioReactor launcherReactor, IDnsClient dnsClient) {
 				Http3ServerLauncherTest.probe = ClientProbe.create((Eventloop) launcherReactor, dnsClient,
-					config -> config.withTrustManager(trustingLeaf(devLeaf())));
+					config -> config.withTrustedCertificate(devLeaf()));
 				return Http3ServerLauncherTest.probe;
 			}
 
@@ -548,6 +546,100 @@ public class Http3ServerLauncherTest {
 			launcher.shutdown();
 			launcherLogger.detachAppender(appender);
 			launcherLogger.setLevel(originalLevel);
+		}
+	}
+
+	/**
+	 * T025 — FR-022, the launcher-level mirror of {@code HttpServerLauncherTest.bindZeroPort}:
+	 * configuring port {@code 0} yields a server reachable on a real, non-zero port discovered
+	 * through {@code Http3Server.getBoundAddress()} (SC-001).
+	 * <p>
+	 * The read is deliberately more verbose than the HTTP/1.1 equivalent, which reads
+	 * {@code getBoundAddresses()} straight from the JUnit thread:
+	 * {@code Http3Server.getBoundAddress()} carries the reactor-thread guard FR-010 keeps — a
+	 * deliberate divergence from {@code AbstractReactiveServer} — so the port must be read through
+	 * the {@link ClientProbe#onLauncher} submit bridge. That verbosity is the price of the guard,
+	 * not an accident (FR-027): do not "simplify" this test by deleting the guard.
+	 */
+	@Test
+	public void bindZeroPort() {
+		probe = null;
+		Throwable[] fatal = new Throwable[1];
+		Http3ServerLauncher launcher = new Http3ServerLauncher() {
+			@Provides
+			AsyncServlet servlet() {
+				return request -> HttpResponse.ok200()
+					.withPlainText(FIXED_TEXT)
+					.toPromise();
+			}
+
+			@Provides
+			IDnsClient dnsClient() {
+				return loopbackResolver();
+			}
+
+			@Provides
+			@Eager
+			ClientProbe probe(NioReactor launcherReactor, IDnsClient dnsClient) {
+				Http3ServerLauncherTest.probe = ClientProbe.create((Eventloop) launcherReactor, dnsClient,
+					config -> config.withTrustedCertificate(devLeaf()));
+				return Http3ServerLauncherTest.probe;
+			}
+
+			@Override
+			Config config() {
+				return super.config().overrideWith(Config.create()
+					.with("http3.listenAddresses", "localhost:0")
+					.with("http3.certificateChain", DEV_CERT_PATH.toString())
+					.with("http3.privateKey", DEV_KEY_PATH.toString()));
+			}
+
+			@Override
+			protected void onFatalError(Throwable throwable) {
+				// the launcher's default onFatalError is System.exit(-1) — capture instead, so a
+				// fatal error fails this test rather than killing the whole Surefire JVM
+				fatal[0] = throwable;
+			}
+		};
+
+		launchOnThread(launcher);
+		try {
+			await(ofCompletionStage(launcher.getStartFuture()));
+
+			ClientProbe probe = Http3ServerLauncherTest.probe;
+			assertNotNull("the test's @Eager ClientProbe must have been created during launch", probe);
+
+			int port = boundPort(launcher, probe);
+			HttpResponse response = requestWithHandshakeRetry(probe,
+				"https://localhost:" + port + "/",
+				"GET / over HTTP/3 on the port discovered through getBoundAddress()");
+			assertEquals("the response must report the exact HTTP_3_0 version enum value",
+				HttpVersion.HTTP_3_0, response.getVersion());
+			ByteBuf body = awaitBounded(probe.onClient(() -> {
+				return response.loadBody();
+			}), "the response body");
+			// asArray() recycles the buffer itself (CSP ownership: the body is ours)
+			assertArrayEquals("the body must be byte-identical to the servlet's fixed text",
+				FIXED_TEXT.getBytes(StandardCharsets.UTF_8),
+				body.asArray());
+			assertNoFatalError(fatal);
+
+			probe.closeClient();
+			launcher.shutdown();
+			await(ofCompletionStage(launcher.getCompleteFuture()));
+		} finally {
+			// A failure between launch and shutdown must not park anything: closeClient() and
+			// shutdown() are idempotent, the launch thread is a daemon, and the complete future is
+			// deliberately NOT awaited here — a failed test reports its own error instead of waiting
+			// on a launcher that may never complete.
+			if (Http3ServerLauncherTest.probe != null) {
+				try {
+					Http3ServerLauncherTest.probe.closeClient();
+				} catch (Exception ignored) {
+					// the test already failed; the daemon client thread cannot hang the JVM
+				}
+			}
+			launcher.shutdown();
 		}
 	}
 
@@ -814,28 +906,6 @@ public class Http3ServerLauncherTest {
 
 	private static X509Certificate devLeaf() {
 		return devIdentity().leaf();
-	}
-
-	/** A trust manager accepting exactly the dev leaf — the {@code Http3TestTls.trustingLeaf} shape. */
-	private static X509TrustManager trustingLeaf(X509Certificate leaf) {
-		return new X509TrustManager() {
-			@Override
-			public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-				throw new CertificateException("Client authentication is not used");
-			}
-
-			@Override
-			public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-				if (chain.length == 0 || !chain[0].equals(leaf)) {
-					throw new CertificateException("Untrusted server chain");
-				}
-			}
-
-			@Override
-			public X509Certificate[] getAcceptedIssuers() {
-				return new X509Certificate[0];
-			}
-		};
 	}
 
 	/** Resolves a fixture from {@code /io/activej/launchers/http3/} on the test classpath. */

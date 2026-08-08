@@ -75,7 +75,8 @@ import static org.junit.Assert.fail;
  * the loops' submit bridges and awaits the resulting promises via {@link Promise#toCompletableFuture()},
  * which the reactor threads keep completing while the JUnit thread blocks.
  * <p>
- * <b>TLS</b>: the client trusts exactly the dev leaf ({@link Http3TestTls#trustingLeaf}) — the
+ * <b>TLS</b>: the client trusts exactly the dev leaf
+ * ({@link io.activej.quic.tls.TlsClientConfig.Builder#withTrustedCertificate}) — the
  * existing test-fabric pattern — so RFC 6125 hostname verification stays live against the dev
  * certificate's {@code localhost} SAN. <b>No {@code EventloopRule}</b>: neither reactor is the JUnit
  * thread's.
@@ -273,8 +274,8 @@ public final class Http3RealSocketInteropTest {
 		};
 		Http3Client client = loop.submit(() ->
 			Http3Client.builder(loop.eventloop(), dns)
-				.withTlsClientConfig(config -> config.withTrustManager(
-					Http3TestTls.trustingLeaf(Http3TestTls.devIdentity().leaf())))
+				.withTlsClientConfig(config -> config.withTrustedCertificate(
+					Http3TestTls.devIdentity().leaf()))
 				.build());
 		loop.onClose(client::close);
 		return client;

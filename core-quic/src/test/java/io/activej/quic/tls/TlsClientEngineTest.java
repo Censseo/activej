@@ -57,7 +57,7 @@ public class TlsClientEngineTest {
 	public void fullHandshakeCompletesWithFinishedAndInstalledKeys() throws Exception {
 		TlsServerIdentity identity = rsaIdentity();
 		ScriptedTlsServer server = new ScriptedTlsServer(identity);
-		TlsEngine client = newClient("example.test", trustingLeaf(identity.leaf()));
+		TlsEngine client = newClient("example.test", identity.leaf());
 
 		byte[] clientHelloBytes = emitClientHello(client);
 		server.acceptClientHello(clientHelloBytes);
@@ -128,7 +128,7 @@ public class TlsClientEngineTest {
 		TlsServerIdentity identity = rsaIdentity();
 		ScriptedTlsServer server = new ScriptedTlsServer(identity);
 		// the fixture chain covers localhost + example.test — "other.test" is not covered
-		TlsEngine client = newClient("other.test", trustingLeaf(identity.leaf()));
+		TlsEngine client = newClient("other.test", identity.leaf());
 
 		server.acceptClientHello(emitClientHello(client));
 		TlsAlertException e = expectAlert(() -> {
@@ -161,7 +161,7 @@ public class TlsClientEngineTest {
 	public void serverFlightDribbledInSingleByteFragmentsCompletes() throws Exception {
 		TlsServerIdentity identity = rsaIdentity();
 		ScriptedTlsServer server = new ScriptedTlsServer(identity);
-		TlsEngine client = newClient("example.test", trustingLeaf(identity.leaf()));
+		TlsEngine client = newClient("example.test", identity.leaf());
 
 		server.acceptClientHello(emitClientHello(client));
 		// every level's CRYPTO stream arrives one byte per consume call — reassembly must
@@ -218,7 +218,7 @@ public class TlsClientEngineTest {
 	public void tamperedCertificateVerifyAbortsWithDecryptError() throws Exception {
 		TlsServerIdentity identity = rsaIdentity();
 		ScriptedTlsServer server = new ScriptedTlsServer(identity);
-		TlsEngine client = newClient("example.test", trustingLeaf(identity.leaf()));
+		TlsEngine client = newClient("example.test", identity.leaf());
 
 		server.acceptClientHello(emitClientHello(client));
 		client.consume(EncryptionLevel.INITIAL, wrap(server.serverHelloBytes));
@@ -231,7 +231,7 @@ public class TlsClientEngineTest {
 	public void tamperedServerFinishedAbortsWithDecryptError() throws Exception {
 		TlsServerIdentity identity = rsaIdentity();
 		ScriptedTlsServer server = new ScriptedTlsServer(identity);
-		TlsEngine client = newClient("example.test", trustingLeaf(identity.leaf()));
+		TlsEngine client = newClient("example.test", identity.leaf());
 
 		server.acceptClientHello(emitClientHello(client));
 		client.consume(EncryptionLevel.INITIAL, wrap(server.serverHelloBytes));
@@ -247,7 +247,7 @@ public class TlsClientEngineTest {
 		TlsServerIdentity identity = rsaIdentity();
 		ScriptedTlsServer server = new ScriptedTlsServer(identity);
 		server.serverRandomOverride = ServerHelloMessage.HELLO_RETRY_REQUEST_RANDOM;
-		TlsEngine client = newClient("example.test", trustingLeaf(identity.leaf()));
+		TlsEngine client = newClient("example.test", identity.leaf());
 
 		server.acceptClientHello(emitClientHello(client));
 		TlsHelloRetryRequestException e = assertThrows(TlsHelloRetryRequestException.class, () ->
@@ -260,7 +260,7 @@ public class TlsClientEngineTest {
 		TlsServerIdentity identity = rsaIdentity();
 		ScriptedTlsServer server = new ScriptedTlsServer(identity);
 		server.cipherSuiteOverride = 0x00ff;
-		TlsEngine client = newClient("example.test", trustingLeaf(identity.leaf()));
+		TlsEngine client = newClient("example.test", identity.leaf());
 
 		server.acceptClientHello(emitClientHello(client));
 		TlsAlertException e = expectAlert(() -> client.consume(EncryptionLevel.INITIAL, wrap(server.serverHelloBytes)));
@@ -275,7 +275,7 @@ public class TlsClientEngineTest {
 		byte[] p256Point = new byte[65];
 		p256Point[0] = 0x04;
 		server.keyShareOverride = new KeyShareEntry(NamedGroup.SECP256R1.code(), p256Point);
-		TlsEngine client = newClient("example.test", trustingLeaf(identity.leaf()));
+		TlsEngine client = newClient("example.test", identity.leaf());
 
 		server.acceptClientHello(emitClientHello(client));
 		TlsAlertException e = expectAlert(() -> client.consume(EncryptionLevel.INITIAL, wrap(server.serverHelloBytes)));
@@ -287,7 +287,7 @@ public class TlsClientEngineTest {
 		TlsServerIdentity identity = rsaIdentity();
 		ScriptedTlsServer server = new ScriptedTlsServer(identity);
 		server.sessionIdEchoOverride = new byte[] {1, 2, 3}; // the client sent an empty legacy session id
-		TlsEngine client = newClient("example.test", trustingLeaf(identity.leaf()));
+		TlsEngine client = newClient("example.test", identity.leaf());
 
 		server.acceptClientHello(emitClientHello(client));
 		TlsAlertException e = expectAlert(() -> client.consume(EncryptionLevel.INITIAL, wrap(server.serverHelloBytes)));
@@ -300,7 +300,7 @@ public class TlsClientEngineTest {
 	public void postHandshakeNewSessionTicketIsParsedAndDiscarded() throws Exception {
 		TlsServerIdentity identity = rsaIdentity();
 		ScriptedTlsServer server = new ScriptedTlsServer(identity);
-		TlsEngine client = newClient("example.test", trustingLeaf(identity.leaf()));
+		TlsEngine client = newClient("example.test", identity.leaf());
 		completeHandshake(client, server);
 
 		byte[] ticket = ScriptedTlsServer.serialize(
@@ -320,7 +320,7 @@ public class TlsClientEngineTest {
 	public void tlsKeyUpdateMessageAbortsWithUnexpectedMessage() throws Exception {
 		TlsServerIdentity identity = rsaIdentity();
 		ScriptedTlsServer server = new ScriptedTlsServer(identity);
-		TlsEngine client = newClient("example.test", trustingLeaf(identity.leaf()));
+		TlsEngine client = newClient("example.test", identity.leaf());
 		completeHandshake(client, server);
 
 		// KeyUpdate: handshake type 24, one-byte body (update_not_requested) — forbidden in QUIC (RFC 9001 §6)
@@ -369,25 +369,10 @@ public class TlsClientEngineTest {
 			.build());
 	}
 
-	static X509TrustManager trustingLeaf(X509Certificate leaf) {
-		return new X509TrustManager() {
-			@Override
-			public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-				throw new CertificateException("Client authentication is not used");
-			}
-
-			@Override
-			public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-				if (chain.length == 0 || !chain[0].equals(leaf)) {
-					throw new CertificateException("Untrusted server chain");
-				}
-			}
-
-			@Override
-			public X509Certificate[] getAcceptedIssuers() {
-				return new X509Certificate[0];
-			}
-		};
+	static TlsEngine newClient(String remoteName, X509Certificate certificate) {
+		return QuicTls.clientEngine(TlsClientConfig.builder(remoteName, CLIENT_PARAMS)
+			.withTrustedCertificate(certificate)
+			.build());
 	}
 
 	private static X509TrustManager rejectingWith(CertificateException rejection) {

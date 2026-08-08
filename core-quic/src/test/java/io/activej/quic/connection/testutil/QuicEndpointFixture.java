@@ -96,7 +96,7 @@ public final class QuicEndpointFixture implements AutoCloseable {
 	public static TlsEngineFactory clientEngineFactory(String serverName) {
 		TlsServerIdentity identity = QuicTestPeers.devIdentity();
 		return params -> QuicTls.clientEngine(TlsClientConfig.builder(serverName, params)
-			.withTrustManager(QuicTestPeers.trustingLeaf(identity.leaf()))
+			.withTrustedCertificate(identity.leaf())
 			.build());
 	}
 

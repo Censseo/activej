@@ -197,20 +197,6 @@ public class QuicTestPeersTest {
 	}
 
 	@Test
-	public void trustingLeafAcceptsTheDevLeafAndRejectsOthers() throws Exception {
-		TlsServerIdentity ecdsa = QuicTestPeers.devIdentity();
-		TlsServerIdentity rsa = QuicTestPeers.devRsaIdentity();
-
-		var trust = QuicTestPeers.trustingLeaf(ecdsa.leaf());
-		trust.checkServerTrusted(new java.security.cert.X509Certificate[]{ecdsa.leaf()}, "EC");
-
-		assertThrows(java.security.cert.CertificateException.class,
-			() -> trust.checkServerTrusted(new java.security.cert.X509Certificate[]{rsa.leaf()}, "RSA"));
-		assertThrows(java.security.cert.CertificateException.class,
-			() -> trust.checkServerTrusted(new java.security.cert.X509Certificate[0], "EC"));
-	}
-
-	@Test
 	public void settableClockStartsWhereAsked() {
 		try (QuicTestPeers peers = QuicTestPeers.loopback(5_000, 7)) {
 			assertEquals(5_000, peers.currentTimeMillis());
