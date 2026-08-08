@@ -31,8 +31,6 @@ import io.activej.reactor.Reactor;
 import io.activej.reactor.nio.NioReactor;
 import org.jetbrains.annotations.Nullable;
 
-import javax.net.ssl.X509TrustManager;
-
 import java.util.function.Function;
 
 /**
@@ -192,9 +190,8 @@ public final class Http3ClientFixture implements AutoCloseable {
 				if (tlsEngineFactory != null) {
 					clientBuilder.withTlsEngineFactory(tlsEngineFactory);
 				} else {
-					X509TrustManager devLeaf = Http3TestTls.trustingLeaf(Http3TestTls.devIdentity().leaf());
 					clientBuilder.withTlsClientConfig(config -> {
-						config.withTrustManager(devLeaf);
+						config.withTrustedCertificate(Http3TestTls.devIdentity().leaf());
 						if (tlsClientConfig != null) tlsClientConfig.initialize(config);
 					});
 				}

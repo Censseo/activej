@@ -88,7 +88,7 @@ public final class QuicFrameHandlerFactoryTest {
 		TlsServerIdentity identity = QuicTestPeers.devIdentity();
 		return QuicConnection.builder(Reactor.getCurrentReactor(), Role.CLIENT, wire, QuicWirePair.SERVER_ADDRESS,
 			params -> QuicTls.clientEngine(TlsClientConfig.builder("localhost", params)
-				.withTrustManager(QuicTestPeers.trustingLeaf(identity.leaf()))
+				.withTrustedCertificate(identity.leaf())
 				.build()));
 	}
 

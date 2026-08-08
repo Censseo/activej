@@ -29,7 +29,7 @@ import static org.junit.Assert.fail;
 
 /**
  * Proves the two properties the interop fixture exists for (T010a, FR-010, FR-011):
- * the socket is bound to the <b>loopback</b> address — never the wildcard, so the suite cannot
+ * the server is bound to the <b>loopback</b> address — never the wildcard, so the suite cannot
  * expose a server beyond loopback and needs no container runtime — and teardown is idempotent and
  * runs on every path, including a throw during setup, so {@link ByteBufRule} finds nothing.
  */
@@ -38,11 +38,12 @@ public final class Http3ServerReactorFixtureTest {
 	public static final ByteBufRule byteBufRule = new ByteBufRule();
 
 	@Test
-	public void bindsLoopbackAndReadsTheKeptPort() {
+	public void bindsLoopbackAndReadsTheBoundPort() {
 		Http3ServerReactorFixture fixture = new Http3ServerReactorFixture(InteropTestServlet::create);
 		try {
 			InetSocketAddress bound = fixture.boundAddress();
-			assertTrue("bound port must be > 0 (read off the kept :0 socket): " + bound, bound.getPort() > 0);
+			assertTrue("bound port must be > 0 (read off the server's bound-address accessor): " + bound,
+				bound.getPort() > 0);
 			assertTrue("must bind the loopback address, not the wildcard: " + bound,
 				bound.getAddress().isLoopbackAddress());
 			assertFalse("any-local binding would expose the suite beyond loopback: " + bound,

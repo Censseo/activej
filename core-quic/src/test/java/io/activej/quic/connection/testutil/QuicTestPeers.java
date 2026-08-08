@@ -31,10 +31,6 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.file.Path;
 import java.security.KeyStore;
-import java.security.cert.CertificateException;
-import java.security.cert.X509Certificate;
-
-import javax.net.ssl.X509TrustManager;
 
 /**
  * Shared fixture for connection-layer tests: a hand-driven clock, the feature-02 dev certificates, and
@@ -196,35 +192,6 @@ public final class QuicTestPeers implements AutoCloseable {
 	// ---------------------------------------------------------------- TLS configuration
 
 	/**
-	 * A client config that trusts exactly the dev certificate's leaf, so <b>hostname verification stays
-	 * live</b> — unlike {@code insecureTrustAll}, which would disable the RFC 6125 check this stack is
-	 * supposed to be exercising.
-	 * <p>
-	 * Duplicated from {@code TlsClientEngineTest.trustingLeaf} for the same package-visibility reason as
-	 * {@link #fixture}.
-	 */
-	public static X509TrustManager trustingLeaf(X509Certificate leaf) {
-		return new X509TrustManager() {
-			@Override
-			public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-				throw new CertificateException("Client authentication is not used");
-			}
-
-			@Override
-			public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-				if (chain.length == 0 || !chain[0].equals(leaf)) {
-					throw new CertificateException("Untrusted server chain");
-				}
-			}
-
-			@Override
-			public X509Certificate[] getAcceptedIssuers() {
-				return new X509Certificate[0];
-			}
-		};
-	}
-
-	/**
 	 * A client config builder trusting the dev identity, for {@code localhost}.
 	 * <p>
 	 * The transport parameters are the caller's: the identification parameters
@@ -235,7 +202,7 @@ public final class QuicTestPeers implements AutoCloseable {
 		String serverName, io.activej.quic.tls.QuicTransportParameters localParams, TlsServerIdentity identity
 	) {
 		return TlsClientConfig.builder(serverName, localParams)
-			.withTrustManager(trustingLeaf(identity.leaf()));
+			.withTrustedCertificate(identity.leaf());
 	}
 
 	public static TlsServerConfig.Builder serverConfig(

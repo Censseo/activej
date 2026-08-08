@@ -25,9 +25,7 @@ import io.activej.http3.Http3Client;
 import io.activej.promise.Promise;
 import io.activej.quic.tls.TlsClientConfig;
 
-import javax.net.ssl.X509TrustManager;
 import java.io.InputStream;
-import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 
@@ -39,12 +37,13 @@ import java.security.cert.X509Certificate;
  * <p>
  * Trust: exactly the committed dev leaf ({@code dev-cert.pem} from this example's own resources,
  * see {@code src/main/resources/README.md}), configured through
- * {@link Http3Client.Builder#withTlsClientConfig} with a {@link X509TrustManager} that accepts
- * only that certificate. This is deliberately <b>not</b> {@code insecureTrustAll} — which would
+ * {@link Http3Client.Builder#withTlsClientConfig} with
+ * {@link TlsClientConfig.Builder#withTrustedCertificate} pinning that certificate. This is
+ * deliberately <b>not</b> {@code insecureTrustAll} — which would
  * also disable RFC 6125 hostname verification — and <b>not</b>
  * {@code withTlsEngineFactory} — a whole engine factory owns its own {@link TlsClientConfig} and
- * silently opts out of this client's resumption plumbing (research D9). With the trust manager the
- * client keeps building the config, so the hostname check against the target's authority stays
+ * silently opts out of this client's resumption plumbing (research D9). With the pin the client
+ * keeps building the config, so the hostname check against the target's authority stays
  * live: a request to a server that is not this dev identity fails the handshake.
  * <p>
  * DNS: the resolver short-circuits {@code localhost} and literal IPs via
@@ -87,7 +86,7 @@ public final class Http3ClientExample {
 			// plumbing stays wired; only the chain validator is replaced by "exactly the dev leaf"
 			.withTlsClientConfig(config -> {
 				try {
-					config.withTrustManager(trustingLeaf(devLeaf()));
+					config.withTrustedCertificate(devLeaf());
 				} catch (Exception e) {
 					throw new RuntimeException("Failed to load the dev certificate", e);
 				}
@@ -148,27 +147,5 @@ public final class Http3ClientExample {
 			}
 			return (X509Certificate) CertificateFactory.getInstance("X.509").generateCertificate(in);
 		}
-	}
-
-	/** A trust manager accepting exactly {@code leaf} — the {@code Http3TestTls.trustingLeaf} shape. */
-	private static X509TrustManager trustingLeaf(X509Certificate leaf) {
-		return new X509TrustManager() {
-			@Override
-			public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-				throw new CertificateException("Client authentication is not used");
-			}
-
-			@Override
-			public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-				if (chain.length == 0 || !chain[0].equals(leaf)) {
-					throw new CertificateException("Untrusted server chain");
-				}
-			}
-
-			@Override
-			public X509Certificate[] getAcceptedIssuers() {
-				return new X509Certificate[0];
-			}
-		};
 	}
 }

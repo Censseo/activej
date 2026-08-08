@@ -22,24 +22,20 @@ import io.activej.eventloop.Eventloop;
 import io.activej.http.AsyncServlet;
 import io.activej.http3.Http3Server;
 import io.activej.http3.testutil.Http3TestTls;
-import io.activej.net.socket.udp.UdpSocket;
 import io.activej.reactor.Reactor;
-import io.activej.reactor.net.DatagramSocketSettings;
-import io.activej.reactor.nio.NioReactor;
 import io.activej.test.EventloopThread;
 
-import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.nio.channels.DatagramChannel;
 import java.util.function.Function;
 
 import org.jetbrains.annotations.Nullable;
 
 /**
  * An {@link Http3Server} on its own reactor thread, bound to the <b>loopback</b> address on a
- * {@code :0} port that is read off the kept socket — the fixture the automated interop suite
- * (T009, FR-009, FR-011, research D10) and the real-socket client suite stand a server up with.
+ * {@code :0} port that is read back off the server's bound-address accessor — the fixture the
+ * automated interop suite (T009, FR-009, FR-011, research D10) and the real-socket client suite
+ * stand a server up with.
  * <p>
  * <b>Threading</b> (FR-012): the loop, the submit bridge and the bounded teardown all come from
  * {@link EventloopThread}. The JUnit thread never touches a reactive component — construction,
@@ -48,22 +44,23 @@ import org.jetbrains.annotations.Nullable;
  * {@code EventloopRule} is deliberately not used: the JUnit thread must be free to block on a real
  * subprocess for seconds while the reactor keeps serving (research D7).
  * <p>
- * <b>Socket</b> (research D10): a {@link DatagramChannel} is bound to {@code :0} on the loopback
- * address, the assigned port is read off the channel, and the channel is <b>kept</b> — wrapped with
- * {@link UdpSocket#connect} and handed to {@link Http3Server.Builder#withSocket} — so there is no
- * free-then-rebind window and no other process can take the port.
+ * <b>Socket</b> (feature 008, T029): the server is built with
+ * {@code withListenAddress(loopback:0)} and {@code listen()} opens the socket itself; the assigned
+ * port is read through {@code Http3Server.getBoundAddress()} (research D11, resolved). This
+ * replaces the earlier workaround of binding a {@link java.nio.channels.DatagramChannel} by hand
+ * and handing it back via {@code withSocket} — see {@code specs/008-h3-api-gaps} for why that
+ * existed (a pre-bound channel guaranteed no free-then-rebind window; the accessor's read-back
+ * keeps the same guarantee, since {@code listen()} binds and completes synchronously).
  * <p>
  * <b>Teardown</b> (FR-010): {@link #close()} is idempotent and runs on every path. Whatever stage
- * setup reached — server, socket or raw channel — is closed on the reactor via the
- * {@link EventloopThread#onClose} action registered below, and only then is the thread joined, so a
- * failed assertion, a timeout or a throw during setup leaves nothing for {@code ByteBufRule} to find.
+ * setup reached — server or nothing — is closed on the reactor via the {@link EventloopThread#onClose}
+ * action registered below, and only then is the thread joined, so a failed assertion, a timeout or
+ * a throw during setup leaves nothing for {@code ByteBufRule} to find.
  */
 public final class Http3ServerReactorFixture implements AutoCloseable {
 	private final EventloopThread loop = EventloopThread.create("http3-interop-server");
 	private final Function<Reactor, AsyncServlet> servletFactory;
 
-	private @Nullable DatagramChannel channel;
-	private @Nullable UdpSocket socket;
 	private @Nullable Http3Server server;
 	private InetSocketAddress boundAddress;
 	private int port;
@@ -76,7 +73,7 @@ public final class Http3ServerReactorFixture implements AutoCloseable {
 	public Http3ServerReactorFixture(Function<Reactor, AsyncServlet> servletFactory) {
 		this.servletFactory = servletFactory;
 		// Registered before the server exists: closeResources() picks whatever stage setup reached,
-		// so a throw halfway through startServer() still releases the socket or the raw channel.
+		// so a throw halfway through startServer() still releases the socket.
 		loop.onClose(this::closeResources);
 		try {
 			loop.submit(this::startServer);
@@ -130,44 +127,31 @@ public final class Http3ServerReactorFixture implements AutoCloseable {
 		loop.close();
 	}
 
-	/** Runs on the reactor thread during {@link #close()}: the furthest stage setup reached wins. */
+	/** Runs on the reactor thread during {@link #close()}: closes the server if setup reached it. */
 	private void closeResources() {
 		if (server != null) {
 			server.close();
-		} else if (socket != null) {
-			socket.close();
-		} else if (channel != null && channel.isOpen()) {
-			try {
-				channel.close();
-			} catch (IOException e) {
-				throw new IllegalStateException("Failed to close the raw datagram channel", e);
-			}
 		}
 	}
 
-	/** Runs on the reactor thread: bind {@code :0} on loopback, keep the socket, listen (T009, T010a). */
-	private void startServer() throws IOException {
+	/** Runs on the reactor thread: listen on {@code :0} on loopback, read the assigned port back (T029). */
+	private void startServer() {
 		Eventloop eventloop = loop.eventloop();
-		DatagramChannel channel = NioReactor.createDatagramChannel(
-			DatagramSocketSettings.create(),
-			new InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
-			null);
-		this.channel = channel;
-		this.boundAddress = (InetSocketAddress) channel.getLocalAddress();
-		this.port = this.boundAddress.getPort();
 
 		// The servlet is built here, on the reactor thread, so a RoutingServlet built by the factory
 		// captures exactly this reactor (WI-2) — the JUnit thread must never construct a reactive piece.
 		AsyncServlet servlet = servletFactory.apply(eventloop);
 
-		UdpSocket socket = UdpSocket.connect(eventloop, channel).getResult();
-		this.socket = socket;
-
 		Http3Server server = Http3Server.builder(eventloop, servlet)
-			.withSocket(socket)
+			.withListenAddress(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0))
 			.withServerIdentity(Http3TestTls.devIdentity())
 			.build();
+		// listen() binds and completes synchronously, so the accessor is readable right here — on the
+		// reactor thread, where its guard permits it — and the port the client is pointed at is the
+		// one the OS assigned (feature 008, T029; the pre-bound-channel workaround is gone).
 		server.listen();
 		this.server = server;
+		this.boundAddress = server.getBoundAddress();
+		this.port = this.boundAddress.getPort();
 	}
 }

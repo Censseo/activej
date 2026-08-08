@@ -24,7 +24,6 @@ import org.junit.Test;
 
 import static io.activej.quic.tls.ScriptedTlsServer.SERVER_PARAMS;
 import static io.activej.quic.tls.TlsClientEngineTest.CLIENT_PARAMS;
-import static io.activej.quic.tls.TlsClientEngineTest.trustingLeaf;
 import static io.activej.quic.tls.TlsServerIdentityTest.fixture;
 import static org.junit.Assert.*;
 
@@ -63,7 +62,7 @@ public class TlsLoopbackTest {
 			fixture(keyType + "-cert.pem"), fixture(keyType + "-key.pem"));
 		TlsEngine server = QuicTls.serverEngine(TlsServerConfig.builder(identity, SERVER_PARAMS).build());
 		TlsEngine client = QuicTls.clientEngine(TlsClientConfig.builder("localhost", CLIENT_PARAMS)
-			.withTrustManager(trustingLeaf(identity.leaf()))
+			.withTrustedCertificate(identity.leaf())
 			.build());
 
 		TlsEngineResult clientHelloResult = client.consume(EncryptionLevel.INITIAL, ByteBuf.empty());

@@ -255,7 +255,7 @@ public class TlsClientResumptionTest {
 			recycleOutput(withTicketOnly);
 		}
 
-		TlsEngineResult noTicket = firstResult(newClient("example.test", trustingLeaf(identity.leaf())));
+		TlsEngineResult noTicket = firstResult(newClient("example.test", identity.leaf()));
 		try {
 			assertTrue(noTicket.keysToInstall().isEmpty());
 		} finally {
@@ -327,7 +327,7 @@ public class TlsClientResumptionTest {
 	public void anUnsolicitedPreSharedKeyInTheServerHelloIsStillUnsupportedExtension() throws Exception {
 		TlsServerIdentity identity = rsaIdentity();
 		ScriptedTlsServer server = new ScriptedTlsServer(identity);
-		TlsEngine client = newClient("example.test", trustingLeaf(identity.leaf())); // offers no PSK
+		TlsEngine client = newClient("example.test", identity.leaf()); // offers no PSK
 		server.shExtensionsOverride = selectionServerHelloExtensions(server, 0);
 		server.acceptClientHello(emitClientHello(client));
 
@@ -493,7 +493,7 @@ public class TlsClientResumptionTest {
 		TlsServerIdentity identity = rsaIdentity();
 		ScriptedTlsServer server = new ScriptedTlsServer(identity);
 		TlsEngine client = QuicTls.clientEngine(TlsClientConfig.builder("example.test", CLIENT_PARAMS)
-			.withTrustManager(trustingLeaf(identity.leaf()))
+			.withTrustedCertificate(identity.leaf())
 			.withMaxSessionTicketsPerConnection(0)
 			.build());
 		completeHandshakeWith(client, server);
@@ -578,7 +578,7 @@ public class TlsClientResumptionTest {
 	private static TlsEngine resumingClient(TlsServerIdentity identity, QuicSessionTicket ticket, boolean earlyData,
 			LongSupplier clock) {
 		return QuicTls.clientEngine(TlsClientConfig.builder("example.test", CLIENT_PARAMS)
-			.withTrustManager(trustingLeaf(identity.leaf()))
+			.withTrustedCertificate(identity.leaf())
 			.withSessionTicket(ticket)
 			.withEarlyDataEnabled(earlyData)
 			.withCurrentTimeMillis(clock)
@@ -587,7 +587,7 @@ public class TlsClientResumptionTest {
 
 	private static TlsEngine clientWithCache(TlsServerIdentity identity, InMemoryQuicSessionCache cache) {
 		TlsClientConfig.Builder builder = TlsClientConfig.builder("example.test", CLIENT_PARAMS)
-			.withTrustManager(trustingLeaf(identity.leaf()))
+			.withTrustedCertificate(identity.leaf())
 			.withCurrentTimeMillis(() -> NOW);
 		if (cache != null) {
 			builder.withSessionCache(cache, 443);
@@ -597,7 +597,7 @@ public class TlsClientResumptionTest {
 
 	private static ClientHelloMessage plainClientHello() throws Exception {
 		return parseClientHello(emitClientHello(
-			newClient("example.test", trustingLeaf(rsaIdentity().leaf()))));
+			newClient("example.test", rsaIdentity().leaf())));
 	}
 
 	private static ClientHelloMessage resumingClientHello(QuicSessionTicket ticket, boolean earlyData) throws Exception {

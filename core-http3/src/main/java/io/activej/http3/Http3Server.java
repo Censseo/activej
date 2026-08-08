@@ -869,6 +869,26 @@ public final class Http3Server extends AbstractNioReactive implements AutoClosea
 		return closed;
 	}
 
+	/**
+	 * The address this server is actually bound to, or {@code null} before {@link #listen()} has opened a
+	 * socket and after that socket has been released. Use it to learn the real port when the configured
+	 * listen address uses port {@literal 0}.
+	 * <p>
+	 * Unlike {@code AbstractReactiveServer}'s address accessors, this one carries the reactor-thread
+	 * guard: {@code socket} is written on the reactor thread inside {@link #listen()}, so reading it
+	 * elsewhere is a genuine race. Constitution Principle II admits no exception. <b>Do not remove this
+	 * guard for consistency with {@code AbstractReactiveServer}</b> — the divergence is the deliberate
+	 * one, and it costs callers a submit bridge (see {@code Http3ServerLauncher}).
+	 * <p>
+	 * It reports the real address <b>throughout the graceful GOAWAY drain</b>: {@link #close()} sets the
+	 * closing flag immediately, but the server stays bound and keeps serving in-flight exchanges until
+	 * the drain finishes. This method therefore consults no closing flag and delegates on every call.
+	 */
+	public @Nullable InetSocketAddress getBoundAddress() {
+		checkInReactorThread(this);
+		return socket == null ? null : socket.getLocalAddress();
+	}
+
 	// ---------------------------------------------------------------- serving
 
 	/**

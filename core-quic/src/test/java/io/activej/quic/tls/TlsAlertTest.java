@@ -33,7 +33,6 @@ import static io.activej.quic.tls.TlsClientEngineTest.emitClientHello;
 import static io.activej.quic.tls.TlsClientEngineTest.newClient;
 import static io.activej.quic.tls.TlsClientEngineTest.recycleOutput;
 import static io.activej.quic.tls.TlsClientEngineTest.rsaIdentity;
-import static io.activej.quic.tls.TlsClientEngineTest.trustingLeaf;
 import static io.activej.quic.tls.TlsClientEngineTest.wrap;
 import static org.junit.Assert.*;
 
@@ -409,7 +408,7 @@ public class TlsAlertTest {
 	}
 
 	private static TlsEngine newTrustAllClient() throws Exception {
-		return newClient("example.test", trustingLeaf(rsaIdentity().leaf()));
+		return newClient("example.test", rsaIdentity().leaf());
 	}
 
 	private static byte[] clientHelloBytes(List<TlsExtension> extensions, byte[] random) {

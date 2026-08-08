@@ -96,7 +96,7 @@ port, the client and the configuration:
 
 | | Automated suite | Manual harness |
 |---|---|---|
-| Server | test-owned `Http3Server` on a **test-chosen loopback port** (`:0` bound and kept — research D10) | `Http3InteropServer` on a fixed port (`-Dport=4433` default) |
+| Server | test-owned `Http3Server` on a **test-chosen loopback port** (`:0`; the assigned address is read back through `Http3Server.getBoundAddress()` — research D10, superseded by feature 008) | `Http3InteropServer` on a fixed port (`-Dport=4433` default) |
 | Client | `curl` through `CurlProbe` — a subprocess, no shell, bounded | anything a human can run: curl, Chrome, `Http3InteropClient` |
 | Configuration | feature-006 defaults — the capabilities are **off** | `-Dprofile=baseline` / `qpack` / `zerortt` / `all` flips QPACK capacity and 0-RTT |
 | Direction | server direction (foreign client → our server) **plus** the loopback client direction (`Http3RealSocketInteropTest`) | both directions, including **foreign servers** |
@@ -524,18 +524,26 @@ single failure is `multipleRequestsOneConnection` with the same signature as rec
 connect … after 0 ms`, exit 7, one write-out line parsed instead of three). The run confirms the
 residual is reproducible and remains client-side.
 
-### Open finding — `Http3Server` exposes no bound-address accessor (feature 007, research D11)
+### Resolved — `Http3Server.getBoundAddress()` (feature 008, supersedes research D11)
 
 `AbstractReactiveServer` gives `HttpServer` `getListenAddresses()` / `getBoundAddresses()`, which
-`HttpServerLauncherTest.bindZeroPort` relies on. `Http3Server` has no equivalent — its public no-arg
-surface is `listen`, `close`, `isClosed` and the counters — so the launcher logs the address it read
-from `Config`, and a test that needs a port passes one explicitly rather than binding `:0` and asking
-the server what it got.
+`Http3ServerLauncherTest.bindZeroPort` relies on. `Http3Server` originally had no equivalent — its
+public no-arg surface was `listen`, `close`, `isClosed` and the counters — so the launcher logged
+the address it read from `Config`, and a test that needed a port passed one explicitly rather than
+binding `:0` and asking the server what it got. That was FR-034's "report the gap", recorded here
+and in `core-http3/CLAUDE.md` for the next feature to find.
 
-This is FR-034's "report the gap": **a future JMX feature that wants to publish the bound address,
-and a `bindZeroPort`-shaped launcher test, will both want `Http3Server.getBoundAddress()`.** It is
-recorded as an open question in `core-http3/CLAUDE.md` as well, since that is where the next feature
-will look.
+**Closed by feature 008.** `Http3Server.getBoundAddress()` now exists — reactor-thread-guarded,
+delegating to the `IUdpSocket` the server already holds (so the `withSocket` path answers too), and
+consulting no closing flag, so it reports the real address throughout the GOAWAY drain. The
+underlying `IUdpSocket.getLocalAddress()` is a **defaulted** method on the published `core-net`
+interface (`null` for "not bound" and for an implementation that models no local address), so no
+existing implementer breaks. The launcher now logs the address it is actually bound to (read through
+a submit bridge), the launcher test binds `:0` and reads the port back, and this fixture's
+`startServer()` configures `withListenAddress(:0)` and reads the assigned port through the accessor
+instead of pre-binding a channel. The accessor deliberately carries **no `@JmxAttribute`**;
+publishing the address through JMX remains open, as part of the separate, not-yet-specified JMX
+feature.
 
 ### Resolved — the dedicated-reactor-loop pattern is now `io.activej.test.EventloopThread`
 
@@ -572,10 +580,12 @@ Two notes for whoever touches this next:
   must be written as an explicit lambda. `javac` happens to accept some of these; ECJ does not.
 
 The same review's `trustingLeaf` duplication — `Http3ClientExample`'s copy is main-scope and can never
-depend on a test-scope class — is the same question one level up, and is **not** closed: a main-scope
-"trust exactly one leaf certificate" helper would serve any self-signed-cert example, but lives in no
-module FR-034 allows this feature to touch. It is planned for feature 008 alongside the bound-address
-accessor below.
+depend on a test-scope class — was the same question one level up, and is **closed by feature 008**:
+`TlsClientConfig.Builder.withTrustedCertificate(X509Certificate)`, placed beside
+`insecureTrustAll()` in `core-quic`, is the single implementation — trust exactly one end-entity
+certificate, with RFC 6125 hostname verification still on and client authentication refused — and
+all five copies migrated to it, this module's `Http3TestTls`/`Http3ClientFixture` and the main-scope
+`Http3ClientExample` copy included.
 
 ### 2026-08-05 (T144) — the phase-1 `Http3Client` ↔ quic-go gap is **closed**, and Slice A does not touch it
 

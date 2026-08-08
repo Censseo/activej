@@ -209,7 +209,7 @@ public final class QuicWirePair implements AutoCloseable {
 		TlsServerIdentity identity = QuicTestPeers.devIdentity();
 		client = QuicConnection.builder(Reactor.getCurrentReactor(), Role.CLIENT, clientWire, SERVER_ADDRESS,
 				params -> QuicTls.clientEngine(TlsClientConfig.builder(serverName, params)
-					.withTrustManager(QuicTestPeers.trustingLeaf(identity.leaf()))
+					.withTrustedCertificate(identity.leaf())
 					.initialize(builder -> {
 						if (clientTlsConfig != null) clientTlsConfig.accept(builder);
 					})

@@ -36,6 +36,7 @@ import io.activej.reactor.nio.NioReactor;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
@@ -190,6 +191,26 @@ public final class UdpSocket extends AbstractNioReactive implements IUdpSocket, 
 
 	public boolean isOpen() {
 		return key != null;
+	}
+
+	/**
+	 * The local address this socket is bound to, or {@code null} once it has been closed.
+	 * <p>
+	 * A {@link ClosedChannelException} — the closed socket, and the ordinary teardown state this
+	 * accessor is read in — answers {@code null}, the same value an implementation that models no
+	 * local address answers; every other {@link IOException} is a genuine fault and is surfaced
+	 * {@link UncheckedIOException}-wrapped rather than hidden behind that value.
+	 */
+	@Override
+	public @Nullable InetSocketAddress getLocalAddress() {
+		if (CHECKS) checkInReactorThread(this);
+		try {
+			return (InetSocketAddress) channel.getLocalAddress();
+		} catch (ClosedChannelException ignored) {
+			return null;
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
 	}
 
 	@Override

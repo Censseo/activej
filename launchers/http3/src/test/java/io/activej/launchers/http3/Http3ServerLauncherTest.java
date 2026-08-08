@@ -39,20 +39,19 @@ import io.activej.promise.SettablePromise;
 import io.activej.quic.connection.QuicTransportException;
 import io.activej.quic.tls.TlsServerIdentity;
 import io.activej.reactor.nio.NioReactor;
-import io.activej.test.TestUtils;
 import io.activej.test.rules.ByteBufRule;
 import io.activej.test.rules.EventloopRule;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.Test;
+import org.slf4j.LoggerFactory;
 
-import javax.net.ssl.X509TrustManager;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.Arrays;
 import java.util.List;
@@ -62,11 +61,18 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+
 import static io.activej.promise.Promise.ofCompletionStage;
 import static io.activej.promise.TestUtils.await;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 /**
  * The smoke and behavioural suite for {@link Http3ServerLauncher} (Phase 5, US3).
@@ -123,7 +129,6 @@ public class Http3ServerLauncherTest {
 	 */
 	@Test
 	public void certificateKeysMissing() {
-		int port = TestUtils.getFreePort();
 		Throwable[] error = new Throwable[1];
 		Http3ServerLauncher launcher = new Http3ServerLauncher() {
 			@Provides
@@ -135,7 +140,7 @@ public class Http3ServerLauncherTest {
 			Config config() {
 				// overrideWith replaces the http3 subtree: certificateChain and privateKey are absent
 				return super.config().overrideWith(Config.create()
-					.with("http3.listenAddresses", "localhost:" + port));
+					.with("http3.listenAddresses", "localhost:0"));
 			}
 
 			@Override
@@ -159,7 +164,6 @@ public class Http3ServerLauncherTest {
 	 */
 	@Test
 	public void certificatePathUnparseable() {
-		int port = TestUtils.getFreePort();
 		Throwable[] error = new Throwable[1];
 		Http3ServerLauncher launcher = new Http3ServerLauncher() {
 			@Provides
@@ -171,7 +175,7 @@ public class Http3ServerLauncherTest {
 			Config config() {
 				// a real, readable file that is not a PEM — the README next to the fixtures
 				return super.config().overrideWith(Config.create()
-					.with("http3.listenAddresses", "localhost:" + port)
+					.with("http3.listenAddresses", "localhost:0")
 					.with("http3.certificateChain", fixture("README.md").toString())
 					.with("http3.privateKey", DEV_KEY_PATH.toString()));
 			}
@@ -203,7 +207,6 @@ public class Http3ServerLauncherTest {
 	 */
 	@Test
 	public void certificatePathValueUnparseable() {
-		int port = TestUtils.getFreePort();
 		Throwable[] error = new Throwable[1];
 		Http3ServerLauncher launcher = new Http3ServerLauncher() {
 			@Provides
@@ -215,7 +218,7 @@ public class Http3ServerLauncherTest {
 			Config config() {
 				// a value Paths.get cannot parse: an embedded NUL is an InvalidPathException on every OS
 				return super.config().overrideWith(Config.create()
-					.with("http3.listenAddresses", "localhost:" + port)
+					.with("http3.listenAddresses", "localhost:0")
 					.with("http3.certificateChain", "bad\u0000path")
 					.with("http3.privateKey", DEV_KEY_PATH.toString()));
 			}
@@ -237,16 +240,16 @@ public class Http3ServerLauncherTest {
 
 	/**
 	 * T036 — the serve test: a launched {@link Http3ServerLauncher} serves one request over HTTP/3
-	 * on an explicitly chosen port (never {@code :0} — {@code Http3Server} exposes no bound-address
-	 * accessor, research D11), and shuts down. The client half is wired <b>through the launcher's
-	 * own DI</b>: the test subclass's {@code @Provides} methods are scanned by
+	 * and shuts down. The launcher binds port {@code 0} — the OS-assigned port is read back through
+	 * {@code Http3Server.getBoundAddress()} (FR-023), eliminating the free-then-rebind race of a
+	 * pre-allocated port — and the client half is wired <b>through the
+	 * launcher's own DI</b>: the test subclass's {@code @Provides} methods are scanned by
 	 * {@code getInternalModule}, so the {@link ClientProbe} (and the {@link Http3Client} it runs,
 	 * on its own dedicated loop — see its Javadoc for why) is created during launch and handed to
 	 * the test through a static field.
 	 */
 	@Test
 	public void servesOneRequest() {
-		int port = TestUtils.getFreePort();
 		probe = null;
 		Throwable[] fatal = new Throwable[1];
 		Http3ServerLauncher launcher = new Http3ServerLauncher() {
@@ -266,14 +269,14 @@ public class Http3ServerLauncherTest {
 			@Eager
 			ClientProbe probe(NioReactor launcherReactor, IDnsClient dnsClient) {
 				Http3ServerLauncherTest.probe = ClientProbe.create((Eventloop) launcherReactor, dnsClient,
-					config -> config.withTrustManager(trustingLeaf(devLeaf())));
+					config -> config.withTrustedCertificate(devLeaf()));
 				return Http3ServerLauncherTest.probe;
 			}
 
 			@Override
 			Config config() {
 				return super.config().overrideWith(Config.create()
-					.with("http3.listenAddresses", "localhost:" + port)
+					.with("http3.listenAddresses", "localhost:0")
 					.with("http3.certificateChain", DEV_CERT_PATH.toString())
 					.with("http3.privateKey", DEV_KEY_PATH.toString()));
 			}
@@ -296,6 +299,7 @@ public class Http3ServerLauncherTest {
 			ClientProbe probe = Http3ServerLauncherTest.probe;
 			assertNotNull("the test's @Eager ClientProbe must have been created during launch", probe);
 
+			int port = boundPort(launcher, probe);
 			HttpResponse response = requestWithHandshakeRetry(probe, "https://localhost:" + port + "/", "GET / over HTTP/3");
 			assertEquals("the response must report the exact HTTP_3_0 version enum value",
 				HttpVersion.HTTP_3_0, response.getVersion());
@@ -345,7 +349,6 @@ public class Http3ServerLauncherTest {
 	 */
 	@Test
 	public void gracefulStopFinishesInFlightExchange() {
-		int port = TestUtils.getFreePort();
 		AtomicBoolean served = new AtomicBoolean();
 		SettablePromise<HttpResponse> heldResponse = new SettablePromise<>();
 		probe = null;
@@ -368,14 +371,14 @@ public class Http3ServerLauncherTest {
 			@Eager
 			ClientProbe probe(NioReactor launcherReactor, IDnsClient dnsClient) {
 				Http3ServerLauncherTest.probe = ClientProbe.create((Eventloop) launcherReactor, dnsClient,
-					config -> config.withTrustManager(trustingLeaf(devLeaf())));
+					config -> config.withTrustedCertificate(devLeaf()));
 				return Http3ServerLauncherTest.probe;
 			}
 
 			@Override
 			Config config() {
 				return super.config().overrideWith(Config.create()
-					.with("http3.listenAddresses", "localhost:" + port)
+					.with("http3.listenAddresses", "localhost:0")
 					.with("http3.certificateChain", DEV_CERT_PATH.toString())
 					.with("http3.privateKey", DEV_KEY_PATH.toString())
 					// a generous GOAWAY drain ceiling: the exchange must survive the stop
@@ -397,7 +400,7 @@ public class Http3ServerLauncherTest {
 			ClientProbe probe = Http3ServerLauncherTest.probe;
 			assertNotNull("the test's @Eager ClientProbe must have been created during launch", probe);
 
-			String url = "https://localhost:" + port + "/";
+			String url = "https://localhost:" + boundPort(launcher, probe) + "/";
 			Promise<HttpResponse> inFlight = null;
 			for (int attempt = 1; attempt <= 3; attempt++) {
 				inFlight = probe.onClient(() -> probe.client().request(HttpRequest.get(url).build()));
@@ -465,6 +468,165 @@ public class Http3ServerLauncherTest {
 			probe.closeClient();
 			await(ofCompletionStage(launcher.getCompleteFuture()));
 			assertNoNonDaemonThreadsLeft();
+		} finally {
+			// A failure between launch and shutdown must not park anything: closeClient() and
+			// shutdown() are idempotent, the launch thread is a daemon, and the complete future is
+			// deliberately NOT awaited here — a failed test reports its own error instead of waiting
+			// on a launcher that may never complete.
+			if (Http3ServerLauncherTest.probe != null) {
+				try {
+					Http3ServerLauncherTest.probe.closeClient();
+				} catch (Exception ignored) {
+					// the test already failed; the daemon client thread cannot hang the JVM
+				}
+			}
+			launcher.shutdown();
+		}
+	}
+
+	/**
+	 * T024 — FR-020: the launcher logs the address it is <b>bound</b> to, not the one it was
+	 * configured with. The configured port is {@code 0} (the OS assigns one); with the pre-fix
+	 * code the log line read {@code https://localhost/127.0.0.1:0} — the configured value read
+	 * back out of {@code Config}. This case captures the log and asserts the line carries the
+	 * real, non-zero port — the assertion that distinguishes the fix from the workaround.
+	 * <p>
+	 * The {@code io.activej} logger is <b>off</b> by default on the test classpath
+	 * ({@code activej-test}'s {@code logback-test.xml}), which would make the launcher's own
+	 * {@code logger.isInfoEnabled()} gate swallow the line; the test raises the
+	 * {@code io.activej.launchers.http3} logger to INFO and captures through a
+	 * {@link ListAppender} before launching, and restores both afterwards.
+	 */
+	@Test
+	public void logsTheBoundAddressNotTheConfiguredOne() {
+		Logger launcherLogger = (Logger) LoggerFactory.getLogger("io.activej.launchers.http3");
+		Level originalLevel = launcherLogger.getLevel();
+		launcherLogger.setLevel(Level.INFO);
+		ListAppender<ILoggingEvent> appender = new ListAppender<>();
+		appender.start();
+		launcherLogger.addAppender(appender);
+		Throwable[] fatal = new Throwable[1];
+		Http3ServerLauncher launcher = new Http3ServerLauncher() {
+			@Provides
+			public AsyncServlet servlet() {
+				return request -> HttpResponse.ok200().toPromise();
+			}
+
+			@Override
+			Config config() {
+				return super.config().overrideWith(Config.create()
+					.with("http3.listenAddresses", "localhost:0")
+					.with("http3.certificateChain", DEV_CERT_PATH.toString())
+					.with("http3.privateKey", DEV_KEY_PATH.toString()));
+			}
+
+			@Override
+			protected void onFatalError(Throwable throwable) {
+				fatal[0] = throwable;
+			}
+		};
+		try {
+			launchOnThread(launcher);
+			await(ofCompletionStage(launcher.getStartFuture()));
+			assertNoFatalError(fatal);
+
+			String message = appender.list.stream()
+				.map(ILoggingEvent::getFormattedMessage)
+				.filter(m -> m != null && m.contains("HTTP/3 Server is now available at https://"))
+				.findFirst()
+				.orElse(null);
+			assertNotNull("the launcher must log its serving address in onStart()", message);
+			int loggedPort = Integer.parseInt(message.substring(message.lastIndexOf(':') + 1));
+			assertTrue("with a configured port of 0 the log must carry the real, non-zero bound port: " + message,
+				loggedPort > 0);
+
+			launcher.shutdown();
+			await(ofCompletionStage(launcher.getCompleteFuture()));
+		} finally {
+			launcher.shutdown();
+			launcherLogger.detachAppender(appender);
+			launcherLogger.setLevel(originalLevel);
+		}
+	}
+
+	/**
+	 * T025 — FR-022, the launcher-level mirror of {@code HttpServerLauncherTest.bindZeroPort}:
+	 * configuring port {@code 0} yields a server reachable on a real, non-zero port discovered
+	 * through {@code Http3Server.getBoundAddress()} (SC-001).
+	 * <p>
+	 * The read is deliberately more verbose than the HTTP/1.1 equivalent, which reads
+	 * {@code getBoundAddresses()} straight from the JUnit thread:
+	 * {@code Http3Server.getBoundAddress()} carries the reactor-thread guard FR-010 keeps — a
+	 * deliberate divergence from {@code AbstractReactiveServer} — so the port must be read through
+	 * the {@link ClientProbe#onLauncher} submit bridge. That verbosity is the price of the guard,
+	 * not an accident (FR-027): do not "simplify" this test by deleting the guard.
+	 */
+	@Test
+	public void bindZeroPort() {
+		probe = null;
+		Throwable[] fatal = new Throwable[1];
+		Http3ServerLauncher launcher = new Http3ServerLauncher() {
+			@Provides
+			AsyncServlet servlet() {
+				return request -> HttpResponse.ok200()
+					.withPlainText(FIXED_TEXT)
+					.toPromise();
+			}
+
+			@Provides
+			IDnsClient dnsClient() {
+				return loopbackResolver();
+			}
+
+			@Provides
+			@Eager
+			ClientProbe probe(NioReactor launcherReactor, IDnsClient dnsClient) {
+				Http3ServerLauncherTest.probe = ClientProbe.create((Eventloop) launcherReactor, dnsClient,
+					config -> config.withTrustedCertificate(devLeaf()));
+				return Http3ServerLauncherTest.probe;
+			}
+
+			@Override
+			Config config() {
+				return super.config().overrideWith(Config.create()
+					.with("http3.listenAddresses", "localhost:0")
+					.with("http3.certificateChain", DEV_CERT_PATH.toString())
+					.with("http3.privateKey", DEV_KEY_PATH.toString()));
+			}
+
+			@Override
+			protected void onFatalError(Throwable throwable) {
+				// the launcher's default onFatalError is System.exit(-1) — capture instead, so a
+				// fatal error fails this test rather than killing the whole Surefire JVM
+				fatal[0] = throwable;
+			}
+		};
+
+		launchOnThread(launcher);
+		try {
+			await(ofCompletionStage(launcher.getStartFuture()));
+
+			ClientProbe probe = Http3ServerLauncherTest.probe;
+			assertNotNull("the test's @Eager ClientProbe must have been created during launch", probe);
+
+			int port = boundPort(launcher, probe);
+			HttpResponse response = requestWithHandshakeRetry(probe,
+				"https://localhost:" + port + "/",
+				"GET / over HTTP/3 on the port discovered through getBoundAddress()");
+			assertEquals("the response must report the exact HTTP_3_0 version enum value",
+				HttpVersion.HTTP_3_0, response.getVersion());
+			ByteBuf body = awaitBounded(probe.onClient(() -> {
+				return response.loadBody();
+			}), "the response body");
+			// asArray() recycles the buffer itself (CSP ownership: the body is ours)
+			assertArrayEquals("the body must be byte-identical to the servlet's fixed text",
+				FIXED_TEXT.getBytes(StandardCharsets.UTF_8),
+				body.asArray());
+			assertNoFatalError(fatal);
+
+			probe.closeClient();
+			launcher.shutdown();
+			await(ofCompletionStage(launcher.getCompleteFuture()));
 		} finally {
 			// A failure between launch and shutdown must not park anything: closeClient() and
 			// shutdown() are idempotent, the launch thread is a daemon, and the complete future is
@@ -604,6 +766,20 @@ public class Http3ServerLauncherTest {
 	}
 
 	/**
+	 * The port the launcher's server is <b>actually</b> bound to, read through the
+	 * {@link ClientProbe#onLauncher} submit bridge the reactor-thread guard on
+	 * {@code Http3Server.getBoundAddress()} requires (FR-010) — the JUnit thread must never touch
+	 * a reactive component directly (SI-9). Asserts the {@code :0} listen address resolved to a
+	 * real, non-zero port (FR-022).
+	 */
+	private static int boundPort(Http3ServerLauncher launcher, ClientProbe probe) {
+		InetSocketAddress bound = probe.onLauncher(() -> launcher.http3Server.getBoundAddress());
+		assertNotNull("the server must report its bound address once listen() has completed", bound);
+		assertNotEquals("a :0 listen address must resolve to a real, non-zero port (FR-022)", 0, bound.getPort());
+		return bound.getPort();
+	}
+
+	/**
 	 * Launches {@code launcher} on a dedicated thread and captures whatever escapes
 	 * {@code launch()}. A {@code @Provides}-time exception (like a missing or unparseable
 	 * certificate) bypasses {@code startServices}, so {@code getStartFuture()} never completes —
@@ -730,28 +906,6 @@ public class Http3ServerLauncherTest {
 
 	private static X509Certificate devLeaf() {
 		return devIdentity().leaf();
-	}
-
-	/** A trust manager accepting exactly the dev leaf — the {@code Http3TestTls.trustingLeaf} shape. */
-	private static X509TrustManager trustingLeaf(X509Certificate leaf) {
-		return new X509TrustManager() {
-			@Override
-			public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-				throw new CertificateException("Client authentication is not used");
-			}
-
-			@Override
-			public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-				if (chain.length == 0 || !chain[0].equals(leaf)) {
-					throw new CertificateException("Untrusted server chain");
-				}
-			}
-
-			@Override
-			public X509Certificate[] getAcceptedIssuers() {
-				return new X509Certificate[0];
-			}
-		};
 	}
 
 	/** Resolves a fixture from {@code /io/activej/launchers/http3/} on the test classpath. */

@@ -116,7 +116,7 @@ public final class QuicHandshakeTest {
 		TlsServerIdentity identity = QuicTestPeers.devIdentity();
 		client = QuicConnection.builder(Reactor.getCurrentReactor(), Role.CLIENT, clientWire, SERVER_ADDRESS,
 				params -> QuicTls.clientEngine(TlsClientConfig.builder(serverName, params)
-					.withTrustManager(QuicTestPeers.trustingLeaf(identity.leaf()))
+					.withTrustedCertificate(identity.leaf())
 					.build()))
 			.withSettings(settings)
 			.build();
