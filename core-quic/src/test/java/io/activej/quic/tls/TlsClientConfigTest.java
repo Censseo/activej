@@ -266,5 +266,17 @@ public class TlsClientConfigTest {
 
 		@Override
 		public int getBasicConstraints() {return delegate.getBasicConstraints();}
+
+		@Override
+		public boolean hasUnsupportedCriticalExtension() {return delegate.hasUnsupportedCriticalExtension();}
+
+		@Override
+		public java.util.Set<String> getCriticalExtensionOIDs() {return delegate.getCriticalExtensionOIDs();}
+
+		@Override
+		public java.util.Set<String> getNonCriticalExtensionOIDs() {return delegate.getNonCriticalExtensionOIDs();}
+
+		@Override
+		public byte[] getExtensionValue(String oid) {return delegate.getExtensionValue(oid);}
 	}
 }
