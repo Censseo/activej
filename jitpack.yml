@@ -1,2 +1,13 @@
+# The reactor compiles with maven.compiler release=25, so a JDK older than 25 cannot
+# build it at all. JitPack provisions no JDK 25 — `jdk: - openjdk25` silently falls back
+# to Java 8 (jitpack/jitpack.io#7547, closed stale without a fix), so 25 has to come from
+# sdkman. `jdk:` below is only the bootstrap JVM; if the sdkman step ever breaks, the
+# build fails loudly on the release=25 check rather than publishing wrong bytecode, and
+# the `java -version` echo shows in the build log which JDK actually ran.
 jdk:
   - openjdk21
+
+before_install:
+  - sdk install java 25-open
+  - sdk use java 25-open
+  - java -version

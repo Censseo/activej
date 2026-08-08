@@ -16,7 +16,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        java: [ 21, 25 ]
+        # 25 is the baseline since 7.0.0 (maven.compiler release=25), so a JDK 21
+        # job could not compile the reactor at all. Add newer JDKs here, never older.
+        java: [ 25 ]
     name: JDK ${{ matrix.java }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

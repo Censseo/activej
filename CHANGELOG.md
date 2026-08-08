@@ -2,6 +2,9 @@
 
 ## v7.0.0 — 2026-08-09 — QUIC / HTTP-3 stack, and security hardening
 
+**This release requires Java 25.** The baseline moved from 17, so artifacts no
+longer load on a 17 or 21 runtime — see the first entry under Breaking changes.
+
 The first release to carry the QUIC and HTTP/3 stack: three modules that did not
 exist in `v6.0-ce1` — `activej-quic` (RFC 9000/9001/9002), `activej-http3`
 (RFC 9114 with RFC 9204 QPACK) and `activej-launchers-http3`.
@@ -17,6 +20,24 @@ independently from here on, under plain semantic versioning: `7.0.0` is a major
 bump because of the breaking changes below, not a claim on any upstream release.
 
 ### Breaking changes
+
+- **Java 25 is the baseline.** The reactor compiles with `maven.compiler`
+  `release=25`, so every artifact carries class file version 69 and **a consumer
+  running Java 17 or 21 will fail to load it** with `UnsupportedClassVersionError`.
+  Previously the baseline was 17. Consequences worth knowing:
+
+  - The compiler configuration moved from `<source>`/`<target>` to `<release>`.
+    The old pair only bounded the emitted bytecode, leaving javac free to link
+    whatever API the build JDK shipped — a call added after the baseline compiled
+    fine and failed at runtime with `NoSuchMethodError`. `<release>` pins the API
+    surface too, so that class of escape is now caught at compile time.
+  - The CI matrix drops JDK 21 and builds on 25 only; a 21 job could not compile
+    the reactor at all.
+  - The archetype templates and the `examples/tutorials` projects moved to 25 for
+    the same reason: a project targeting 17 cannot read a version-69 class file.
+  - JitPack provisions no JDK 25 (`jdk: - openjdk25` silently falls back to Java 8,
+    see jitpack/jitpack.io#7547), so [jitpack.yml](jitpack.yml) installs it through
+    sdkman in `before_install`.
 
 - **HTTP server read/write timeout.** `HttpServer` now applies a default
   read/write timeout of 60 seconds (previously unlimited). Long-lived responses
@@ -152,6 +173,28 @@ bump because of the breaking changes below, not a claim on any upstream release.
   `hasCryptoStream()` is `false` for it alone.
 
 ### Notable fixes
+
+- **DI: a generic module's `new Key<A>() {}` resolves again at source level 18 and
+  above.** `Key` and `KeyPattern` recover the enclosing module instance — the one
+  that says what `A` actually is — through the synthetic `this$0` field, and javac
+  emits that field only up to source 17: from 18 on it is omitted whenever the
+  anonymous subclass never reads the enclosing instance, which is precisely the
+  shape of `new Key<A>() {}`. The instance is passed to the constructor and
+  discarded, so reflection cannot recover it, and every such key failed with
+  `IllegalArgumentException: Key should not contain a type variable`.
+
+  `AbstractModule` now publishes itself for the two windows in which user code
+  writes those keys — its own construction, covering field initializers, and
+  `configure()` — and `ReflectionUtils.getOuterClassInstance` falls back to that
+  only after the `this$0` lookup fails, only for an instance of the anonymous
+  class's own enclosing class. Type-variable binding then substitutes exactly the
+  variables that class declares, so a hint that does not fit changes nothing and
+  the original error still stands.
+
+  This was reachable before Java 25 became the baseline: **any consumer compiling
+  their own generic module at source 18 or above already hit it**, whatever source
+  level ActiveJ itself was built with. Ordinary keys such as
+  `new Key<List<String>>() {}` were never affected.
 
 - Fixed an authentication bypass in `BasicAuthServlet` when a username was
   absent from the credentials store, while preserving constant-time comparison.
