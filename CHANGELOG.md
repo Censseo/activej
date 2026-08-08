@@ -1,11 +1,20 @@
 # Changelog
 
-## Unreleased — security and robustness hardening
+## v7.0.0 — 2026-08-09 — QUIC / HTTP-3 stack, and security hardening
 
-This release hardens core and networked components against resource exhaustion,
+The first release to carry the QUIC and HTTP/3 stack: three modules that did not
+exist in `v6.0-ce1` — `activej-quic` (RFC 9000/9001/9002), `activej-http3`
+(RFC 9114 with RFC 9204 QPACK) and `activej-launchers-http3`.
+
+It also hardens core and networked components against resource exhaustion,
 request smuggling and abuse. Several safe-by-default limits are now enforced;
 applications that relied on the previous unlimited behavior must opt out
 explicitly.
+
+**On the version number.** This release leaves the `6.0-ce` line. Upstream
+ActiveJ has been unmaintained since January 2026, so this fork versions itself
+independently from here on, under plain semantic versioning: `7.0.0` is a major
+bump because of the breaking changes below, not a claim on any upstream release.
 
 ### Breaking changes
 
