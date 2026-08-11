@@ -1,5 +1,73 @@
 # Changelog
 
+## Unreleased
+
+### Notable additions
+
+- **JSON-RPC 2.0 protocol core.** A new profile-gated module `extra/cloud-jsonrpc`
+  (`activej-jsonrpc`, package `io.activej.jsonrpc`) carrying the JSON-RPC 2.0
+  **envelope** and nothing else: request, notification, response, error object and
+  batch as immutable `record`s behind sealed interfaces, a decoder over a
+  contiguous `byte[]` that leaves `params` / `result` / `error.data` undecoded, and
+  a deterministic encoder. There is no transport, no dispatcher and no code
+  generation; the module holds no `Reactor`, returns no `Promise` and touches no
+  `ByteBuf`, so it is usable and testable without an eventloop.
+
+  It is built **only** under `-P extra` and adds no third-party dependency — it
+  consumes `activej-json` and `activej-common`, and inherits dsl-json `1.10.0`
+  from `extra/pom.xml` without redeclaring it.
+
+  The specification's §7 examples ship as replayable conformance vectors under
+  `src/test/resources/io/activej/jsonrpc/conformance/`, alongside vectors for this
+  implementation's own strictness decisions. Vector **names are stable once
+  published**; later features reference them by name.
+
+  Three safe-by-default bounds, each an `ApplicationSettings` key resolved from
+  `io.activej.jsonrpc.JsonRpcLimits.<setting>` or `JsonRpcLimits.<setting>`, so
+  the fully qualified and the short spelling work alike. All three ship
+  **enabled** — a consumer opts out by raising one, never in by enabling one:
+
+  | Setting | Default | What it bounds | Behaviour at the bound | Opt out with |
+  |---|---|---|---|---|
+  | `maxBodySize` | `1mb` | the length of one envelope, checked before parsing | refused with `-32001` | `-DJsonRpcLimits.maxBodySize=4mb` |
+  | `maxBatchSize` | `100` | elements in one batch, applied **while** they are decoded | refused with `-32002`, one document for the whole batch | `-DJsonRpcLimits.maxBatchSize=1000` |
+  | `maxJsonDepth` | `64` | JSON nesting depth, by a string-aware scan run **before** the parser | refused with `-32003` | `-DJsonRpcLimits.maxJsonDepth=256` |
+
+  The depth bound cannot be delegated to the parser: dsl-json's
+  `JsonReader.skip()` recurses one stack frame per nesting level and exposes no
+  depth hook, so a deep document exhausts the stack *inside* the parser before any
+  in-parse check could run. `1mb` is chosen because a JSON-RPC envelope is a
+  control message — `core-http`'s `100mb` body default is sized for arbitrary
+  bodies and is the wrong reference point.
+
+  `JsonRpcLimits.MAX_BODY_SIZE` is readable without an instance so that a
+  transport can bound its own accumulation loop *before* a full envelope array
+  exists; applying a size bound to an array already allocated has paid most of the
+  cost already.
+
+  Four error codes are allocated inside the `-32099 … -32000` range JSON-RPC 2.0
+  §5.1 reserves for implementation-defined server errors. **These are published
+  contract** — changing the meaning of one later is a breaking change:
+
+  | Code | Message | Meaning |
+  |---|---|---|
+  | `-32001` | `Request too large` | the envelope exceeded `maxBodySize` |
+  | `-32002` | `Batch too large` | the batch exceeded `maxBatchSize` |
+  | `-32003` | `Nesting too deep` | the document exceeded `maxJsonDepth` |
+  | `-32004` | `Invalid response` | a peer's Response object violates §5 — both or neither of `result`/`error`, a missing `id`, or a malformed error object |
+
+  A distinct code per bound is deliberate: a peer that receives `-32600` cannot
+  tell "your envelope was malformed" from "your envelope was too big", and the two
+  have different remedies. `-32004` exists because a peer's malformed *response*
+  is not an internal error on our side, and `-32603` would say it was.
+
+  The five predefined codes of §5.1 (`-32700`, `-32600`, `-32601`, `-32602`,
+  `-32603`) are exposed as named constants on `JsonRpcErrors` with the
+  specification's canonical messages. Its `of(...)` factory **refuses** a code in
+  the reserved `-32768 … -32000` range so an application cannot accidentally
+  publish a document a client will read as "method not found"; decoding a peer's
+  error accepts any code, so nothing a conforming peer sends is ever discarded.
+
 ## v7.0.0 — 2026-08-09 — QUIC / HTTP-3 stack, and security hardening
 
 **This release requires Java 25.** The baseline moved from 17, so artifacts no

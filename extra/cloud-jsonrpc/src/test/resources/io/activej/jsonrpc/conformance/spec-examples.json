@@ -1,0 +1,111 @@
+{
+  "source": "JSON-RPC 2.0 specification, 7 Examples (https://www.jsonrpc.org/specification)",
+  "stability": "Vector NAMES are stable once published: features 03/04/06/07/08 reference them by name, so renaming or removing one breaks a downstream test. Adding vectors is safe.",
+  "vectors": [
+    {
+      "name": "positional-params-subtract",
+      "description": "a request with positional parameters; the response carries the same id, of the same JSON type",
+      "request": "{\"jsonrpc\": \"2.0\", \"method\": \"subtract\", \"params\": [42, 23], \"id\": 1}",
+      "response": "{\"jsonrpc\": \"2.0\", \"result\": 19, \"id\": 1}",
+      "exactBytes": false
+    },
+    {
+      "name": "positional-params-subtract-reversed",
+      "description": "positional parameter order is significant to the method, and the envelope layer preserves it verbatim",
+      "request": "{\"jsonrpc\": \"2.0\", \"method\": \"subtract\", \"params\": [23, 42], \"id\": 2}",
+      "response": "{\"jsonrpc\": \"2.0\", \"result\": -19, \"id\": 2}",
+      "exactBytes": false
+    },
+    {
+      "name": "named-params-subtract",
+      "description": "params may be an object as well as an array (\u00a74.2); both are structured forms",
+      "request": "{\"jsonrpc\": \"2.0\", \"method\": \"subtract\", \"params\": {\"subtrahend\": 23, \"minuend\": 42}, \"id\": 3}",
+      "response": "{\"jsonrpc\": \"2.0\", \"result\": 19, \"id\": 3}",
+      "exactBytes": false
+    },
+    {
+      "name": "named-params-subtract-reordered",
+      "description": "member order inside an object-shaped params does not change decoding",
+      "request": "{\"jsonrpc\": \"2.0\", \"method\": \"subtract\", \"params\": {\"minuend\": 42, \"subtrahend\": 23}, \"id\": 4}",
+      "response": "{\"jsonrpc\": \"2.0\", \"result\": 19, \"id\": 4}",
+      "exactBytes": false
+    },
+    {
+      "name": "notification-update",
+      "description": "a notification carries no id and produces no response document at all (\u00a74.1)",
+      "request": "{\"jsonrpc\": \"2.0\", \"method\": \"update\", \"params\": [1,2,3,4,5]}",
+      "response": null,
+      "exactBytes": false
+    },
+    {
+      "name": "notification-foobar",
+      "description": "a notification with no params at all is still a notification, and still answers nothing",
+      "request": "{\"jsonrpc\": \"2.0\", \"method\": \"foobar\"}",
+      "response": null,
+      "exactBytes": false
+    },
+    {
+      "name": "method-not-found",
+      "description": "an unresolvable method is -32601; the id is echoed as the string it arrived as, not coerced to a number",
+      "request": "{\"jsonrpc\": \"2.0\", \"method\": \"foobar\", \"id\": \"1\"}",
+      "response": "{\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32601, \"message\": \"Method not found\"}, \"id\": \"1\"}",
+      "exactBytes": false
+    },
+    {
+      "name": "invalid-json",
+      "description": "input that is not well-formed JSON is -32700 with a null id: no id can be trusted from a document that did not parse",
+      "request": "{\"jsonrpc\": \"2.0\", \"method\": \"foobar, \"params\": \"bar\", \"baz]",
+      "response": "{\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32700, \"message\": \"Parse error\"}, \"id\": null}",
+      "exactBytes": false
+    },
+    {
+      "name": "invalid-request-object",
+      "description": "well-formed JSON that is not a valid Request object is -32600, not -32700",
+      "request": "{\"jsonrpc\": \"2.0\", \"method\": 1, \"params\": \"bar\"}",
+      "response": "{\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32600, \"message\": \"Invalid Request\"}, \"id\": null}",
+      "exactBytes": false
+    },
+    {
+      "name": "batch-invalid-json",
+      "description": "a break in the ARRAY's own structure leaves no element boundaries to report against, so the answer is a single -32700 object rather than an array",
+      "request": "[{\"jsonrpc\": \"2.0\", \"method\": \"sum\", \"params\": [1,2,4], \"id\": \"1\"}, {\"jsonrpc\": \"2.0\", \"method\"]",
+      "response": "{\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32700, \"message\": \"Parse error\"}, \"id\": null}",
+      "exactBytes": false
+    },
+    {
+      "name": "batch-empty-array",
+      "description": "an empty array is a single -32600 OBJECT, not an empty array of errors and not a batch (\u00a76)",
+      "request": "[]",
+      "response": "{\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32600, \"message\": \"Invalid Request\"}, \"id\": null}",
+      "exactBytes": false
+    },
+    {
+      "name": "batch-invalid-single",
+      "description": "a one-element batch stays a batch: its single error renders as an ARRAY of one, unlike the empty-array case",
+      "request": "[1]",
+      "response": "[{\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32600, \"message\": \"Invalid Request\"}, \"id\": null}]",
+      "exactBytes": false
+    },
+    {
+      "name": "batch-invalid-three",
+      "description": "every non-object element is refused individually; three bad elements give three errors, not one",
+      "request": "[1,2,3]",
+      "response": "[{\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32600, \"message\": \"Invalid Request\"}, \"id\": null}, {\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32600, \"message\": \"Invalid Request\"}, \"id\": null}, {\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32600, \"message\": \"Invalid Request\"}, \"id\": null}]",
+      "exactBytes": false
+    },
+    {
+      "name": "batch-mixed",
+      "description": "requests, a notification and an invalid element in one array: five responses for six elements, correlated by id alone and never by position",
+      "request": "[{\"jsonrpc\": \"2.0\", \"method\": \"sum\", \"params\": [1,2,4], \"id\": \"1\"}, {\"jsonrpc\": \"2.0\", \"method\": \"notify_hello\", \"params\": [7]}, {\"jsonrpc\": \"2.0\", \"method\": \"subtract\", \"params\": [42,23], \"id\": \"2\"}, {\"foo\": \"boo\"}, {\"jsonrpc\": \"2.0\", \"method\": \"foo.get\", \"params\": {\"name\": \"myself\"}, \"id\": \"5\"}, {\"jsonrpc\": \"2.0\", \"method\": \"get_data\", \"id\": \"9\"}]",
+      "response": "[{\"jsonrpc\": \"2.0\", \"result\": 7, \"id\": \"1\"}, {\"jsonrpc\": \"2.0\", \"result\": 19, \"id\": \"2\"}, {\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32600, \"message\": \"Invalid Request\"}, \"id\": null}, {\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32601, \"message\": \"Method not found\"}, \"id\": \"5\"}, {\"jsonrpc\": \"2.0\", \"result\": [\"hello\", 5], \"id\": \"9\"}]",
+      "exactBytes": false
+    },
+    {
+      "name": "batch-all-notifications",
+      "description": "a batch of notifications only produces no response document at all - distinct from an empty array",
+      "request": "[{\"jsonrpc\": \"2.0\", \"method\": \"notify_sum\", \"params\": [1,2,4]}, {\"jsonrpc\": \"2.0\", \"method\": \"notify_hello\", \"params\": [7]}]",
+      "response": null,
+      "exactBytes": false
+    }
+  ]
+}

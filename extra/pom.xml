@@ -29,6 +29,7 @@
     <module>cloud-redis</module>
     <module>util-etcd</module>
     <module>util-json</module>
+    <module>cloud-jsonrpc</module>
     <module>launchers</module>
   </modules>
 
