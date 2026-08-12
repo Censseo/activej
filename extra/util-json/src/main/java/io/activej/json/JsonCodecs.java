@@ -24,7 +24,9 @@ import io.activej.common.annotation.StaticFactories;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
-import java.time.LocalDate;
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.time.*;
 import java.time.format.DateTimeParseException;
 import java.util.*;
 import java.util.function.Function;
@@ -79,6 +81,117 @@ public class JsonCodecs {
 
 	public static JsonCodec<LocalDate> ofLocalDate() {
 		return new JsonCodecLocalDate();
+	}
+
+	/**
+	 * ISO-8601, as {@code LocalTime.toString()} writes it — which is <b>variable length</b>: the
+	 * seconds are omitted when zero and the nanoseconds when zero, so {@code 10:15} and
+	 * {@code 10:15:30.123456789} are both produced by this codec.
+	 */
+	public static JsonCodec<LocalTime> ofLocalTime() {
+		return transform(ofString(),
+			LocalTime::toString,
+			string -> {
+				try {
+					return LocalTime.parse(string);
+				} catch (DateTimeParseException e) {
+					throw new JsonValidationException("Malformed LocalTime: " + string, e);
+				}
+			});
+	}
+
+	/** ISO-8601, as {@code LocalDateTime.toString()} writes it. */
+	public static JsonCodec<LocalDateTime> ofLocalDateTime() {
+		return transform(ofString(),
+			LocalDateTime::toString,
+			string -> {
+				try {
+					return LocalDateTime.parse(string);
+				} catch (DateTimeParseException e) {
+					throw new JsonValidationException("Malformed LocalDateTime: " + string, e);
+				}
+			});
+	}
+
+	/**
+	 * ISO-8601 ({@code DateTimeFormatter.ISO_INSTANT}), <b>not</b> epoch milliseconds: the string form
+	 * keeps nanosecond precision and is readable, while {@code toEpochMilli} truncates.
+	 */
+	public static JsonCodec<Instant> ofInstant() {
+		return transform(ofString(),
+			Instant::toString,
+			string -> {
+				try {
+					return Instant.parse(string);
+				} catch (DateTimeParseException e) {
+					throw new JsonValidationException("Malformed Instant: " + string, e);
+				}
+			});
+	}
+
+	/** ISO-8601 {@code PnDTnHnMn.nS}; {@code Duration.ZERO} is {@code "PT0S"} and a negative duration round-trips. */
+	public static JsonCodec<Duration> ofDuration() {
+		return transform(ofString(),
+			Duration::toString,
+			string -> {
+				try {
+					return Duration.parse(string);
+				} catch (DateTimeParseException e) {
+					throw new JsonValidationException("Malformed Duration: " + string, e);
+				}
+			});
+	}
+
+	/**
+	 * The canonical lower-case {@code UUID.toString()}. Decoding is case-insensitive because
+	 * {@code UUID.fromString} is, so a round trip <b>normalises case</b> — value-preserving, not
+	 * byte-preserving, for an upper-case source.
+	 */
+	public static JsonCodec<UUID> ofUuid() {
+		return transform(ofString(),
+			UUID::toString,
+			string -> {
+				try {
+					return UUID.fromString(string);
+				} catch (IllegalArgumentException e) {
+					throw new JsonValidationException("Malformed UUID: " + string, e);
+				}
+			});
+	}
+
+	/**
+	 * A JSON <b>string</b>, and a JSON number is refused deliberately: a numeric encoding would make
+	 * round-trip equality depend on the parser's normalization, since dsl-json yields {@code Long} for
+	 * any integral literal and {@code BigDecimal} for any fractional one while
+	 * {@code BigDecimal.equals} is scale-sensitive.
+	 * <p>
+	 * {@code BigDecimal.toString()} rather than {@code toPlainString()}: only the former is a
+	 * documented one-to-one mapping with {@code new BigDecimal(String)}, so scale and exponent form
+	 * survive the round trip.
+	 */
+	public static JsonCodec<BigDecimal> ofBigDecimal() {
+		return transform(ofString(),
+			BigDecimal::toString,
+			string -> {
+				try {
+					return new BigDecimal(string);
+				} catch (NumberFormatException e) {
+					throw new JsonValidationException("Malformed BigDecimal: " + string, e);
+				}
+			});
+	}
+
+	/** A JSON <b>string</b>, for the same reason as {@link #ofBigDecimal()} — plus: there is no {@code long} bound. */
+	public static JsonCodec<BigInteger> ofBigInteger() {
+		return transform(ofString(),
+			BigInteger::toString,
+			string -> {
+				try {
+					return new BigInteger(string);
+				} catch (NumberFormatException e) {
+					throw new JsonValidationException("Malformed BigInteger: " + string, e);
+				}
+			});
 	}
 
 	private static final class JsonCodecString implements JsonCodec<String> {
@@ -405,7 +518,7 @@ public class JsonCodecs {
 
 			@Override
 			protected void accumulate(LinkedHashSet<T> accumulator, int index, T value) throws JsonValidationException {
-				if (accumulator.contains(value)) throw new JsonValidationException();
+				if (accumulator.contains(value)) throw new JsonValidationException("Duplicate element: " + value);
 				accumulator.add(value);
 			}
 
@@ -493,6 +606,32 @@ public class JsonCodecs {
 
 	public static <T> JsonCodec<@Nullable T> ofNullable(JsonCodec<T> codec) {
 		return new NullableJsonCodec<>(codec);
+	}
+
+	/**
+	 * An empty {@code Optional} encodes as JSON {@code null}; a present one encodes as the bare value.
+	 * <p>
+	 * <b>Omitting</b> the member entirely is the <i>container's</i> decision, not this codec's — it is
+	 * made by {@link ObjectJsonCodec.BuilderArray}'s default-value overload, which a derived
+	 * {@code record} wires up with {@code Optional.empty()} as the default. A codec cannot omit itself,
+	 * and a second omission mechanism here would fight that one.
+	 */
+	public static <T> JsonCodec<Optional<T>> ofOptional(JsonCodec<T> codec) {
+		return new JsonCodec<>() {
+			@Override
+			public Optional<T> read(JsonReader<?> reader) throws IOException {
+				if (reader.wasNull()) return Optional.empty();
+				// ofNullable, not of: a @JsonNullable-wrapped inner codec may legitimately return null,
+				// and Optional.of would turn that into an unattributable NPE inside dsl-json
+				return Optional.ofNullable(codec.read(reader));
+			}
+
+			@Override
+			public void write(JsonWriter writer, Optional<T> value) {
+				if (checkNotNull(value).isEmpty()) writer.writeNull();
+				else codec.write(writer, value.get());
+			}
+		};
 	}
 
 	public static <T, F1> JsonCodec<T> ofObject(JsonConstructor1<F1, T> constructor,

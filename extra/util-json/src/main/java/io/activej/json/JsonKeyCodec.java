@@ -1,5 +1,7 @@
 package io.activej.json;
 
+import java.util.UUID;
+
 public interface JsonKeyCodec<T> extends JsonKeyEncoder<T>, JsonKeyDecoder<T> {
 	@Override
 	String encode(T value);
@@ -57,7 +59,12 @@ public interface JsonKeyCodec<T> extends JsonKeyEncoder<T>, JsonKeyDecoder<T> {
 				} else if (type == Double.class) {
 					this.parser = Double::parseDouble;
 				} else
-					throw new IllegalArgumentException();
+					// an INSTANCE initialiser, so this propagates out of the constructor as-is - no
+					// ExceptionInInitializerError is involved. Reachable from the shipped factory:
+					// Number.isAssignableFrom(BigDecimal.class) routes Map<BigDecimal,V> here
+					throw new IllegalArgumentException(
+						"Unsupported number key type: " + type.getName() +
+						"; supported: Byte, Short, Integer, Long, Float, Double");
 			}
 
 			@Override
@@ -71,10 +78,41 @@ public interface JsonKeyCodec<T> extends JsonKeyEncoder<T>, JsonKeyDecoder<T> {
 					//noinspection unchecked
 					return (T) parser.parse(string);
 				} catch (NumberFormatException e) {
-					throw new JsonValidationException("TODO", e);
+					// getSimpleName() here and getName() in ofEnumKey, on purpose: these are java.lang
+					// wrappers where the package adds nothing, whereas a consumer's enum is only
+					// identifiable fully qualified
+					throw new JsonValidationException("Malformed " + type.getSimpleName() + " key: " + string, e);
 				}
 			}
 		};
+	}
+
+	/** {@code Enum.name()}, verbatim — never {@code ordinal()} and never {@code toString()}. */
+	static <E extends Enum<E>> JsonKeyCodec<E> ofEnumKey(Class<E> type) {
+		return of(
+			Enum::name,
+			string -> {
+				try {
+					return Enum.valueOf(type, string);
+				} catch (IllegalArgumentException e) {
+					// Enum.valueOf also throws NPE for a null name; a JSON key is never null
+					throw new JsonValidationException(
+						"Not a constant of enum " + type.getName() + ": " + string, e);
+				}
+			});
+	}
+
+	/** The canonical lower-case {@code UUID.toString()}; decoding is case-insensitive, as {@code UUID.fromString} is. */
+	static JsonKeyCodec<UUID> ofUuidKey() {
+		return of(
+			UUID::toString,
+			string -> {
+				try {
+					return UUID.fromString(string);
+				} catch (IllegalArgumentException e) {
+					throw new JsonValidationException("Malformed UUID key: " + string, e);
+				}
+			});
 	}
 
 }

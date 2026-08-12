@@ -50,7 +50,8 @@ public abstract class AbstractArrayJsonCodec<T, A, V> implements JsonCodec<T> {
 			while (true) {
 				JsonDecoder<V> decoder = decoder(i, accumulator);
 				if (decoder == null) {
-					reader.skip();
+					if (reader.skip() != COMMA) break; // skip() consumes the separator too, and returns it
+					reader.getNextToken();
 					continue;
 				}
 				V value = decoder.read(reader);

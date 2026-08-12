@@ -146,7 +146,7 @@ public final class ObjectJsonCodec<T, A> extends AbstractMapJsonCodec<T, A, Obje
 						//noinspection ForLoopReplaceableByForEach
 						for (int i = 0; i < array.length; i++) {
 							if (array[i] == NO_DEFAULT_VALUE) {
-								throw new JsonValidationException();
+								throw new JsonValidationException("Required field \"" + fields.get(i).key() + "\" is missing");
 							}
 						}
 						return constructor.create(array);
@@ -154,7 +154,10 @@ public final class ObjectJsonCodec<T, A> extends AbstractMapJsonCodec<T, A, Obje
 					fields.toArray(Field[]::new),
 					fields.stream().collect(CollectorUtils.toHashMap(f -> f.key, f -> f))) :
 				new ObjectJsonCodec<>(
-					() -> new Object[prototype.length],
+					// when every field has a default there is no NO_DEFAULT_VALUE to sweep for, but the
+					// defaults still have to be IN the accumulator: a fresh Object[] discarded every one
+					// of them, so a record whose components are all Optional decoded {} to all-nulls
+					() -> Arrays.copyOf(prototype, prototype.length),
 					constructor::create,
 					fields.toArray(Field[]::new),
 					fields.stream().collect(CollectorUtils.toHashMap(f -> f.key, f -> f)));
