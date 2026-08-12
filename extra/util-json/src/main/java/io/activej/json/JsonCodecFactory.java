@@ -37,6 +37,12 @@ public class JsonCodecFactory implements Rebuildable<JsonCodecFactory, JsonCodec
 		this.derivationCache = derivationCache;
 	}
 
+	/**
+	 * A shared, process-lifetime factory. Resolving a record through it pins that record's
+	 * classloader for the JVM's lifetime — see {@link DerivationCache}'s "Classloader retention"
+	 * note. A host that unloads classloaders at runtime (plugins, hot redeploy) should keep a
+	 * scoped instance from {@link #builder()} instead, one per deployment.
+	 */
 	public static JsonCodecFactory defaultInstance() {
 		return DEFAULT_INSTANCE;
 	}
@@ -118,6 +124,14 @@ public class JsonCodecFactory implements Rebuildable<JsonCodecFactory, JsonCodec
 				if (keyAnnotatedType.getAnnotations().length == 0 && keyType == String.class) {
 					//noinspection unchecked
 					return JsonCodecs.ofMap((JsonCodec<Object>) ctx.scanTypeArgument(1));
+				}
+				if (keyType == String.class) {
+					// reached only with an annotation present - the unannotated case already returned above
+					throw new IllegalArgumentException(
+						"Cannot resolve a JSON codec for map type " + ctx.getType() +
+						": a String map key does not support annotations (found " +
+						Arrays.toString(keyAnnotatedType.getAnnotations()) + "), since a JSON object key is " +
+						"always a plain string with no room to carry one. Remove the annotation from the key type.");
 				}
 				if (Number.class.isAssignableFrom(keyType)) {
 					//noinspection unchecked

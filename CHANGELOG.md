@@ -184,6 +184,21 @@ All three are in `extra/util-json` (`activej-json`), built only under `-P extra`
   that branch. Every existing `Class`-keyed map — `String`, `Integer`, an `Enum`,
   a `UUID` — is bit-for-bit unaffected.
 
+- **Two more message-less exceptions from the derivation path now say what went
+  wrong**, and one existing message stopped contradicting itself. `BuilderArray`'s
+  all-defaults-missing path — now the default path for every derived record with a
+  required component — names the missing field instead of throwing a bare
+  `JsonValidationException`; `JsonCodecs.ofSet`'s duplicate-element rejection names
+  the offending value; and `JsonCodecFactory`'s `Map` mapping gives an annotated
+  `String` key (e.g. `Map<@JsonNullable String, V>`) its own refusal message instead
+  of falling into the generic "unsupported key type" one, which used to name
+  `String` as both unsupported and supported in the same sentence. Also documented,
+  no behavior change: `DerivationCache`'s Javadoc and `JsonCodecFactory.defaultInstance()`
+  now note that resolving a record through the shared static instance pins that
+  record's classloader for the JVM's lifetime — relevant to hosts that unload
+  classloaders at runtime (plugins, hot redeploy), which should keep a scoped
+  `builder()` instance per deployment instead.
+
 ## v7.0.0 — 2026-08-09 — QUIC / HTTP-3 stack, and security hardening
 
 **This release requires Java 25.** The baseline moved from 17, so artifacts no

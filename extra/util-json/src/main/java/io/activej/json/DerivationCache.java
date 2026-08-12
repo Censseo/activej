@@ -49,6 +49,15 @@ import java.util.function.Supplier;
  * a key</b> — the key is a Java type, which a payload cannot influence. Nothing is evicted, because
  * there is nothing an adversary could make grow.
  *
+ * <p><b>Classloader retention.</b> A {@link CacheKey#type} is a {@link Type}, which for any resolved
+ * record holds a live reference to its {@code Class} and therefore to its defining
+ * {@code ClassLoader}. A cache reached through {@link JsonCodecFactory#defaultInstance()} lives for
+ * the JVM's lifetime, so resolving a record from a dynamically loaded classloader — a plugin, a
+ * hot-redeployed module — through that shared instance pins the classloader for good. A host that
+ * unloads classloaders at runtime should resolve those records through a scoped, non-static
+ * {@link JsonCodecFactory} instead (one per deployment), so its cache — and everything it retains —
+ * becomes collectible when that instance does.
+ *
  * <p><b>Why the key is shaped this way.</b> A bare {@link Type} cannot serve, because annotations do
  * not live on it and {@code Box<@JsonNullable String>} and {@code Box<String>} share one
  * {@code Type} while needing different codecs; an {@link AnnotatedType} cannot serve either, because

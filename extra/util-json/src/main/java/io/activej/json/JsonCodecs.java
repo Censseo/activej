@@ -518,7 +518,7 @@ public class JsonCodecs {
 
 			@Override
 			protected void accumulate(LinkedHashSet<T> accumulator, int index, T value) throws JsonValidationException {
-				if (accumulator.contains(value)) throw new JsonValidationException();
+				if (accumulator.contains(value)) throw new JsonValidationException("Duplicate element: " + value);
 				accumulator.add(value);
 			}
 

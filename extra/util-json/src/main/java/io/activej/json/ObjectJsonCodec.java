@@ -146,7 +146,7 @@ public final class ObjectJsonCodec<T, A> extends AbstractMapJsonCodec<T, A, Obje
 						//noinspection ForLoopReplaceableByForEach
 						for (int i = 0; i < array.length; i++) {
 							if (array[i] == NO_DEFAULT_VALUE) {
-								throw new JsonValidationException();
+								throw new JsonValidationException("Required field \"" + fields.get(i).key() + "\" is missing");
 							}
 						}
 						return constructor.create(array);
