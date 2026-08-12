@@ -4,6 +4,80 @@
 
 ### Notable additions
 
+- **`JsonCodecFactory` derives a `JsonCodec` for any `record`, and for eleven more
+  built-in types.** In `extra/util-json` (`activej-json`, profile-gated behind
+  `-P extra`), `JsonCodecFactory.defaultInstance().resolve(MyRecord.class)` now
+  returns a working codec with no registration at all, recursing through nested,
+  generic, self-referencing and mutually recursive records. Previously every one of
+  these reached the `Object.class` fallback and threw
+  `UnsupportedOperationException`.
+
+  A record's **component names are the JSON keys, verbatim**, and its **canonical
+  constructor order is the emitted member order**. There is no naming strategy and
+  no way to configure either — so for a record whose JSON is persisted or published,
+  renaming or reordering a component is a wire-format change, not a Java refactor.
+  Decoding accepts members in any order; an unknown key is still
+  `JsonValidationException("Key not found: …")` and a missing member still fails, so
+  the reader's contract is unchanged.
+
+  Eleven types the factory could not previously resolve now resolve, inside a
+  derived record or standalone: `Set`, `Optional`, `UUID`, `BigDecimal`,
+  `BigInteger`, reference arrays (`T[]`, recursively), `LocalTime`, `LocalDateTime`,
+  `Instant`, `Duration`, and `Map` keyed by an `Enum` or a `UUID` on top of the
+  existing `String` and `Number` keys. `Optional` is the one with an encode-side
+  rule: `Optional.empty()` is **omitted**, and both an absent member and an explicit
+  `null` decode back to it. Deliberately still unresolved, each for a stated reason:
+  **primitive arrays** (`byte[]` would force a base64-versus-numeric commitment) and
+  `ZonedDateTime` / `OffsetDateTime` / `Period` (each carries its own normalization
+  question).
+
+  The public surface added is ten static factories and no new type: `ofUuid`,
+  `ofBigDecimal`, `ofBigInteger`, `ofLocalTime`, `ofLocalDateTime`, `ofInstant`,
+  `ofDuration` and `ofOptional(JsonCodec<T>)` on `JsonCodecs`, plus `ofEnumKey` and
+  `ofUuidKey` on `JsonKeyCodec`. Derivation itself is reflection over the canonical
+  constructor — **no bytecode generation, no new dependency**, and the module's POM
+  is unchanged. A codec is derived at `resolve(...)` time and memoized per
+  `JsonCodecFactory` instance, never per encode or decode; `rebuild()` starts a fresh
+  memo, so a rebuilt factory never serves a codec built against the component codecs
+  the consumer just replaced.
+
+  Failures surface at `resolve(...)`, never on the first payload that happens to
+  carry the field, and they name the full path from the root:
+
+  ```text
+  Cannot derive a JSON codec at Order.lines[].product.registeredAt: record
+  com.example.Product, component 'registeredAt' of type java.time.ZonedDateTime:
+  no codec is registered for it; register one with
+  JsonCodecFactory.rebuild().with(Type, Mapping).build()
+  ```
+
+  **Opting out is one registration** — no flag was added because none is needed:
+
+  ```java
+  JsonCodecFactory strict = JsonCodecFactory.defaultInstance().rebuild()
+      .with(Record.class, ctx -> { throw new UnsupportedOperationException(); })
+      .build();
+  ```
+
+  **One narrow behaviour change beyond "types that threw now work."** Derivation is
+  registered on `java.lang.Record` inside `JsonCodecFactory.builder()`, so it always
+  precedes any entry a consumer adds through `rebuild().with(...)`, and
+  `TypeScannerRegistry.match` promotes only a candidate assignable to the incumbent.
+  A registration on a record's **exact type** still wins, as it always did. A
+  registration on a record's **supertype or interface** no longer does — before this
+  change it was the only candidate and won by default; now the derived codec does.
+  Nothing in this repository regresses (the only `JsonCodecFactory` registrations
+  outside the module are `cloud-lsmt-cube`'s and `launchers/crdt`'s, and `CrdtData`
+  is a `final class`, not a record), but a consumer relying on an interface-level
+  registration for a `record` implementation must move it to the record type, or use
+  the opt-out above.
+
+  A second, smaller consequence: resolving a **record** whose derivation fails now
+  raises `IllegalArgumentException` with the original failure as `getCause()`, where
+  the untouched `Object.class` fallback still raises a bare
+  `UnsupportedOperationException`. The two signals stay distinguishable, and the
+  fallback's behaviour for every non-record type is byte-for-byte what it was.
+
 - **JSON-RPC 2.0 protocol core.** A new profile-gated module `extra/cloud-jsonrpc`
   (`activej-jsonrpc`, package `io.activej.jsonrpc`) carrying the JSON-RPC 2.0
   **envelope** and nothing else: request, notification, response, error object and
@@ -67,6 +141,48 @@
   the reserved `-32768 … -32000` range so an application cannot accidentally
   publish a document a client will read as "method not found"; decoding a peer's
   error accepts any code, so nothing a conforming peer sends is ever discarded.
+
+### Notable fixes
+
+All three are in `extra/util-json` (`activej-json`), built only under `-P extra`.
+
+- **`ObjectJsonCodec.BuilderArray` no longer discards every default when *every*
+  field has one.** `doBuild()` branches on whether any field is still
+  `NO_DEFAULT_VALUE`; the mixed branch already seeded the accumulator from the
+  prototype, but the all-defaulted branch allocated a fresh `Object[]` and threw the
+  defaults away, so `{}` decoded to all-nulls instead of to the defaults. The two
+  branches now differ only in their finaliser, which is the only thing they should
+  ever have differed in. No shipped consumer reached the broken branch — the cube's
+  two `ObjectJsonCodec.builder(...)` call sites use the mixed branch and a
+  `BuilderObject` respectively — but a record whose components are all `Optional`
+  reaches it on the first decode.
+
+- **`AbstractMapJsonCodec.read` and `AbstractArrayJsonCodec.read` no longer drop
+  members after a skipped one.** A subclass returning `null` from `decoder(...)` to
+  ignore a member had its cursor left one token past the separator: `skip()`
+  consumes the following `,` **and returns it**, and both templates then did a bare
+  `continue`, re-entering `readKey()` on the byte after the comma. Both now use the
+  byte `skip()` returns as the separator and `break` into the existing
+  `checkObjectEnd()` / `checkArrayEnd()` when it is not a comma. Unreachable from
+  the codecs shipped in the module (every `decoder(...)` override there either
+  returns a codec or throws), so nothing in this repository changes behaviour; any
+  subclass outside it that skips unknown members was silently losing data, or —
+  more often, since the misplaced cursor usually lands on a separator where
+  `readKey()` demands a quote — failing with a `ParsingException` that named a
+  position rather than the cause. Regression test: `SkipBranchTest`.
+
+- **Three placeholder exceptions in shipped code now say what went wrong.** The
+  `Map` mapping's `IllegalArgumentException("TODO")` for an unsupported key type now
+  names the whole map type, the offending key type and the supported set; the same
+  mapping's `(Class<?>)` cast on the key type became `Types.getRawType(...)`, so
+  `Map<List<String>, V>` reaches that named refusal instead of a bare
+  `ClassCastException` thrown out of the factory before any branch ran; and
+  `JsonKeyCodec.ofNumberKey` replaces both a `JsonValidationException("TODO")` on a
+  malformed key and a completely message-less `IllegalArgumentException` on an
+  unsupported number type — the latter became reachable in this release, because
+  `Number.class.isAssignableFrom(BigDecimal.class)` routes `Map<BigDecimal, V>` into
+  that branch. Every existing `Class`-keyed map — `String`, `Integer`, an `Enum`,
+  a `UUID` — is bit-for-bit unaffected.
 
 ## v7.0.0 — 2026-08-09 — QUIC / HTTP-3 stack, and security hardening
 

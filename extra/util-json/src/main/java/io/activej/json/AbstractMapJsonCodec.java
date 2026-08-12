@@ -66,7 +66,8 @@ public abstract class AbstractMapJsonCodec<T, A, V> implements JsonCodec<T> {
 				String key = reader.readKey();
 				JsonDecoder<V> decoder = decoder(key, i, accumulator);
 				if (decoder == null) {
-					reader.skip();
+					if (reader.skip() != COMMA) break; // skip() consumes the separator too, and returns it
+					reader.getNextToken();
 					continue;
 				}
 				V value = decoder.read(reader);
