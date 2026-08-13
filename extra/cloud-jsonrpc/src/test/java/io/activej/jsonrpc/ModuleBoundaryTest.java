@@ -16,7 +16,9 @@
 
 package io.activej.jsonrpc;
 
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -25,22 +27,29 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
  * The boundary guard for {@code extra/cloud-jsonrpc}.
  * <p>
- * Two properties are asserted by scanning this module's own {@code src/main} sources as text:
+ * Properties are asserted by scanning a module's {@code src/main} sources as text:
  * <ol>
  *     <li><b>FR-004 / FR-007 / FR-085 / SC-005</b> — no source file imports a reactor, {@code Promise},
  *     {@code ByteBuf}, transport, codegen, {@code activej-rpc} or {@code slf4j} type. Reading the POM alone
  *     would miss any of these: {@code slf4j-api} is a <i>global</i> compile dependency declared in the root
  *     {@code pom.xml}, and {@code activej-common} can reach further types transitively.</li>
+ *     <li><b>FR-108 / FR-109</b> — the reactor and {@code Promise} prefixes are <i>package-scoped</i>
+ *     rather than module-wide: they are permitted inside {@code io.activej.jsonrpc.service} and
+ *     {@code io.activej.jsonrpc.transport} (and their subpackages), but stay rejected everywhere else in
+ *     this module, including {@code io.activej.jsonrpc} and {@code io.activej.jsonrpc.impl}. The other
+ *     seven forbidden prefixes remain module-wide.</li>
  *     <li><b>FR-022</b> — no field (and no {@code record} component) is declared as a
  *     {@code com.dslplatform.json.JsonReader}. A retained reader is the obvious first implementation of a
  *     deferred payload and it is wrong: dsl-json's index space does not survive a buffer refill, so the
@@ -63,6 +72,19 @@ public class ModuleBoundaryTest {
 		"org.slf4j"
 	);
 
+	/**
+	 * The two prefixes this feature confines to {@link #PERMITTED_PACKAGES} instead of forbidding
+	 * module-wide (FR-108). Every other entry in {@link #FORBIDDEN_IMPORT_PREFIXES} stays module-wide
+	 * (FR-109).
+	 */
+	private static final Set<String> PACKAGE_SCOPED_PREFIXES = Set.of("io.activej.reactor", "io.activej.promise");
+
+	/** Packages (and subpackages) where {@link #PACKAGE_SCOPED_PREFIXES} are permitted. */
+	private static final Set<String> PERMITTED_PACKAGES = Set.of(
+		"io.activej.jsonrpc.service",
+		"io.activej.jsonrpc.transport"
+	);
+
 	private static final Pattern IMPORT = Pattern.compile("^\\s*import\\s+(?:static\\s+)?([\\w.$]+)\\s*;");
 
 	/**
@@ -81,22 +103,12 @@ public class ModuleBoundaryTest {
 
 	private static final Pattern JSON_READER_TYPE = Pattern.compile("\\bJsonReader\\b");
 
+	@Rule
+	public TemporaryFolder tmp = new TemporaryFolder();
+
 	@Test
 	public void noForbiddenImport() {
-		List<String> violations = new ArrayList<>();
-		for (Path source : mainSources()) {
-			String text = read(source);
-			for (String line : text.split("\n")) {
-				Matcher matcher = IMPORT.matcher(line);
-				if (!matcher.find()) continue;
-				String imported = matcher.group(1);
-				for (String forbidden : FORBIDDEN_IMPORT_PREFIXES) {
-					if (imported.equals(forbidden) || imported.startsWith(forbidden + ".")) {
-						violations.add(source + " imports " + imported + " (forbidden prefix " + forbidden + ")");
-					}
-				}
-			}
-		}
+		List<String> violations = findForbiddenImportViolations(mainRoot());
 		if (!violations.isEmpty()) {
 			fail("this module must stay free of the reactor, transport, codegen and logging stacks:\n\t" +
 				 String.join("\n\t", violations));
@@ -104,9 +116,51 @@ public class ModuleBoundaryTest {
 	}
 
 	@Test
+	public void reactorAndPromisePermittedOnlyInServiceAndTransportPackages() throws IOException {
+		Path root = tmp.newFolder("permitted-scan").toPath();
+		writeSyntheticSource(root, "io.activej.jsonrpc.service", "InService",
+			"io.activej.promise.Promise", "io.activej.reactor.Reactor");
+		writeSyntheticSource(root, "io.activej.jsonrpc.transport", "InTransport",
+			"io.activej.promise.Promise", "io.activej.reactor.Reactor");
+		writeSyntheticSource(root, "io.activej.jsonrpc.service.impl", "InServiceImpl",
+			"io.activej.promise.Promise");
+		writeSyntheticSource(root, "io.activej.jsonrpc", "InEnvelope",
+			"io.activej.promise.Promise", "io.activej.reactor.Reactor");
+		writeSyntheticSource(root, "io.activej.jsonrpc.impl", "InEnvelopeImpl",
+			"io.activej.promise.Promise", "io.activej.reactor.Reactor");
+
+		List<String> violations = findForbiddenImportViolations(root);
+
+		for (String violation : violations) {
+			assertTrue("io.activej.jsonrpc.service and .transport must never be flagged for reactor/promise, " +
+					   "but got: " + violation,
+				!violation.contains("InService.java") && !violation.contains("InTransport.java") &&
+				!violation.contains("InServiceImpl.java"));
+		}
+		assertEquals("io.activej.jsonrpc and io.activej.jsonrpc.impl must still reject both scoped prefixes " +
+					 "(2 violations each): " + violations,
+			4, violations.stream()
+				.filter(v -> v.contains("InEnvelope.java") || v.contains("InEnvelopeImpl.java"))
+				.count());
+	}
+
+	@Test
+	public void misplacedPromiseImportInEnvelopePackageIsRejected() throws IOException {
+		// SC-011: the guard must be shown to actually catch a violation, not merely report zero every time.
+		Path root = tmp.newFolder("negative-scan").toPath();
+		writeSyntheticSource(root, "io.activej.jsonrpc", "Misplaced", "io.activej.promise.Promise");
+
+		List<String> violations = findForbiddenImportViolations(root);
+
+		assertEquals("a deliberately misplaced import must be reported exactly once: " + violations,
+			1, violations.size());
+		assertTrue(violations.get(0).contains("io.activej.promise.Promise"));
+	}
+
+	@Test
 	public void noRetainedJsonReader() {
 		List<String> violations = new ArrayList<>();
-		for (Path source : mainSources()) {
+		for (Path source : sourcesUnder(mainRoot())) {
 			String text = read(source);
 
 			Matcher field = JSON_READER_FIELD.matcher(text);
@@ -134,6 +188,55 @@ public class ModuleBoundaryTest {
 		assertTrue("src/main/java was not found from " + Path.of("").toAbsolutePath(), Files.isDirectory(mainRoot()));
 	}
 
+	private static List<String> findForbiddenImportViolations(Path root) {
+		List<String> violations = new ArrayList<>();
+		for (Path source : sourcesUnder(root)) {
+			boolean scopePermitted = isPermittedPackage(packageOf(root, source));
+			String text = read(source);
+			for (String line : text.split("\n")) {
+				Matcher matcher = IMPORT.matcher(line);
+				if (!matcher.find()) continue;
+				String imported = matcher.group(1);
+				for (String forbidden : FORBIDDEN_IMPORT_PREFIXES) {
+					if (!(imported.equals(forbidden) || imported.startsWith(forbidden + "."))) continue;
+					if (scopePermitted && PACKAGE_SCOPED_PREFIXES.contains(forbidden)) continue;
+					violations.add(source + " imports " + imported + " (forbidden prefix " + forbidden + ")");
+				}
+			}
+		}
+		return violations;
+	}
+
+	private static boolean isPermittedPackage(String pkg) {
+		for (String permitted : PERMITTED_PACKAGES) {
+			if (pkg.equals(permitted) || pkg.startsWith(permitted + ".")) return true;
+		}
+		return false;
+	}
+
+	private static String packageOf(Path root, Path source) {
+		Path relativeDir = root.relativize(source.getParent());
+		StringBuilder sb = new StringBuilder();
+		for (Path part : relativeDir) {
+			if (!sb.isEmpty()) sb.append('.');
+			sb.append(part);
+		}
+		return sb.toString();
+	}
+
+	private static void writeSyntheticSource(Path root, String packageName, String className, String... imports)
+		throws IOException {
+		Path dir = root.resolve(packageName.replace('.', '/'));
+		Files.createDirectories(dir);
+		StringBuilder sb = new StringBuilder();
+		sb.append("package ").append(packageName).append(";\n\n");
+		for (String imp : imports) {
+			sb.append("import ").append(imp).append(";\n");
+		}
+		sb.append("\nclass ").append(className).append(" {}\n");
+		Files.writeString(dir.resolve(className + ".java"), sb.toString(), StandardCharsets.UTF_8);
+	}
+
 	private static Path mainRoot() {
 		Path local = Path.of("src", "main", "java");
 		if (Files.isDirectory(local)) return local;
@@ -141,8 +244,7 @@ public class ModuleBoundaryTest {
 		return Path.of("extra", "cloud-jsonrpc", "src", "main", "java");
 	}
 
-	private static List<Path> mainSources() {
-		Path root = mainRoot();
+	private static List<Path> sourcesUnder(Path root) {
 		if (!Files.isDirectory(root)) return List.of();
 		try (Stream<Path> walk = Files.walk(root)) {
 			return walk.filter(p -> p.getFileName().toString().endsWith(".java")).sorted().toList();

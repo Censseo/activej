@@ -19,11 +19,34 @@ package io.activej.jsonrpc;
 import io.activej.common.exception.MalformedDataException;
 import io.activej.json.JsonCodec;
 import io.activej.json.JsonCodecs;
+import io.activej.jsonrpc.service.JsonRpcClient;
+import io.activej.jsonrpc.service.JsonRpcDispatcher;
+import io.activej.jsonrpc.service.fixtures.InMemoryTransport;
+import io.activej.jsonrpc.service.fixtures.PaymentsApi;
+import io.activej.jsonrpc.service.fixtures.PaymentsApiImpl;
+import io.activej.jsonrpc.service.fixtures.User;
+import io.activej.jsonrpc.service.fixtures.UserApi;
+import io.activej.jsonrpc.service.fixtures.UserApiImpl;
+import io.activej.jsonrpc.transport.JsonRpcTransport;
+import io.activej.promise.Promise;
+import io.activej.reactor.Reactor;
+import io.activej.test.rules.EventloopRule;
+import org.jetbrains.annotations.Nullable;
+import org.junit.ClassRule;
 import org.junit.Test;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
+import static io.activej.promise.TestUtils.await;
+import static io.activej.promise.TestUtils.awaitException;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -31,13 +54,28 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The worked example from the module README, as compiled and executed code (SC-007).
+ * The worked example from the module README, as compiled and executed code (SC-007, FR-103).
  * <p>
  * <b>The README's code blocks are copied from this file, not the other way round.</b> A README example
  * that only exists as prose rots into a lie the first time the API moves; this way the build fails
  * instead. If you change one, change the other — and run this test.
+ * <p>
+ * {@link #everyReadmeBlockIsCopiedFromCompilingCode()} makes that a build gate rather than a convention: it
+ * reads {@code README.md} and asserts that every {@code java} block appears, line for line, in one of the
+ * files it claims to be copied from.
+ * <p>
+ * Two README blocks are copied from files rather than from a method here, because their subject <i>is</i> a
+ * whole file: the annotated interface is
+ * {@link io.activej.jsonrpc.service.fixtures.UserApi UserApi}, and the conformance-harness subject is
+ * {@link io.activej.jsonrpc.service.InMemoryTransportConformanceTest InMemoryTransportConformanceTest}. Both
+ * compile and run in this same suite, so the guarantee is the same one.
+ * <p>
+ * The service-layer examples use the interface and the transport double the rest of the suite uses, so a
+ * change that breaks them breaks far more than the README.
  */
 public class ReadmeExampleTest {
+	@ClassRule
+	public static final EventloopRule eventloopRule = new EventloopRule();
 
 	private static final JsonCodec<List<Integer>> LIST_OF_INT = JsonCodecs.ofList(JsonCodecs.ofInteger());
 
@@ -185,6 +223,199 @@ public class ReadmeExampleTest {
 
 		// mutating the envelope after decoding invalidates every payload derived from it
 		assertEquals(7, request.params().size());
+	}
+
+	// ---------------------------------------------------------------------------------------------------
+	// The service layer. The interface behind every block below is the UserApi fixture, which the README
+	// quotes verbatim.
+	// ---------------------------------------------------------------------------------------------------
+
+	// --- README: "Wire names" -----------------------------------------------------------------------
+	@Test
+	public void wireNames() {
+		JsonRpcDispatcher dispatcher = JsonRpcDispatcher.builder(Reactor.getCurrentReactor())
+			.withService(UserApi.class, new UserApiImpl())
+			.build();
+
+		// the service's prefix, a dot, and each method's own name
+		assertEquals(Set.of("user.get", "user.touch"), dispatcher.wireNames());
+	}
+
+	// --- README: "Serve it" -------------------------------------------------------------------------
+	@Test
+	public void serveIt() {
+		JsonRpcDispatcher dispatcher = JsonRpcDispatcher.builder(Reactor.getCurrentReactor())
+			.withService(UserApi.class, new UserApiImpl())
+			.build();
+
+		byte[] response = await(dispatcher.dispatch("""
+			{"jsonrpc":"2.0","id":1,"method":"user.get","params":[42]}""".getBytes(UTF_8)));
+
+		assertEquals("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"id\":42,\"name\":\"user-42\"}}",
+			new String(response, UTF_8));
+	}
+
+	// --- README: "Call it" --------------------------------------------------------------------------
+	@Test
+	public void callIt() {
+		JsonRpcDispatcher dispatcher = JsonRpcDispatcher.builder(Reactor.getCurrentReactor())
+			.withService(UserApi.class, new UserApiImpl())
+			.build();
+
+		// no transport ships in this module — this is the in-memory double the module's own tests use
+		JsonRpcTransport transport = InMemoryTransport.create(dispatcher::dispatch);
+		JsonRpcClient client = JsonRpcClient.builder(Reactor.getCurrentReactor(), transport).build();
+
+		UserApi api = client.proxy(UserApi.class);
+
+		Promise<User> user = api.getUser(42);   // {"jsonrpc":"2.0","id":1,"method":"user.get","params":[42]}
+		api.touch(42);                          // {"jsonrpc":"2.0","method":"user.touch","params":[42]}
+
+		assertEquals(new User(42, "user-42"), await(user));
+		client.close();
+	}
+
+	// --- README: "A deliberate error, and an accidental one" ----------------------------------------
+	@Test
+	public void aDeliberateErrorAndAnAccidentalOne() {
+		JsonRpcDispatcher dispatcher = JsonRpcDispatcher.builder(Reactor.getCurrentReactor())
+			.withService(PaymentsApi.class, new PaymentsApiImpl())
+			.build();
+
+		// deliberate: the service's own code, message and `data` reach the peer verbatim
+		byte[] deliberate = await(dispatcher.dispatch("""
+			{"jsonrpc":"2.0","id":1,"method":"payments.charge","params":[1000]}""".getBytes(UTF_8)));
+		assertEquals("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":429,\"message\":\"Too many requests\"}}",
+			new String(deliberate, UTF_8));
+
+		// accidental: -32603 and nothing else. No class name, no message, no `data`, no stack frame
+		byte[] accidental = await(dispatcher.dispatch("""
+			{"jsonrpc":"2.0","id":2,"method":"payments.charge","params":[1]}""".getBytes(UTF_8)));
+		assertEquals("{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}",
+			new String(accidental, UTF_8));
+	}
+
+	// --- README: "What the caller gets" -------------------------------------------------------------
+	@Test
+	public void whatTheCallerGets() {
+		JsonRpcDispatcher dispatcher = JsonRpcDispatcher.builder(Reactor.getCurrentReactor())
+			.withService(PaymentsApi.class, new PaymentsApiImpl())
+			.build();
+		JsonRpcClient client = JsonRpcClient.builder(
+			Reactor.getCurrentReactor(), InMemoryTransport.create(dispatcher::dispatch)).build();
+
+		PaymentsApi payments = client.proxy(PaymentsApi.class);
+
+		JsonRpcException deliberate = (JsonRpcException) awaitException(payments.charge(1000));
+		assertEquals(429, deliberate.getError().code());
+		assertEquals("Too many requests", deliberate.getError().message());
+
+		JsonRpcException accidental = (JsonRpcException) awaitException(payments.charge(1));
+		assertEquals(-32603, accidental.getError().code());
+
+		client.close();
+	}
+
+	// --- README: "Serving over a transport" ---------------------------------------------------------
+	@Test
+	public void servingOverATransport() {
+		JsonRpcDispatcher dispatcher = JsonRpcDispatcher.builder(Reactor.getCurrentReactor())
+			.withService(UserApi.class, new UserApiImpl())
+			.build();
+
+		// `transport` is whichever JsonRpcTransport you plug in; this one is the in-memory double
+		InMemoryTransport transport = InMemoryTransport.create(document -> Promise.of(new byte[0]));
+
+		transport.setListener(new JsonRpcTransport.Listener() {
+			@Override
+			public void onDocument(byte[] document) {
+				// one complete, contiguous document — the transport joined the pieces before calling us
+				dispatcher.dispatch(document).whenResult(response -> {
+					// zero bytes is how "no response document" is spelled: a notification, or a batch of
+					// only notifications. It must never reach the wire (obligation 3)
+					if (response.length != 0) transport.send(response);
+				});
+			}
+
+			@Override
+			public void onClosed(@Nullable Exception e) {
+				// exactly once, whether the close was local, remote, or a failure of the medium
+			}
+		});
+
+		transport.deliverFromPeer("""
+			{"jsonrpc":"2.0","id":1,"method":"user.get","params":[42]}""".getBytes(UTF_8));
+
+		assertEquals(List.of("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"id\":42,\"name\":\"user-42\"}}"),
+			transport.sentText());
+	}
+
+	// ---------------------------------------------------------------------------------------------------
+	// The guard that makes "copied verbatim" a build gate rather than a promise (FR-103).
+	// ---------------------------------------------------------------------------------------------------
+
+	/**
+	 * Every {@code java} block of the README appears, line for line, in one of the files it is copied from.
+	 * <p>
+	 * Indentation is normalised away on both sides — the README dedents its blocks and renders a tab as four
+	 * spaces, deliberately — so this compares the code and not the layout. Everything else must match: a block
+	 * that drifts from the source, or source that moves out from under a block, fails here by name.
+	 */
+	@Test
+	public void everyReadmeBlockIsCopiedFromCompilingCode() {
+		String readme = read(moduleRoot().resolve("README.md"));
+		List<String> sources = new ArrayList<>();
+		for (String path : List.of(
+			"src/test/java/io/activej/jsonrpc/ReadmeExampleTest.java",
+			"src/test/java/io/activej/jsonrpc/service/fixtures/UserApi.java",
+			"src/test/java/io/activej/jsonrpc/service/InMemoryTransportConformanceTest.java")
+		) {
+			sources.add(normalize(read(moduleRoot().resolve(path))));
+		}
+
+		Matcher blocks = Pattern.compile("```java\\n(.*?)```", Pattern.DOTALL).matcher(readme);
+		int found = 0;
+		while (blocks.find()) {
+			found++;
+			String block = normalize(blocks.group(1));
+			boolean copied = false;
+			for (String source : sources) {
+				if (source.contains(block)) {
+					copied = true;
+					break;
+				}
+			}
+			assertTrue("README java block #" + found + " is not copied from any of the files it claims to be " +
+					   "copied from — the README has drifted, or the code moved out from under it:\n" +
+					   blocks.group(1), copied);
+		}
+		assertTrue("the README must carry java blocks; finding none means this guard scanned the wrong file",
+			found > 0);
+	}
+
+	/** Leading indentation and blank lines carry no meaning across the README/source boundary; the rest does. */
+	private static String normalize(String text) {
+		StringBuilder sb = new StringBuilder();
+		for (String line : text.split("\n")) {
+			String stripped = line.strip();
+			if (stripped.isEmpty()) continue;
+			sb.append(stripped).append('\n');
+		}
+		return sb.toString();
+	}
+
+	private static Path moduleRoot() {
+		Path local = Path.of("README.md");
+		// running from the reactor root rather than the module basedir
+		return Files.isRegularFile(local) ? Path.of("") : Path.of("extra", "cloud-jsonrpc");
+	}
+
+	private static String read(Path path) {
+		try {
+			return Files.readString(path, UTF_8);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
 	}
 
 	private static void fail(String message) {
