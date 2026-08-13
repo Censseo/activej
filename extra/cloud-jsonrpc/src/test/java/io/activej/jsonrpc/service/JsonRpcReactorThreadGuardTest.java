@@ -46,13 +46,17 @@ import static org.junit.Assert.fail;
  * One test per {@code checkInReactorThread} call site: {@link JsonRpcDispatcher#dispatch(byte[])},
  * {@link JsonRpcDispatcher#dispatch(JsonRpcInput)}, {@link JsonRpcDispatcher#wireNames()},
  * {@link JsonRpcClient#proxy(Class)}, {@link JsonRpcClient#inFlightCount()},
- * {@link JsonRpcClient#closeEx(Exception)}, and a proxy method invocation itself (the
- * {@code ServiceInvocationHandler.Caller#checkReactorThread} seam inside {@link JsonRpcClient}).
+ * {@link JsonRpcClient#closeEx(Exception)}, a proxy method invocation itself (the
+ * {@code ServiceInvocationHandler.Caller#checkReactorThread} seam inside {@link JsonRpcClient}), and the
+ * two transport listener callbacks — the transport SPI is deliberately not {@code Reactive} (FR-087), so
+ * the guards on inbound delivery are the only thing keeping an off-thread transport from mutating the
+ * correlation table silently.
  */
 public class JsonRpcReactorThreadGuardTest {
 	private EventloopThread loop;
 	private JsonRpcDispatcher dispatcher;
 	private JsonRpcClient client;
+	private InMemoryTransport transport;
 	private UserApi api;
 
 	@Before
@@ -62,7 +66,7 @@ public class JsonRpcReactorThreadGuardTest {
 			dispatcher = JsonRpcDispatcher.builder(loop.eventloop())
 				.withService(UserApi.class, new UserApiImpl())
 				.build();
-			InMemoryTransport transport = InMemoryTransport.create(dispatcher::dispatch);
+			transport = InMemoryTransport.create(dispatcher::dispatch);
 			client = JsonRpcClient.builder(loop.eventloop(), transport).build();
 			api = client.proxy(UserApi.class);
 		});
@@ -111,6 +115,17 @@ public class JsonRpcReactorThreadGuardTest {
 	@Test
 	public void aProxyMethodCallRefusesTheJUnitThread() {
 		expectIllegalState(() -> api.getUser(42));
+	}
+
+	@Test
+	public void anInboundDocumentDeliveredOffTheReactorThreadIsRefused() {
+		expectIllegalState(() -> transport.deliverFromPeer(
+			"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":42}".getBytes(UTF_8)));
+	}
+
+	@Test
+	public void aPeerCloseDeliveredOffTheReactorThreadIsRefused() {
+		expectIllegalState(() -> transport.closeFromPeer(null));
 	}
 
 	/** Calls {@code action}, here on the JUnit thread, and requires exactly an {@link IllegalStateException}. */

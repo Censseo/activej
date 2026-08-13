@@ -73,6 +73,13 @@ import org.jetbrains.annotations.Nullable;
  * but an in-memory one must not be forced to carry a reactor it never uses. The components on both ends of
  * this SPI are reactor-confined regardless, so a reactive transport is called from the reactor thread in
  * practice.
+ * <p>
+ * 'Not {@code Reactive}' excuses an implementation from <i>carrying</i> a reactor, not from delivering on
+ * one: {@code onDocument} and {@code onClosed} must fire on the reactor thread of the component that owns
+ * this transport. {@code JsonRpcClient} guards both callbacks with {@code checkInReactorThread(this)}, so
+ * an off-thread delivery fails fast instead of silently corrupting its correlation table. A transport whose
+ * bytes arrive on its own I/O thread hops (its {@code Reactor#post} is the usual one) rather than calling
+ * the listener directly.
  *
  * <h2>Why {@code byte[]} and not a pooled buffer</h2>
  * The decoder needs one contiguous array, so the copy exists wherever the boundary is drawn. Drawing it here

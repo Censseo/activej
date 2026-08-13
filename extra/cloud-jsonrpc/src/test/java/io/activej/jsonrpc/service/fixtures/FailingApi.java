@@ -78,4 +78,12 @@ public interface FailingApi {
 	/** A notification that throws synchronously — the other way a notification can fail. */
 	@JsonRpcNotification("notifyThrow")
 	void notifyAndThrow(@JsonRpcParam("value") String value);
+
+	/**
+	 * A notification that throws an {@link AssertionError} — not an {@code Exception}. The dispatcher
+	 * cannot let it reach the wire (FR-048), but it must not lose it either: it reaches the failure
+	 * handler as the cause of the wrapper.
+	 */
+	@JsonRpcNotification("notifyError")
+	void notifyAndThrowError(@JsonRpcParam("value") String value);
 }

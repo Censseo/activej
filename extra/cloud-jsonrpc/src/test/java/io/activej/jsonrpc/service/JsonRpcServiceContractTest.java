@@ -38,8 +38,8 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * User story 1 and 3 — the startup contract: introspection of one annotated interface, and the eight
- * validation rules, every violation reported at once (FR-019…FR-034).
+ * User story 1 and 3 — the startup contract: introspection of one annotated interface, and the nine
+ * validation rules, every violation reported at once (FR-019…FR-034, FR-043a).
  * <p>
  * Nothing here builds a dispatcher, opens anything or invokes an implementation: a contract is a property of
  * the <b>interface alone</b> (FR-034), which is exactly why it can be checked before a port is opened.
@@ -121,7 +121,7 @@ public class JsonRpcServiceContractTest {
 	}
 
 	// ---------------------------------------------------------------------------------------------------
-	// T013 — the eight validation rules.
+	// T013 — the nine validation rules.
 	// ---------------------------------------------------------------------------------------------------
 
 	@Test
@@ -310,6 +310,61 @@ public class JsonRpcServiceContractTest {
 		assertEquals(Set.of("inh.base"), contract.methods().keySet());
 	}
 
+	@Test
+	public void aSignatureDeclaredByTwoUnrelatedInterfacesIsAViolation() {
+		List<String> violations = violationsOf(BrokenApis.DiamondApi.class);
+
+		assertEquals("the diamond is one violation, not a spurious FR-022 on one path: " + violations,
+			1, violations.size());
+		String violation = violations.get(0);
+		assertTrue(violation, violation.contains("FR-024"));
+		assertTrue("both declaring types must be named: " + violation,
+			violation.contains(BrokenApis.DiamondLeft.class.getName()));
+		assertTrue("both declaring types must be named: " + violation,
+			violation.contains(BrokenApis.DiamondRight.class.getName()));
+		assertTrue("the remedy must be named: " + violation,
+			violation.contains(BrokenApis.DiamondApi.class.getName()));
+	}
+
+	@Test
+	public void theDiamondViolationDoesNotDependOnTheExtendsOrder() {
+		List<String> violations = violationsOf(ReversedDiamondApi.class);
+
+		assertEquals(violations.toString(), 1, violations.size());
+		assertTrue(violations.get(0), violations.get(0).contains("FR-024"));
+		assertTrue(violations.get(0), violations.get(0).contains(BrokenApis.DiamondLeft.class.getName()));
+		assertTrue(violations.get(0), violations.get(0).contains(BrokenApis.DiamondRight.class.getName()));
+	}
+
+	@Test
+	public void aDiamondIsAmbiguousEvenWhenBothPathsAreAnnotated() {
+		List<String> violations = violationsOf(AnnotatedDiamondApi.class);
+
+		assertEquals(violations.toString(), 1, violations.size());
+		assertTrue(violations.get(0), violations.get(0).contains("FR-024"));
+	}
+
+	@Test
+	public void redeclaringTheDiamondMethodOnTheServiceInterfaceResolvesIt() {
+		// the redeclaration is the single most-derived declaration, so its annotations speak for the group
+		JsonRpcServiceContract contract = JsonRpcServiceContract.of(ResolvedDiamondApi.class, CODECS);
+
+		assertEquals(Set.of("resolved.get"), contract.methods().keySet());
+		assertNotNull(contract.byWireName("resolved.get"));
+	}
+
+	@Test
+	public void rule9_twoParametersSharingOneNameAreAViolation() {
+		List<String> violations = violationsOf(BrokenApis.DuplicateParamName.class);
+
+		assertEquals(violations.toString(), 1, violations.size());
+		String violation = violations.get(0);
+		assertTrue("the shared name must be named: " + violation, violation.contains("'id'"));
+		assertTrue("both positions must be named: " + violation,
+			violation.contains("0") && violation.contains("1"));
+		assertTrue("the method must be named: " + violation, violation.contains("move"));
+	}
+
 	// ---------------------------------------------------------------------------------------------------
 	// T015 — generic resolution (FR-028, research threat 2).
 	// ---------------------------------------------------------------------------------------------------
@@ -413,6 +468,32 @@ public class JsonRpcServiceContractTest {
 
 	@JsonRpcService("clash")
 	public interface ClashingApi extends ClashOne, ClashTwo {}
+
+	/** The same diamond as {@link BrokenApis.DiamondApi} with the extends clause reversed. */
+	@JsonRpcService("diamond")
+	public interface ReversedDiamondApi extends BrokenApis.DiamondRight, BrokenApis.DiamondLeft {}
+
+	public interface AnnotatedLeft {
+		@JsonRpcMethod("left")
+		Promise<User> get(@JsonRpcParam("id") long id);
+	}
+
+	public interface AnnotatedRight {
+		@JsonRpcMethod("right")
+		Promise<User> get(@JsonRpcParam("id") long id);
+	}
+
+	/** Both paths annotated, and disagreeing: no redeclaration means no deterministic winner either. */
+	@JsonRpcService("anndiamond")
+	public interface AnnotatedDiamondApi extends AnnotatedLeft, AnnotatedRight {}
+
+	/** The remedy: the service interface redeclares the method, and its annotations speak for the group. */
+	@JsonRpcService("resolved")
+	public interface ResolvedDiamondApi extends AnnotatedLeft, AnnotatedRight {
+		@Override
+		@JsonRpcMethod("get")
+		Promise<User> get(@JsonRpcParam("id") long id);
+	}
 
 	public interface CrudApi<T> {
 		@JsonRpcMethod("get")

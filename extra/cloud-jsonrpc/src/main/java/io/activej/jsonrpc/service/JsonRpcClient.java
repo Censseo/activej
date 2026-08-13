@@ -334,6 +334,9 @@ public final class JsonRpcClient extends AbstractReactive implements AsyncClosea
 	// ---------------------------------------------------------------------------------------------------
 
 	private void onDocument(byte[] document) {
+		// the transport SPI is deliberately not Reactive (FR-087), so this guard is the only thing between
+		// an off-thread delivery and silent corruption of the correlation table
+		checkInReactorThread(this);
 		if (closed) return;
 
 		JsonRpcInput input;
@@ -464,6 +467,8 @@ public final class JsonRpcClient extends AbstractReactive implements AsyncClosea
 	// ---------------------------------------------------------------------------------------------------
 
 	private void onTransportClosed(@Nullable Exception e) {
+		// same threading contract as onDocument: the pending table is drained here and must stay reactor-confined
+		checkInReactorThread(this);
 		if (closed) return;
 		// FR-078a: the same path as a local close, with the transport's cause when it supplied one
 		doClose(e != null ? e : new AsyncCloseException("the transport closed"));

@@ -112,6 +112,12 @@ public final class FailingApiImpl implements FailingApi {
 		throw new IllegalStateException(SECRET);
 	}
 
+	@Override
+	public void notifyAndThrowError(@Nullable String value) {
+		invocations.add("notifyAndThrowError(" + value + ')');
+		throw new AssertionError(SECRET);
+	}
+
 	/** Every invocation so far, in order, rendered as {@code name(args)}. */
 	public List<String> invocations() {
 		return invocations;

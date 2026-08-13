@@ -182,7 +182,13 @@
   sources rather than claimed in prose.
 
   A contract is validated **entirely at construction**, and one exception reports
-  **every** violation rather than the first. Dispatch is total: `dispatch(byte[])`
+  **every** violation rather than the first. A method signature two unrelated
+  super-interfaces declare independently is rejected deterministically, naming
+  every declaring type, rather than silently inheriting whichever annotations an
+  unspecified reflection order hands down — the remedy, redeclaring the method on
+  the service interface, is named in the message. Two parameters sharing one
+  `@JsonRpcParam` name are rejected by name and position at the same time, instead
+  of leaving the second parameter unreachable by named `params` forever. Dispatch is total: `dispatch(byte[])`
   and `dispatch(JsonRpcInput)` never complete exceptionally, so a transport author
   writes no failure branch — an unknown method is `-32601` and undecodable `params`
   are `-32602`, both without invoking the implementation, and "no response document"

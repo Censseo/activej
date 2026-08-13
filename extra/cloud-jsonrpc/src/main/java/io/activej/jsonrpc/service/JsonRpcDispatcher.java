@@ -257,6 +257,7 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 	 */
 	public Promise<JsonRpcOutput> dispatch(JsonRpcInput input) {
 		checkInReactorThread(this);
+		Objects.requireNonNull(input, "input");
 		return switch (input) {
 			case JsonRpcDecoded decoded -> dispatchElement(decoded);
 			case JsonRpcBatch batch -> dispatchBatch(batch);
@@ -328,7 +329,7 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 
 		Object[] args;
 		try {
-			args = ParamsCodec.decode(handler.descriptor, request.params());
+			args = handler.paramsCodec.decode(request.params());
 		} catch (Exception e) {
 			// FR-045: the decoder's message embeds the offending input by construction, so it is dropped here
 			// rather than mapped into the error object
@@ -348,7 +349,7 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 
 		Object[] args;
 		try {
-			args = ParamsCodec.decode(handler.descriptor, notification.params());
+			args = handler.paramsCodec.decode(notification.params());
 		} catch (Exception e) {
 			// FR-050: nothing goes on the wire, but nothing is swallowed either
 			reportFailure(handler.descriptor, e);
@@ -411,7 +412,11 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 	}
 
 	/** One wire name's descriptor bound to the instance that answers it. Immutable, built at {@code build()}. */
-	private record Handler(JsonRpcMethodDescriptor descriptor, Object implementation) {
+	private record Handler(JsonRpcMethodDescriptor descriptor, Object implementation, ParamsCodec paramsCodec) {
+		// the params codec is built here, once, with everything else — not allocated per inbound request
+		private Handler(JsonRpcMethodDescriptor descriptor, Object implementation) {
+			this(descriptor, implementation, new ParamsCodec(descriptor));
+		}
 		/**
 		 * The single reflective hop the JDK proxy mechanism costs (verdict 00-B). Every failure — a refused
 		 * argument, a throwing body, a {@code null} where a {@code Promise} was declared — leaves as a failed
@@ -425,9 +430,11 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 				returned = method.invoke(implementation, args);
 			} catch (InvocationTargetException e) {
 				Throwable cause = e.getCause();
+				// an Error is not a JSON-RPC failure either, but it is the only diagnostic a notification's
+				// failure handler will ever see — wrap it, never drop it
 				return Promise.ofException(cause instanceof Exception exception ?
 					exception :
-					new IllegalStateException("the service method failed"));
+					new IllegalStateException("the service method failed", cause));
 			} catch (Exception e) {
 				return Promise.ofException(e);
 			}

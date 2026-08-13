@@ -66,10 +66,15 @@ import java.util.Set;
  *     <li>a notification declares {@code void} or {@code Promise<Void>} (FR-026);</li>
  *     <li>a method does not declare {@code void} (FR-027);</li>
  *     <li>no raw {@code Promise}, no {@code Promise<?>}, no unbound type variable (FR-028);</li>
- *     <li>every parameter type and the result type resolve to a codec (FR-029).</li>
+ *     <li>every parameter type and the result type resolve to a codec (FR-029);</li>
+ *     <li>no two parameters of one method share a {@link JsonRpcParam} name (FR-043a).</li>
  * </ol>
  * {@code static} and {@code private} interface methods are ignored, and a {@code default} method is ignored
- * unless it is annotated (FR-023). Methods inherited from super-interfaces participate (FR-024). A
+ * unless it is annotated (FR-023). Methods inherited from super-interfaces participate (FR-024), but a
+ * signature that two <b>unrelated</b> super-interfaces declare independently is not participation — there
+ * is no single most-derived declaration to read the annotations from, so it is rejected, naming every
+ * declaring type. The remedy is to redeclare the method on the service interface itself, which then heads
+ * the group with one set of annotations. A
  * {@code throws} clause — the only way to {@code throw} the checked
  * {@link io.activej.jsonrpc.JsonRpcException} directly — is accepted on any method and is never a violation
  * (FR-047a).
@@ -129,7 +134,24 @@ public final class JsonRpcServiceContract {
 		Map<String, List<Method>> bySignature = candidateMethods(serviceType);
 
 		for (List<Method> overloads : bySignature.values()) {
-			Method method = overloads.get(0);
+			// FR-024: a signature declared independently by two unrelated super-interfaces has no single
+			// most-derived declaration to read the annotations from. That is an ambiguity, not an
+			// override — report it deterministically rather than let getMethods()' unspecified order
+			// pick which declaration's annotations win
+			List<Method> maximal = maximalDeclarations(overloads);
+			if (maximal.size() > 1) {
+				maximal.sort(Comparator.comparing(m -> m.getDeclaringClass().getName()));
+				StringBuilder sb = new StringBuilder("method ").append(maximal.get(0).getName())
+					.append(" is inherited from unrelated interfaces that declare it independently: ");
+				for (int i = 0; i < maximal.size(); i++) {
+					if (i != 0) sb.append(i == maximal.size() - 1 ? " and " : ", ");
+					sb.append(where(maximal.get(i)));
+				}
+				violations.add(sb.append("; redeclare it in ").append(serviceType.getName())
+					.append(" with a single set of annotations (FR-024)").toString());
+				continue;
+			}
+			Method method = maximal.get(0);
 
 			JsonRpcMethod methodAnnotation = method.getAnnotation(JsonRpcMethod.class);
 			JsonRpcNotification notificationAnnotation = method.getAnnotation(JsonRpcNotification.class);
@@ -222,8 +244,8 @@ public final class JsonRpcServiceContract {
 
 	/**
 	 * Every candidate method of the interface, grouped by erased signature so that one Java method reached
-	 * through two inheritance paths is one entry, not a self-collision. The most derived declaration heads
-	 * each group; the rest are kept only as {@link #byJavaMethod} aliases.
+	 * through two inheritance paths is one entry, not a self-collision. Which declaration speaks for the
+	 * group is {@link #maximalDeclarations}' call, made by the validation loop.
 	 * <p>
 	 * {@code getMethods()} is the whole filter for {@code private} (it returns public members only) and the
 	 * loop below is the filter for {@code static}, bridge and synthetic methods (FR-023).
@@ -241,15 +263,33 @@ public final class JsonRpcServiceContract {
 
 		Map<String, List<Method>> bySignature = new LinkedHashMap<>();
 		for (Method method : candidates) {
-			List<Method> group = bySignature.computeIfAbsent(signature(method), key -> new ArrayList<>());
-			// the most derived declaration heads the group: it is the one carrying the author's annotations
-			if (!group.isEmpty() && group.get(0).getDeclaringClass().isAssignableFrom(method.getDeclaringClass())) {
-				group.add(0, method);
-			} else {
-				group.add(method);
-			}
+			bySignature.computeIfAbsent(signature(method), key -> new ArrayList<>()).add(method);
 		}
 		return bySignature;
+	}
+
+	/**
+	 * The declarations of one signature group that nothing else in the group overrides: {@code A.get} is
+	 * shadowed as soon as another member is declared in a sub-interface of {@code A}. Ordinarily exactly
+	 * one survives — the most derived declaration, the one carrying the author's annotations. Two or more
+	 * can only mean one thing: the signature was declared independently in unrelated interfaces and
+	 * inherited through both paths, the diamond FR-024 makes a contract violation rather than an
+	 * arbitrary choice.
+	 */
+	private static List<Method> maximalDeclarations(List<Method> group) {
+		List<Method> maximal = new ArrayList<>(group.size());
+		for (Method candidate : group) {
+			boolean shadowed = false;
+			for (Method other : group) {
+				if (!other.equals(candidate) &&
+					candidate.getDeclaringClass().isAssignableFrom(other.getDeclaringClass())) {
+					shadowed = true;
+					break;
+				}
+			}
+			if (!shadowed) maximal.add(candidate);
+		}
+		return maximal;
 	}
 
 	private static String signature(Method method) {
@@ -292,6 +332,20 @@ public final class JsonRpcServiceContract {
 			}
 
 			params.add(new JsonRpcParamDescriptor(i, bound, codec, name));
+		}
+
+		// FR-043a: two parameters sharing one name can never both be addressed by named params, and a
+		// NAMED-style proxy would emit a duplicate key — a startup fault, not a call-time one
+		for (int i = 0; i < params.size(); i++) {
+			String name = params.get(i).name();
+			if (name == null) continue;
+			for (int j = i + 1; j < params.size(); j++) {
+				if (name.equals(params.get(j).name())) {
+					violations.add(where(method) + " parameters " + i + " and " + j + " share the " +
+								   "@JsonRpcParam name '" + name + "'; named params cannot address the " +
+								   "second (FR-043a)");
+				}
+			}
 		}
 		return params;
 	}

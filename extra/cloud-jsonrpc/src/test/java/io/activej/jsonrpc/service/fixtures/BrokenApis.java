@@ -154,6 +154,37 @@ public final class BrokenApis {
 	}
 
 	// -------------------------------------------------------------------------------------------------
+	// Rule 9 — no two parameters of one method share a @JsonRpcParam name (FR-043a).
+	// -------------------------------------------------------------------------------------------------
+
+	@JsonRpcService("dupparam")
+	public interface DuplicateParamName {
+		@JsonRpcMethod("move")
+		Promise<Void> move(@JsonRpcParam("id") long from, @JsonRpcParam("id") long to);
+	}
+
+	// -------------------------------------------------------------------------------------------------
+	// A diamond — one erased signature declared independently by two unrelated super-interfaces (FR-024).
+	// -------------------------------------------------------------------------------------------------
+
+	public interface DiamondLeft {
+		@JsonRpcMethod("get")
+		Promise<User> get(@JsonRpcParam("id") long id);
+	}
+
+	/** The same erased signature as {@link DiamondLeft}, declared independently and left unannotated. */
+	public interface DiamondRight {
+		Promise<User> get(@JsonRpcParam("id") long id);
+	}
+
+	/**
+	 * Inherits {@code get(long)} through both paths without redeclaring it: no single most-derived
+	 * declaration exists, so nothing deterministic says which path's annotations apply.
+	 */
+	@JsonRpcService("diamond")
+	public interface DiamondApi extends DiamondLeft, DiamondRight {}
+
+	// -------------------------------------------------------------------------------------------------
 	// Several at once — SC-005: one exception, every fault named.
 	// -------------------------------------------------------------------------------------------------
 

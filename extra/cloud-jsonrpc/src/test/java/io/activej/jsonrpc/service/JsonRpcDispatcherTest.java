@@ -38,6 +38,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
  * User story 1 — an inbound document naming {@code user.get} reaches an implementation with decoded
@@ -253,6 +254,14 @@ public class JsonRpcDispatcherTest {
 		assertFalse("no data member may be attached to a params failure (FR-045)", response.contains("\"data\""));
 		assertFalse("nothing of the offending payload may be echoed", response.contains("hunter2"));
 		assertFalse("nothing of the offending payload may be echoed", response.contains("secret-key"));
+	}
+
+	@Test
+	public void aNullDecodedInputIsRejectedSymmetricallyWithANullDocument() {
+		try {
+			dispatcher.dispatch((JsonRpcInput) null);
+			fail("dispatch(JsonRpcInput) must require its argument, exactly as dispatch(byte[]) does");
+		} catch (NullPointerException expected) {}
 	}
 
 	// ---------------------------------------------------------------------------------------------------

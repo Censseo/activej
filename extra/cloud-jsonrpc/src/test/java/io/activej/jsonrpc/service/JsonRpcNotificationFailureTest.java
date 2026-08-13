@@ -104,6 +104,23 @@ public class JsonRpcNotificationFailureTest {
 	}
 
 	@Test
+	public void aNotificationThatThrowsAnErrorKeepsItAsTheCause() {
+		byte[] response = dispatch(
+			"{\"jsonrpc\":\"2.0\",\"method\":\"fail.notifyError\",\"params\":{\"value\":\"x\"}}");
+
+		assertEquals("an Error is no more wire-bound than an Exception is (FR-048)", 0, response.length);
+		assertEquals(1, failures.size());
+		Failure failure = failures.get(0);
+		assertEquals("fail.notifyError", failure.descriptor().wireName());
+		assertSame("a non-Exception cause travels in a wrapper", IllegalStateException.class,
+			failure.exception().getClass());
+		assertSame("but the Error itself is attached, never dropped: it is the only stack trace the " +
+				   "handler will ever see", AssertionError.class,
+			failure.exception().getCause().getClass());
+		assertEquals(SECRET, failure.exception().getCause().getMessage());
+	}
+
+	@Test
 	public void aNotificationWhoseParamsCannotBeDecodedIsAlsoReportedAndAlsoAnswerless() {
 		byte[] response = dispatch(
 			"{\"jsonrpc\":\"2.0\",\"method\":\"fail.notify\",\"params\":{\"value\":42}}");

@@ -63,22 +63,20 @@ public final class ParamsCodec implements JsonCodec<Object[]> {
 	}
 
 	/**
-	 * Decodes {@code params} into the argument array of {@code descriptor}'s method.
+	 * Decodes {@code params} into the argument array of this codec's method.
 	 *
-	 * @param descriptor the method the arguments are for
-	 * @param params     the raw {@code params} member, possibly {@link JsonRpcPayload#absent()}
+	 * @param params the raw {@code params} member, possibly {@link JsonRpcPayload#absent()}
 	 * @return an argument array of exactly the method's arity; empty for a zero-argument method
 	 * @throws MalformedDataException on any mismatch — the caller answers {@code -32602} and discards this
 	 *                                exception without copying anything out of it
 	 */
-	public static Object[] decode(JsonRpcMethodDescriptor descriptor, JsonRpcPayload params)
-		throws MalformedDataException {
+	public Object[] decode(JsonRpcPayload params) throws MalformedDataException {
 		if (params.isAbsent()) {
 			// FR-044: an omitted params member is exactly right for a zero-arity method and wrong for any other
 			if (descriptor.params().isEmpty()) return NO_ARGS;
 			throw new MalformedDataException("params is absent but the method takes arguments");
 		}
-		return params.decode(new ParamsCodec(descriptor));
+		return params.decode(this);
 	}
 
 	@Override
