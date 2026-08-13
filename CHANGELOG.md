@@ -142,6 +142,82 @@
   publish a document a client will read as "method not found"; decoding a peer's
   error accepts any code, so nothing a conforming peer sends is ever discarded.
 
+- **JSON-RPC service layer: an annotated interface, a dispatcher, a typed client
+  proxy and a transport SPI.** Two new packages in `extra/cloud-jsonrpc`
+  (`activej-jsonrpc`, still profile-gated behind `-P extra`):
+  `io.activej.jsonrpc.service` and `io.activej.jsonrpc.transport`. Publishing a
+  method is an interface plus one `withService(...)`; consuming it is one
+  `proxy(...)`. Neither side carries a line of routing, correlation or
+  serialization code.
+
+  ```java
+  @JsonRpcService("user")
+  public interface UserApi {
+      @JsonRpcMethod("get")
+      Promise<User> getUser(@JsonRpcParam("id") long id);
+
+      @JsonRpcNotification("touch")
+      void touch(@JsonRpcParam("id") long id);
+  }
+  ```
+
+  The new public surface, and nothing else: the four runtime-retained annotations
+  `@JsonRpcService`, `@JsonRpcMethod`, `@JsonRpcNotification` and `@JsonRpcParam`;
+  `JsonRpcServiceContract` with `JsonRpcMethodDescriptor` and
+  `JsonRpcParamDescriptor`; `JsonRpcContractException`; `JsonRpcParamStyle`;
+  `JsonRpcDispatcher`; `JsonRpcClient`; `JsonRpcPeerHandler`; and the
+  `JsonRpcTransport` SPI with its nested `Listener`. The envelope layer
+  (`io.activej.jsonrpc`, `io.activej.jsonrpc.impl`) is **untouched** and stays
+  reactor-free and `Promise`-free — `ModuleBoundaryTest` now scopes that rule by
+  package rather than by module, so a `Promise` or `Reactor` import in an envelope
+  package still fails the build.
+
+  A wire name is the service's prefix, a dot, and the method's own name. **A method
+  that leaves `@JsonRpcMethod`'s `value()` empty puts its Java identifier on the
+  wire**, so a later rename is a wire-format change with no compile error anywhere;
+  an explicit `@JsonRpcMethod("…")` is the mitigation, and the README says so where
+  a consumer reads it before writing an interface. The Java signature itself is
+  unaffected — renaming the method still breaks compilation on both the implementing
+  and the calling side, asserted by driving the JDK compiler over three throwaway
+  sources rather than claimed in prose.
+
+  A contract is validated **entirely at construction**, and one exception reports
+  **every** violation rather than the first. Dispatch is total: `dispatch(byte[])`
+  and `dispatch(JsonRpcInput)` never complete exceptionally, so a transport author
+  writes no failure branch — an unknown method is `-32601` and undecodable `params`
+  are `-32602`, both without invoking the implementation, and "no response document"
+  is a zero-length array, which is neither `[]` nor `{}`. On the client, correlation
+  is by whole `JsonRpcId` through a single removal path, and the entry is removed
+  **before** the payload is decoded, so an undecodable result cannot leak an entry
+  and an orphan value is never constructed; an answer with an unknown `id` is ignored
+  silently.
+
+  Error mapping is a one-way valve: a `JsonRpcException` travels verbatim — code,
+  message and `data` — while **anything else** becomes exactly
+  `{"code":-32603,"message":"Internal error"}` with no `data`, no class name, no
+  message fragment and no stack frame. A notification's failure has nowhere to go on
+  the wire (§4.1), so it goes to `withFailureHandler(...)`, defaulting to
+  `Reactor.logFatalError`.
+
+  Transport authors get an SPI over contiguous `byte[]` documents with seven stated
+  obligations (join before decoding, bound the accumulation rather than the result,
+  never deliver a zero-length document, `send` means *written* not *answered*, assume
+  nothing about pairing or order, close idempotently and report it exactly once, keep
+  everything transport-specific inside the implementation), plus
+  `AbstractTransportConformanceTest`: implement one method and inherit the whole
+  conformance suite, all 30 vectors replayed end to end through a real dispatcher.
+  The harness is in test sources and is not published as a `test-jar` today.
+
+  **Purely additive.** No new `ApplicationSettings` limit is introduced, so there is
+  no behaviour-changing default and nothing here belongs under Breaking changes; the
+  three envelope bounds above (`maxBodySize`, `maxBatchSize`, `maxJsonDepth`) remain
+  the module's only settings, unchanged. Per-call timeouts and an in-flight bound are
+  deliberately **not** here — `JsonRpcClient` exposes `inFlightCount()` as the
+  diagnostic a later feature's bound would be observed through. No third-party
+  dependency, no bytecode generation, no `ByteBuf`, no transport and no `activej-rpc`:
+  the module adds two internal edges only, `activej-promise` and `activej-eventloop`,
+  both confined to the two new packages.
+
 ### Notable fixes
 
 All three are in `extra/util-json` (`activej-json`), built only under `-P extra`.
