@@ -30,6 +30,7 @@
     <module>util-etcd</module>
     <module>util-json</module>
     <module>cloud-jsonrpc</module>
+    <module>cloud-jsonrpc-http</module>
     <module>launchers</module>
   </modules>
 

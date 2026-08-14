@@ -2,6 +2,7 @@ package io.activej.csp.consumer;
 
 import io.activej.bytebuf.ByteBuf;
 import io.activej.bytebuf.ByteBufPool;
+import io.activej.bytebuf.ByteBufs;
 import io.activej.eventloop.Eventloop;
 import io.activej.promise.Promise;
 import io.activej.reactor.Reactor;
@@ -82,6 +83,41 @@ public class ChannelConsumerTest {
 		ChannelConsumer<ByteBuf> channelConsumer = ofOutputStream(newSingleThreadExecutor(), outputStream);
 		Exception exception2 = awaitException(channelConsumer.acceptAll(ByteBuf.empty(), ByteBuf.wrapForReading("Hello".getBytes())));
 		assertSame(exception, exception2);
+	}
+
+	/**
+	 * The failure path of {@link ChannelConsumer#acceptAll(Iterator)} — the iterator overload, not
+	 * the {@link List} one: when an item is accepted with an error, the <b>remaining</b> items must
+	 * be recycled, per the documented contract ("subsequent items will be recycled"). This is the
+	 * path the HTTP gzip processors rely on: {@code ByteBufs.asIterator()} transfers the queue's
+	 * buffers to the iterator, which is <b>not</b> itself {@code Recyclable}, so the remainder is
+	 * reachable only through the iterator. Before the fix the failure branch recycled the iterator
+	 * object (a no-op for a non-{@code Recyclable} one) and dropped the remainder — this test
+	 * failed red on {@link ByteBufRule} and passes green now (WI-13).
+	 */
+	@Test
+	public void testAcceptAllIteratorRecyclesRemainderOnFailure() {
+		ExpectedException expectedException = new ExpectedException();
+		ChannelConsumer<ByteBuf> failing = ChannelConsumers.ofAsyncConsumer(value -> {
+			value.recycle();
+			return Promise.ofException(expectedException);
+		});
+
+		ByteBufs bufs = new ByteBufs();
+		bufs.add(readableBuf());
+		bufs.add(readableBuf());
+		bufs.add(readableBuf());
+
+		Exception exception = awaitException(failing.acceptAll(bufs.asIterator()));
+
+		assertSame(expectedException, exception);
+	}
+
+	/** A pooled buffer with one readable byte — {@code ByteBufs.add} drops and recycles empty buffers. */
+	private static ByteBuf readableBuf() {
+		ByteBuf buf = ByteBufPool.allocate(1);
+		buf.put((byte) 42);
+		return buf;
 	}
 
 	@Test
