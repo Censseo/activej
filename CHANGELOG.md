@@ -224,6 +224,44 @@
   the module adds two internal edges only, `activej-promise` and `activej-eventloop`,
   both confined to the two new packages.
 
+- **JSON-RPC 2.0 over HTTP POST: a servlet and a client transport.** A new
+  profile-gated module `extra/cloud-jsonrpc-http` (`activej-jsonrpc-http`, package
+  `io.activej.jsonrpc.transport.http`) — the **first transport** for the SPI above,
+  and the wire half of `JsonRpcClient.proxy(...)`. `JsonRpcServlet` mounts the
+  dispatcher behind `AsyncServlet`; `JsonRpcHttpClientTransport` implements
+  `JsonRpcTransport` with one `POST` per `send` (no batching, no retry, no
+  reordering — connection reuse is entirely the injected `IHttpClient`'s). One
+  `POST` in, one `dispatch(byte[])` out, the dispatcher's bytes written back
+  **unaltered** — never re-encoded, with no response `Content-Type` inspection on
+  the client side (strict on the request, lenient on the response).
+
+  The wire contract is a six-row semantics table evaluated **in order** before any
+  body byte is read: `405` + `Allow: POST` for a non-`POST` method, `415` for an
+  absent or non-JSON media type (parameters ignored), `413` for a declared
+  `Content-Length` over the bound, the connection tier's hardcoded `400` + close
+  for a mid-stream crossing, `204` (builder-configurable to `200`) when the
+  dispatcher answers with nothing — a notification, an all-notification batch —
+  and `200` carrying the document for every JSON-RPC outcome: `-32700` Parse error
+  (including a **zero-length body**), `-32600`…`-32603`, application errors and
+  batches. The table is pinned by frozen curl/fetch interoperability vectors, so a
+  change to a status, a header or a body fails the build. On the client, a `2xx`
+  with a body delivers it to the listener **before** `send`'s promise completes; a
+  `204` or an empty body delivers nothing; a non-`2xx`, a network failure or an
+  oversize response fails **that call only**, never `onClosed`; `send` after close
+  fails immediately with no request issued; the injected `IHttpClient` is never
+  closed.
+
+  The module reuses feature 012's bounds rather than adding keys: the
+  `JsonRpcLimits.maxBodySize` (`1mb` default) applies to the request on the
+  servlet side and to the response on the transport side, with
+  `withMaxBodySize(MemSize)` as the per-instance override — and **no
+  `ApplicationSettings` key exists** in this module. It consumes `activej-http`,
+  `activej-jsonrpc`, `activej-json` and `activej-common`, adds no third-party
+  dependency and is built only under `-P extra`. No `Breaking changes` entry: the
+  module is new, and the existing behaviour it builds on (`core-http`'s body
+  handling, gzip decoded before the bound applies, feature 012's envelope and SPI)
+  is unchanged.
+
 ### Notable fixes
 
 All three are in `extra/util-json` (`activej-json`), built only under `-P extra`.

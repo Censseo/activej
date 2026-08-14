@@ -1,0 +1,152 @@
+[
+  {
+    "name": "curl-single-request",
+    "origin": "curl",
+    "request": {
+      "method": "POST",
+      "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "curl/7.88.1"
+      },
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"test.add\",\"params\":{\"a\":2,\"b\":3}}"
+    },
+    "expect": {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "bodyAbsent": false,
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sum\":5}}"
+    }
+  },
+  {
+    "name": "curl-notification",
+    "origin": "curl",
+    "request": {
+      "method": "POST",
+      "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "curl/7.88.1"
+      },
+      "body": "{\"jsonrpc\":\"2.0\",\"method\":\"test.notify\",\"params\":{\"message\":\"hello from curl\"}}"
+    },
+    "expect": {
+      "status": 204,
+      "headers": {},
+      "bodyAbsent": true
+    }
+  },
+  {
+    "name": "curl-batch",
+    "origin": "curl",
+    "request": {
+      "method": "POST",
+      "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "curl/7.88.1"
+      },
+      "body": "[{\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"test.add\",\"params\":{\"a\":2,\"b\":3}},{\"jsonrpc\":\"2.0\",\"id\":102,\"method\":\"test.add\",\"params\":{\"a\":4,\"b\":5}}]"
+    },
+    "expect": {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "bodyAbsent": false,
+      "body": "[{\"jsonrpc\":\"2.0\",\"id\":101,\"result\":{\"sum\":5}},{\"jsonrpc\":\"2.0\",\"id\":102,\"result\":{\"sum\":9}}]"
+    }
+  },
+  {
+    "name": "curl-rejection-get",
+    "origin": "curl",
+    "request": {
+      "method": "GET",
+      "headers": {
+        "User-Agent": "curl/7.88.1"
+      },
+      "body": null
+    },
+    "expect": {
+      "status": 405,
+      "headers": {
+        "Allow": "POST"
+      },
+      "bodyAbsent": true
+    }
+  },
+  {
+    "name": "fetch-single-request",
+    "origin": "fetch",
+    "request": {
+      "method": "POST",
+      "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "node-fetch (undici)"
+      },
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"test.add\",\"params\":{\"a\":2,\"b\":3}}"
+    },
+    "expect": {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "bodyAbsent": false,
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sum\":5}}"
+    }
+  },
+  {
+    "name": "fetch-notification",
+    "origin": "fetch",
+    "request": {
+      "method": "POST",
+      "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "node-fetch (undici)"
+      },
+      "body": "{\"jsonrpc\":\"2.0\",\"method\":\"test.notify\",\"params\":{\"message\":\"hello from fetch\"}}"
+    },
+    "expect": {
+      "status": 204,
+      "headers": {},
+      "bodyAbsent": true
+    }
+  },
+  {
+    "name": "fetch-batch",
+    "origin": "fetch",
+    "request": {
+      "method": "POST",
+      "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "node-fetch (undici)"
+      },
+      "body": "[{\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"test.add\",\"params\":{\"a\":2,\"b\":3}},{\"jsonrpc\":\"2.0\",\"id\":102,\"method\":\"test.add\",\"params\":{\"a\":4,\"b\":5}}]"
+    },
+    "expect": {
+      "status": 200,
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "bodyAbsent": false,
+      "body": "[{\"jsonrpc\":\"2.0\",\"id\":101,\"result\":{\"sum\":5}},{\"jsonrpc\":\"2.0\",\"id\":102,\"result\":{\"sum\":9}}]"
+    }
+  },
+  {
+    "name": "fetch-rejection-get",
+    "origin": "fetch",
+    "request": {
+      "method": "GET",
+      "headers": {
+        "User-Agent": "node-fetch (undici)"
+      },
+      "body": null
+    },
+    "expect": {
+      "status": 405,
+      "headers": {
+        "Allow": "POST"
+      },
+      "bodyAbsent": true
+    }
+  }
+]
