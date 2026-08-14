@@ -25,6 +25,7 @@ import io.activej.http.HttpRequest;
 import io.activej.http.HttpResponse;
 import io.activej.http.IHttpClient;
 import io.activej.http.MalformedHttpException;
+import io.activej.http.UrlParser;
 import io.activej.jsonrpc.JsonRpcLimits;
 import io.activej.jsonrpc.transport.JsonRpcTransport;
 import io.activej.promise.Promise;
@@ -139,7 +140,9 @@ public final class JsonRpcHttpClientTransport extends AbstractReactive implement
 	/**
 	 * Starts a transport on {@code reactor} over {@code httpClient}, POSTing to {@code url}.
 	 *
-	 * @throws NullPointerException if any argument is {@code null}
+	 * @throws NullPointerException     if any argument is {@code null}
+	 * @throws IllegalArgumentException at {@code build()} if {@code url} is malformed or the
+	 *                                  configured {@code maxBodySize} is not positive
 	 */
 	public static Builder builder(Reactor reactor, IHttpClient httpClient, String url) {
 		return new JsonRpcHttpClientTransport(
@@ -169,6 +172,10 @@ public final class JsonRpcHttpClientTransport extends AbstractReactive implement
 			// unconditional — the servlet's builder precedent (T031): a transport that cannot bound
 			// its response body would silently unbind FR-037
 			checkArgument(maxBodySize.toInt() > 0, "maxBodySize must be positive");
+			// the URL is a construction-time constant: refuse a malformed one here, with the same
+			// parser send() uses, rather than throwing IllegalArgumentException out of the first
+			// send() — after its promise had already entered inFlight
+			UrlParser.of(url);
 			return JsonRpcHttpClientTransport.this;
 		}
 	}
@@ -232,8 +239,11 @@ public final class JsonRpcHttpClientTransport extends AbstractReactive implement
 				return;
 			}
 			// FR-037: the bound applies during accumulation (F4); the post-load check below closes
-			// the already-accumulated hole
+			// the already-accumulated hole. whenException is attached to loadBody's promise BEFORE
+			// whenResult: a throwing listener must not reach sendPromise::setException — by then the
+			// finally below has already completed the send, and a second set would throw
 			response.loadBody(maxBodySize)
+				.whenException(sendPromise::setException)                    // oversize mid-stream (F4)
 				.whenResult($ -> {
 					ByteBuf taken = response.takeBody();                     // ownership out of the response (F5)
 					if (taken.readRemaining() > maxBodySize.toInt()) {       // T039: the accumulated-path belt
@@ -249,10 +259,15 @@ public final class JsonRpcHttpClientTransport extends AbstractReactive implement
 						return;
 					}
 					byte[] delivered = taken.asArray();                      // copies AND recycles in one call
-					listener.onDocument(delivered);                          // FR-035: before the promise (plan D2)
-					sendPromise.set(null);
-				})
-				.whenException(sendPromise::setException);                   // oversize mid-stream (F4)
+					try {
+						listener.onDocument(delivered);                      // FR-035: before the promise (plan D2)
+					} finally {
+						// a throwing listener must not hang or fail the send: the document was
+						// delivered, so the send completes; the exception still reaches the
+						// fatal-error handler through whenResult's chain
+						sendPromise.set(null);
+					}
+				});
 		});
 		return sendPromise;
 	}

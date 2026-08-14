@@ -31,6 +31,27 @@
 
     <dependency>
       <groupId>io.activej</groupId>
+      <artifactId>activej-common</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-bytebuf</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-promise</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-eventloop</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>io.activej</groupId>
       <artifactId>activej-jsonrpc</artifactId>
       <version>${project.version}</version>
       <type>test-jar</type>

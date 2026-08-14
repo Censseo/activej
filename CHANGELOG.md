@@ -212,7 +212,9 @@
   everything transport-specific inside the implementation), plus
   `AbstractTransportConformanceTest`: implement one method and inherit the whole
   conformance suite, all 30 vectors replayed end to end through a real dispatcher.
-  The harness is in test sources and is not published as a `test-jar` today.
+  The harness ships as a `test-jar` (the module's POM runs the `maven-jar-plugin`
+  `test-jar` goal), so a transport module consumes the suite at test scope — the
+  HTTP transport below is the first consumer.
 
   **Purely additive.** No new `ApplicationSettings` limit is introduced, so there is
   no behaviour-changing default and nothing here belongs under Breaking changes; the
@@ -255,16 +257,32 @@
   `JsonRpcLimits.maxBodySize` (`1mb` default) applies to the request on the
   servlet side and to the response on the transport side, with
   `withMaxBodySize(MemSize)` as the per-instance override — and **no
-  `ApplicationSettings` key exists** in this module. It consumes `activej-http`,
-  `activej-jsonrpc`, `activej-json` and `activej-common`, adds no third-party
+  `ApplicationSettings` key exists** in this module. It declares `activej-jsonrpc`,
+  `activej-http` and the platform modules it uses directly (`activej-common`,
+  `activej-bytebuf`, `activej-promise`, `activej-eventloop`), adds no third-party
   dependency and is built only under `-P extra`. No `Breaking changes` entry: the
   module is new, and the existing behaviour it builds on (`core-http`'s body
   handling, gzip decoded before the bound applies, feature 012's envelope and SPI)
-  is unchanged.
+  is unchanged — apart from the `core-csp` `acceptAll` failure-path fix under
+  Notable fixes below.
 
 ### Notable fixes
 
-All three are in `extra/util-json` (`activej-json`), built only under `-P extra`.
+- **`ChannelConsumer.acceptAll(Iterator)` no longer leaks the not-yet-accepted items
+  on failure** (in `core-csp`). A failed `accept` mid-iteration used to recycle the
+  *iterator* via `Recyclers.recycle(it)` — a no-op for the iterator every production
+  caller passes (`ByteBufs.asIterator()` is not `Recyclable`), so each pooled
+  `ByteBuf` still queued behind the failed item was dropped unrecycled. The
+  remaining **items** are now drained and recycled
+  (`it.forEachRemaining(Recyclers::recycle)`), which is what the javadoc always
+  promised and now states explicitly. The `List` overload already recycled this way
+  and is unchanged. The affected callers are `BufsConsumerGzipDeflater`,
+  `BufsConsumerDelimiter` and `BufsConsumerGzipInflater`, and only on their failure
+  paths. Regression test: `ChannelConsumerTest.testAcceptAllIteratorRecyclesRemainderOnFailure`,
+  pinned by `ByteBufRule`.
+
+The remaining fixes are in `extra/util-json` (`activej-json`), built only under
+`-P extra`.
 
 - **`ObjectJsonCodec.BuilderArray` no longer discards every default when *every*
   field has one.** `doBuild()` branches on whether any field is still

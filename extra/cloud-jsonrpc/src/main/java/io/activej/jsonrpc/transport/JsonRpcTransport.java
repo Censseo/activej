@@ -51,7 +51,9 @@ import org.jetbrains.annotations.Nullable;
  *
  *     <li><b>{@code send}'s promise means <i>written</i>, not <i>answered</i>.</b> It completes when the
  *     document has been handed to the underlying medium. Correlating an answer is the caller's job, and it
- *     does it by {@code id}.</li>
+ *     does it by {@code id}. An implementation is free to complete <b>later</b> than the write — the HTTP
+ *     transport completes only once the exchange has produced a response and any document has been
+ *     delivered — so a caller must never treat completion as a write-flow or pipelining signal.</li>
  *
  *     <li><b>Assume nothing about pairing or order.</b> A document sent need not produce a document received,
  *     one sent may produce several received, and responses may arrive in any order relative to the requests
@@ -94,7 +96,9 @@ public interface JsonRpcTransport extends AsyncCloseable {
 	 * @param document the whole document as a contiguous array, never empty. The transport does not retain it
 	 *                 after the returned promise completes
 	 * @return a promise completing when the document has been <b>written</b> to the underlying medium, or
-	 * failing with the medium's exception. It says nothing about an answer
+	 * failing with the medium's exception. It says nothing about an answer. An implementation may hold
+	 * it longer — the HTTP transport completes only after the response has arrived and any document has
+	 * been delivered — so completion must never be used as a write-flow signal
 	 */
 	Promise<Void> send(byte[] document);
 

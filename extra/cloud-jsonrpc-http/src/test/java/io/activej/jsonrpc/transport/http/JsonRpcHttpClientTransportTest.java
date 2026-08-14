@@ -346,6 +346,32 @@ public final class JsonRpcHttpClientTransportTest {
 		assertTrue(closed.isEmpty());
 	}
 
+	@Test
+	public void aThrowingListenerStillCompletesTheSendPromise() throws Exception {
+		listen(shaped());
+		List<Exception> closed = new ArrayList<>();
+		JsonRpcHttpClientTransport transport = transport("/");
+		RuntimeException listenerBug = new RuntimeException("listener bug");
+		loop.submit(() -> transport.setListener(new JsonRpcTransport.Listener() {
+			@Override
+			public void onDocument(byte[] document) {
+				throw listenerBug;
+			}
+
+			@Override
+			public void onClosed(@Nullable Exception e) {
+				closed.add(e);
+			}
+		}));
+
+		// the document WAS delivered — the listener's own bug is not an exchange failure: the send
+		// completes (never hangs, never fails), and the exception goes to the loop's fatal-error
+		// handler, which on a plain EventloopThread logs it. A regression here hangs this await or
+		// fails it with the listener's exception.
+		await(loop.submit(() -> transport.send(ADD_DOCUMENT)).toCompletableFuture(), "send");
+		assertTrue("a listener bug must not reach onClosed (FR-036)", closed.isEmpty());
+	}
+
 	// ---------------------------------------------------------------------------------------------------
 	// The shared pieces: shaped servlet, listener, transport, outcome helpers.
 	// ---------------------------------------------------------------------------------------------------
