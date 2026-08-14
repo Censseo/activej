@@ -78,15 +78,15 @@ public interface ChannelConsumer<T> extends AsyncCloseable {
 	 * Passes iterator's values to the {@code output} until it {@code hasNext()},
 	 * then returns a promise of {@code null} as a marker of completion.
 	 * <p>
-	 * If there was an exception while accepting iterator, a promise of
-	 * exception will be returned.
+	 * If one of the items was accepted with an error, subsequent items will be
+	 * recycled and a {@code Promise} of exception will be returned.
 	 *
 	 * @param it an {@link Iterator} which provides some values
 	 * @return a promise of {@code null} as a marker of completion
 	 */
 	default Promise<Void> acceptAll(Iterator<? extends T> it) {
 		if (!it.hasNext()) return Promise.complete();
-		return Promise.ofCallback(cb -> acceptAllImpl(this, it, false, cb));
+		return Promise.ofCallback(cb -> acceptAllImpl(this, it, cb));
 	}
 
 	/**
@@ -94,7 +94,7 @@ public interface ChannelConsumer<T> extends AsyncCloseable {
 	 */
 	default Promise<Void> acceptAll(List<T> list) {
 		if (list.isEmpty()) return Promise.complete();
-		return Promise.ofCallback(cb -> acceptAllImpl(this, ((List<? extends T>) list).iterator(), true, cb));
+		return Promise.ofCallback(cb -> acceptAllImpl(this, ((List<? extends T>) list).iterator(), cb));
 	}
 
 	/**
@@ -266,19 +266,19 @@ public interface ChannelConsumer<T> extends AsyncCloseable {
 		};
 	}
 
-	private static <T> void acceptAllImpl(ChannelConsumer<T> output, Iterator<? extends T> it, boolean ownership, SettableCallback<Void> cb) {
+	private static <T> void acceptAllImpl(ChannelConsumer<T> output, Iterator<? extends T> it, SettableCallback<Void> cb) {
 		while (it.hasNext()) {
 			Promise<Void> accept = output.accept(it.next());
 			if (accept.isResult()) continue;
 			accept.subscribe(($, e) -> {
 				if (e == null) {
-					acceptAllImpl(output, it, ownership, cb);
+					acceptAllImpl(output, it, cb);
 				} else {
-					if (ownership) {
-						it.forEachRemaining(Recyclers::recycle);
-					} else {
-						Recyclers.recycle(it);
-					}
+					// the documented contract: items not yet accepted are recycled on failure.
+					// Drain the iterator itself (forEachRemaining), not Recyclers.recycle(it) —
+					// an iterator that owns its remaining items (e.g. ByteBufs.asIterator())
+					// may not be Recyclable, and only the items are ours to recycle
+					it.forEachRemaining(Recyclers::recycle);
 					cb.setException(e);
 				}
 			});
