@@ -4,6 +4,48 @@
 
 ### Notable additions
 
+- **A turnkey JSON-RPC 2.0 launcher family, and per-method JMX metrics on the
+  dispatcher.** New profile-gated module `extra/launchers/jsonrpc`
+  (`activej-launchers-jsonrpc`): `JsonRpcServerLauncher` (one eventloop),
+  `MultithreadedJsonRpcServerLauncher` (one dispatcher and servlet per worker, a
+  `PrimaryServer` accepting on every core) and `JsonRpcClientModule` (a DI-provided
+  client whose in-flight calls are failed deterministically at graph stop). A
+  developer writes one `@JsonRpcService` interface, an implementation and a
+  `JsonRpcServiceBinding` contribution; the servlet, dispatcher, server, config and
+  JMX come from the launcher.
+
+  In `extra/cloud-jsonrpc` (`activej-jsonrpc`), `JsonRpcDispatcher` gains a purely
+  additive `Inspector` seam with a `JmxInspector` implementation: request counts,
+  error breakdowns by JSON-RPC code, latencies and a `methodNotFound` aggregate —
+  **one row per registered wire name, the row set closed at `build()`** and never
+  growable by anything a caller sends (no `computeIfAbsent` anywhere; the one
+  callback that sees wire text, `onMethodNotFound(String)`, is documented as
+  aggregate-only). The JMX attribute names are a stable surface from this entry
+  onward. With no inspector installed every dispatch outcome is byte-identical to
+  before; a throwing inspector can never break a dispatch. Under a worker pool the
+  per-worker tables aggregate in the JMX layer so the aggregated attribute equals
+  the sum over workers.
+
+Fixes a latent platform defect found while verifying this surface against a real
+  `MBeanServer`: registering a stats-bearing bean through a bare `DynamicMBeanFactory` (no
+  `customType` adapters) threw "Setters are allowed only on attributes of simple, custom or
+  Enum types" on `EventStats.setSmoothingWindow(Duration)`. `boot-jmx`'s
+  `DynamicMBeanFactory` now skips non-simple setters and renders an un-walkable optional
+  attribute as an inert hidden node; `RealStatsRegistrationTest` pins it. Launcher-path
+  registrations (`HttpServer` included) were already fine at HEAD — `JmxModule` registers a
+  `Duration` custom type by default — so the blast radius is the bare factory, which no
+  launcher path exercised. The one corner this changes from loud to silent: a bean whose
+  *only* member for an attribute is a non-simple setter now registers without that attribute
+  instead of failing the whole bean — nothing could register that bean before.
+
+  Not Breaking changes: no signature moves in any shipped module (the dispatcher's
+  seam is additive; the `boot-jmx` fix only removes a startup crash). The new
+  launcher's config surface is `jsonrpc.path`, `jsonrpc.maxBodySize`,
+  `jsonrpc.emptyResponseCode` plus the inherited `http.*` / `eventloop.*` / `workers`
+  keys; setting `jsonrpc.maxBatchSize`, `jsonrpc.maxJsonDepth`,
+  `jsonrpc.callTimeout` or `jsonrpc.maxInFlight` fails startup loudly rather than
+  being silently ignored.
+
 - **`JsonCodecFactory` derives a `JsonCodec` for any `record`, and for eleven more
   built-in types.** In `extra/util-json` (`activej-json`, profile-gated behind
   `-P extra`), `JsonCodecFactory.defaultInstance().resolve(MyRecord.class)` now
@@ -265,6 +307,20 @@
   handling, gzip decoded before the bound applies, feature 012's envelope and SPI)
   is unchanged — apart from the `core-csp` `acceptAll` failure-path fix under
   Notable fixes below.
+
+- **JitPack publishes the `extra/` artefacts too.** JitPack's default build command is
+  `mvn install -DskipTests`, and the `extra` profile is `activeByDefault=false` — so
+  every artefact under `extra/` was silently absent from the published build.
+  [jitpack.yml](jitpack.yml) now overrides that command with
+  `mvn install -B -DskipTests -P extra`, which adds the seventeen extra artefacts
+  (`activej-json`, `activej-jsonrpc`, `activej-jsonrpc-http`, `activej-cube`,
+  `activej-crdt`, `activej-dataflow`, `activej-dataflow-jdbc-driver`, `activej-etl`,
+  `activej-etcd`, `activej-memcache`, `activej-multilog`, `activej-ot`, `activej-redis`
+  and the four extra launchers) to the reactor's. Each is one coordinate, as for any
+  other module: `com.github.<user>.<repo>:activej-jsonrpc:<tag>`. The profile stays
+  off for a plain `mvn verify` and for CI, which is deliberate — turning it on there
+  would drag the extra modules' third-party dependencies (Calcite, jetcd, MinIO,
+  Jackson, …) into every build of a reactor that refuses them.
 
 ### Notable fixes
 

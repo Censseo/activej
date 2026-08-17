@@ -11,3 +11,13 @@ before_install:
   - sdk install java 25-open
   - sdk use java 25-open
   - java -version
+
+# JitPack's default build command is a plain `mvn install -DskipTests`, and the `extra`
+# profile is activeByDefault=false — so without `-P extra` every artifact under extra/
+# (activej-jsonrpc, activej-jsonrpc-http, activej-cube, activej-crdt, activej-dataflow,
+# activej-ot, activej-redis, activej-etcd, activej-json, the extra launchers, …) is
+# silently absent from the published build. Turning it on here rather than flipping the
+# profile to activeByDefault keeps a plain `mvn verify` — and CI — free of the extra
+# modules and their third-party dependencies, which is deliberate.
+install:
+  - mvn install -B -DskipTests -P extra
