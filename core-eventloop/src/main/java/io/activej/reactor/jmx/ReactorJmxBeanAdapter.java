@@ -43,7 +43,11 @@ public final class ReactorJmxBeanAdapter implements JmxBeanAdapterWithRefresh {
 	public synchronized void execute(Object bean, Runnable command) {
 		Reactor reactor = beanToReactor.get(bean);
 		checkNotNull(reactor, () -> "Unregistered bean " + bean);
-		reactor.execute(command);
+		if (Reactor.getCurrentReactorOrNull() == reactor) {
+			command.run();
+		} else {
+			reactor.execute(command);
+		}
 	}
 
 	@Override

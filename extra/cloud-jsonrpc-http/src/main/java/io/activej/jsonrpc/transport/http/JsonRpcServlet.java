@@ -135,7 +135,9 @@ public final class JsonRpcServlet extends AbstractReactive implements AsyncServl
 		 * {@link JsonRpcLimits#MAX_BODY_SIZE}; a non-positive value is refused at {@link #build()}.
 		 * The bound is the servlet tier's — {@code HttpServer}'s own 100 MB connection tier stays
 		 * untouched (FR-020a), and no {@code ApplicationSettings} key exists for it (Decision 8 —
-		 * {@code JsonRpcLimits} exists precisely so a transport reads the bound).
+		 * {@code JsonRpcLimits} exists precisely so a transport reads the bound). A configured value
+		 * above {@code Integer.MAX_VALUE} bytes is clamped to that for accumulation; the 100 MB
+		 * connection tier remains the effective cap for anything above it (FR-020a).
 		 */
 		public Builder withMaxBodySize(MemSize maxBodySize) {
 			checkNotBuilt(this);
@@ -152,7 +154,8 @@ public final class JsonRpcServlet extends AbstractReactive implements AsyncServl
 			// T031 — unconditional, always-on: java-api.md §1 refuses a non-positive maxBodySize.
 			// 0 would disable loadBody's bound (HttpMessage.java:335 `maxBodySize != 0 &&`) AND make
 			// the row-3 check answer 413 for every declared-length request (`declared > 0`).
-			checkArgument(maxBodySize.toInt() > 0, "maxBodySize must be positive");
+			// toLong(), not toInt(): toInt throws past Integer.MAX_VALUE before the check could run (D3-1).
+			checkArgument(maxBodySize.toLong() > 0, "maxBodySize must be positive");
 			return JsonRpcServlet.this;
 		}
 	}
@@ -206,13 +209,15 @@ public final class JsonRpcServlet extends AbstractReactive implements AsyncServl
 				// direct serve() callers (FR-019); a malformed value is treated as absent
 				declaredContentLength = -1;
 			}
-			if (declaredContentLength > maxBodySize.toInt()) {
+			if (declaredContentLength > maxBodySize.toLong()) {
 				// strict > : a body exactly at the bound proceeds (loadBody accepts it too)
 				return HttpResponse.ofCode(413).toPromise();
 			}
 		}
 		// ---- semantics table rows 4-6: load, dispatch, respond (FR-013, FR-017) -------------------
-		return request.loadBody(maxBodySize)
+		// loadBody takes an int bound; a configured value above Integer.MAX_VALUE is clamped to it for
+		// accumulation — the connection tier's 100mb is the real cap for anything above (FR-020a, D3-1).
+		return request.loadBody((int) Math.min(maxBodySize.toLong(), Integer.MAX_VALUE))
 			.then($ -> dispatcher.dispatch(request.takeBody().asArray()))
 			.then(response -> response.length == 0 ?
 				HttpResponse.ofCode(emptyResponseCode).toPromise() :

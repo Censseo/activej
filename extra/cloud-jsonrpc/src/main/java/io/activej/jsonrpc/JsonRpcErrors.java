@@ -18,6 +18,8 @@ package io.activej.jsonrpc;
 
 import io.activej.common.annotation.StaticFactories;
 
+import java.util.List;
+
 /**
  * The named error codes of JSON-RPC 2.0 §5.1, the four this implementation allocates, the two range
  * predicates, and the two construction paths (FR-015, FR-016).
@@ -91,6 +93,13 @@ public final class JsonRpcErrors {
 	public static final JsonRpcError NESTING_TOO_DEEP = predefined(-32003, "Nesting too deep");
 	/** {@code -32004} — a peer's Response object violates §5 (both or neither of {@code result}/{@code error}). */
 	public static final JsonRpcError INVALID_RESPONSE = predefined(-32004, "Invalid response");
+
+	/** The nine named codes, in declaration order — the closed key set of a per-method error breakdown. */
+	public static List<JsonRpcError> named() {
+		return List.of(
+			PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL_ERROR,
+			REQUEST_TOO_LARGE, BATCH_TOO_LARGE, NESTING_TOO_DEEP, INVALID_RESPONSE);
+	}
 
 	/** Whether {@code code} is inside the range {@code -32768 … -32000} reserved by JSON-RPC 2.0 §5.1. */
 	public static boolean isReserved(int code) {

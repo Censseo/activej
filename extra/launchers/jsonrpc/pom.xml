@@ -4,44 +4,45 @@
 
   <parent>
     <groupId>io.activej</groupId>
-    <artifactId>activej-extra</artifactId>
+    <artifactId>extra-launchers</artifactId>
     <version>6.0-SNAPSHOT</version>
     <relativePath>../pom.xml</relativePath>
   </parent>
 
-  <artifactId>extra-launchers</artifactId>
-  <packaging>pom</packaging>
+  <artifactId>activej-launchers-jsonrpc</artifactId>
 
-  <name>Extra Launchers</name>
+  <name>ActiveJ : Launchers : JSON-RPC</name>
   <description>
-    A set of predefined launchers for different extra services
+    JSON-RPC 2.0 launchers for ActiveJ project.
   </description>
-
-  <modules>
-    <module>crdt</module>
-    <module>dataflow</module>
-    <module>fs-gui</module>
-    <module>jsonrpc</module>
-  </modules>
 
   <dependencies>
     <dependency>
       <groupId>io.activej</groupId>
-      <artifactId>activej-boot</artifactId>
+      <artifactId>activej-jsonrpc-http</artifactId>
       <version>${project.version}</version>
     </dependency>
-    <dependency>
-      <groupId>ch.qos.logback</groupId>
-      <artifactId>logback-classic</artifactId>
-      <optional>true</optional>
-    </dependency>
-
     <dependency>
       <groupId>io.activej</groupId>
-      <artifactId>activej-test</artifactId>
+      <artifactId>activej-launchers-common</artifactId>
       <version>${project.version}</version>
-      <scope>test</scope>
     </dependency>
   </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <configuration>
+          <archive>
+            <manifestEntries>
+              <Automatic-Module-Name>io.activej.launchers.jsonrpc</Automatic-Module-Name>
+            </manifestEntries>
+          </archive>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
 
 </project>
