@@ -284,9 +284,13 @@ public final class DynamicMBeanFactory {
 
 	private void processSetter(Map<String, AttributeDescriptor> nameToAttr, Method setter, Map<Type, JmxCustomTypeAdapter<?>> customTypes) {
 		Class<?> attrType = setter.getParameterTypes()[0];
-		checkArgument(ReflectionUtils.isSimpleType(attrType) || isStringWrappedType(customTypes, attrType),
-			"Setters are allowed only on attributes of simple, custom or Enum types. But setter \"%s\" is for neither of the above types",
-			setter.getName());
+		if (!(ReflectionUtils.isSimpleType(attrType) || isStringWrappedType(customTypes, attrType))) {
+			// A non-simple setter can never be a settable JMX attribute. Skipping it — rather than
+			// rejecting the whole bean — lets the matching getter define a read-only attribute; this is
+			// what EventStats/ValueStats.setSmoothingWindow(Duration) rely on, and without it no
+			// stats-bearing bean could be registered at all.
+			return;
+		}
 
 		String name = extractFieldNameFromSetter(setter);
 
@@ -387,7 +391,14 @@ public final class DynamicMBeanFactory {
 					createNodesFor(returnClass, beanClass, extraSubAttributes, getter, customTypes);
 
 				if (subNodes.isEmpty()) {
-					throw new IllegalArgumentException(format("Unrecognized type of Jmx attribute: %s", attrType.getTypeName()));
+					if (included) {
+						throw new IllegalArgumentException(format("Unrecognized type of Jmx attribute: %s", attrType.getTypeName()));
+					}
+					// an optional attribute that was not requested and whose type carries no walkable members
+					// (e.g. EventStats.getSmoothingWindow() returning Duration) contributes an inert node — it
+					// cannot be rendered, and it was not requested. Building it as a hidden empty pojo keeps
+					// the attribute tree uniform without breaking registration of the whole bean.
+					return new AttributeNodeForPojo(attrName, attrDescription, false, defaultFetcher, null, List.of());
 				} else {
 					// POJO case
 
