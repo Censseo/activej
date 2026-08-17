@@ -17,6 +17,12 @@
 package io.activej.jsonrpc.service;
 
 import io.activej.common.builder.AbstractBuilder;
+import io.activej.common.inspector.AbstractInspector;
+import io.activej.common.inspector.BaseInspector;
+import io.activej.jmx.api.attribute.JmxAttribute;
+import io.activej.jmx.api.attribute.JmxReducers.JmxReducerSum;
+import io.activej.jmx.stats.EventStats;
+import io.activej.jmx.stats.ValueStats;
 import io.activej.json.JsonCodec;
 import io.activej.json.JsonCodecFactory;
 import io.activej.json.JsonUtils;
@@ -29,6 +35,7 @@ import io.activej.jsonrpc.JsonRpcErrors;
 import io.activej.jsonrpc.JsonRpcException;
 import io.activej.jsonrpc.JsonRpcId;
 import io.activej.jsonrpc.JsonRpcInput;
+import io.activej.jsonrpc.JsonRpcLimits;
 import io.activej.jsonrpc.JsonRpcMalformed;
 import io.activej.jsonrpc.JsonRpcMessage;
 import io.activej.jsonrpc.JsonRpcOutput;
@@ -40,9 +47,12 @@ import io.activej.promise.Promise;
 import io.activej.promise.Promises;
 import io.activej.reactor.AbstractReactive;
 import io.activej.reactor.Reactor;
+import io.activej.reactor.jmx.ReactiveJmxBean;
+import org.jetbrains.annotations.Nullable;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -100,13 +110,228 @@ import static java.nio.charset.StandardCharsets.US_ASCII;
  *         <td>per element</td></tr>
  * </table>
  */
-public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpcPeerHandler {
+public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpcPeerHandler, ReactiveJmxBean {
 	/** The wire rendering of a {@code Promise<Void>} result: the JSON literal {@code null} (FR-030). */
 	private static final byte[] NULL_LITERAL = "null".getBytes(US_ASCII);
 
+	@Nullable Inspector inspector;
 	private Map<String, Handler> handlers = Map.of();
 	private Set<String> wireNames = Set.of();
 	private BiConsumer<JsonRpcMethodDescriptor, Exception> failureHandler;
+
+	/**
+	 * The observation seam (FR-030…FR-034). A plain interface with <b>no JMX types in its signature</b>, so a
+	 * consumer may implement it for logging or tracing without any JMX dependency.
+	 * <p>
+	 * Every callback fires on the dispatcher's reactor thread. A throwing implementation is ignored — the
+	 * dispatcher never propagates, and a dispatch never fails because its inspector failed (FR-040).
+	 * {@link #initialize(Set)} is the one exception to the threading rule: it fires once, during
+	 * {@code build()}, on the <b>builder's</b> thread, with the frozen registered wire-name set.
+	 * <p>
+	 * The asymmetry between {@link #onMethodNotFound(String)} and every other callback is the type system
+	 * carrying FR-034: a callback that receives a {@link JsonRpcMethodDescriptor} can only have been reached
+	 * through the closed handler table, so an implementation <i>cannot</i> key a map on a wire-supplied name
+	 * by accident. {@code onMethodNotFound} is the one callback that does see wire text — <b>it is
+	 * aggregate-only</b> and must never be used to retain, key or expose the name it receives; doing so would
+	 * be a memory-exhaustion primitive, since the name set is unbounded (FR-034).
+	 */
+	public interface Inspector extends BaseInspector<Inspector> {
+		/** A registered method is about to be invoked. */
+		void onRequest(JsonRpcMethodDescriptor descriptor);
+
+		/** A registered method succeeded; {@code durationMillis} is the invocation duration, {@code >= 0}. */
+		void onResponse(JsonRpcMethodDescriptor descriptor, long durationMillis);
+
+		/**
+		 * A registered method produced an error object; {@code errorCode} is a JSON-RPC code <b>chosen by this
+		 * server</b> — a named {@link JsonRpcErrors} code or an application's own — never echoed from a request.
+		 */
+		void onError(JsonRpcMethodDescriptor descriptor, int errorCode, long durationMillis);
+
+		/**
+		 * <b>Aggregate-only.</b> No descriptor exists for {@code requestedName} — the name came from the wire.
+		 * Implementations MUST NOT retain it, key a map by it, or expose it; it is a count signal, not data
+		 * (FR-034).
+		 */
+		void onMethodNotFound(String requestedName);
+
+		/** The document never resolved to a method at all — it was malformed. */
+		void onMalformed();
+
+		/**
+		 * The lifecycle hook the dispatcher's {@code doBuild()} calls exactly once, when the handler table
+		 * is frozen, with the <b>closed</b> registered wire-name set (FR-034 — it can never grow from the
+		 * wire). A default no-op, so a logging or tracing inspector needs no implementation; an inspector
+		 * that keeps per-method state pre-populates it here rather than on the call path.
+		 * <p>
+		 * Implementations must not retain the set for keying beyond their own lifetime or expose it: the
+		 * names are server-registered, but {@link #onMethodNotFound(String)} is the only callback that
+		 * must never retain its argument. An instance is owned by <b>one</b> dispatcher — a second
+		 * {@code initialize} call is the dispatcher-build misusing a shared inspector. A <b>delegating</b>
+		 * inspector (one whose {@link #lookup} forwards) must forward this call to its delegate too —
+		 * the dispatcher reaches the delegate through the seam, not through {@code lookup}.
+		 */
+		default void initialize(Set<String> wireNames) {}
+	}
+
+	/**
+	 * The statistics-carrying {@link Inspector} (FR-030…FR-034). {@code methodStats} is built <b>once</b> from
+	 * the dispatcher's {@link #wireNames()} inside {@link Builder#doBuild()}, when the handler table is already
+	 * frozen, and is never written to afterwards. There is <b>no {@code computeIfAbsent}</b> anywhere in this
+	 * class: a lookup miss is a {@code null}, and {@link #onMethodNotFound(String)} / {@link #onMalformed()}
+	 * never touch the map (FR-034).
+	 * <p>
+	 * Single-ownership: an instance is wired into <b>one</b> dispatcher, which calls {@link #initialize} once
+	 * at {@code build()}. Re-using the instance for a second dispatcher is refused, not silently accepted —
+	 * it would wipe the first dispatcher's rows.
+	 */
+	public static class JmxInspector extends AbstractInspector<Inspector> implements Inspector {
+		private static final Duration SMOOTHING_WINDOW = Duration.ofMinutes(1);
+
+		private Map<String, JsonRpcMethodStats> methodStats = Map.of();
+		private boolean initialized;
+		private final EventStats methodNotFound = EventStats.create(SMOOTHING_WINDOW);
+		private final EventStats malformedDocuments = EventStats.create(SMOOTHING_WINDOW);
+		private final EventStats totalRequests = EventStats.create(SMOOTHING_WINDOW);
+		private final EventStats totalErrors = EventStats.create(SMOOTHING_WINDOW);
+
+		@Override
+		public void onRequest(JsonRpcMethodDescriptor descriptor) {
+			totalRequests.recordEvent();
+		}
+
+		@Override
+		public void onResponse(JsonRpcMethodDescriptor descriptor, long durationMillis) {
+			JsonRpcMethodStats stats = requireStats(descriptor);
+			stats.getSuccessfulRequests().recordEvent();
+			stats.getRequestHandlingTime().recordValue(durationMillis);
+		}
+
+		@Override
+		public void onError(JsonRpcMethodDescriptor descriptor, int errorCode, long durationMillis) {
+			totalErrors.recordEvent();
+			JsonRpcMethodStats stats = requireStats(descriptor);
+			stats.getFailedRequests().recordEvent();
+			stats.getRequestHandlingTime().recordValue(durationMillis);
+			EventStats bucket = stats.getErrorsByCode().get(errorCode);
+			if (bucket != null) {
+				bucket.recordEvent();
+			} else {
+				// FR-033a: an application-chosen code outside the nine named codes never creates an entry
+				stats.getOtherErrors().recordEvent();
+			}
+		}
+
+		@Override
+		public void onMethodNotFound(String requestedName) {
+			// aggregate-only by contract — the name is a count signal, never data (FR-034)
+			methodNotFound.recordEvent();
+			totalRequests.recordEvent();
+			totalErrors.recordEvent();
+		}
+
+		@Override
+		public void onMalformed() {
+			malformedDocuments.recordEvent();
+		}
+
+		/**
+		 * The row for a registered descriptor must exist — the map was built from the frozen
+		 * {@code wireNames()} at dispatcher build. A miss means this inspector was never wired into a
+		 * dispatcher ({@code initialize} was never called); failing loudly here beats the dispatcher's
+		 * totality wrapper silently swallowing the misuse.
+		 */
+		private JsonRpcMethodStats requireStats(JsonRpcMethodDescriptor descriptor) {
+			JsonRpcMethodStats stats = methodStats.get(descriptor.wireName());
+			if (stats == null) {
+				throw new IllegalStateException(
+					"this JmxInspector has no row for '" + descriptor.wireName() +
+					"' — it was not wired into a dispatcher (initialize was never called)");
+			}
+			return stats;
+		}
+
+/** The {@link Inspector} lifecycle hook: pre-populates the per-method rows, once, from the frozen set. */
+		@Override
+		public void initialize(Set<String> wireNames) {
+		if (initialized) {
+			throw new IllegalStateException(
+				"this JmxInspector is already wired into a dispatcher; an inspector belongs to one dispatcher only");
+		}
+		initialized = true;
+		Map<String, JsonRpcMethodStats> built = new LinkedHashMap<>();
+		for (String wireName : wireNames) {
+			built.put(wireName, JsonRpcMethodStats.create());
+		}
+		this.methodStats = Collections.unmodifiableMap(built);
+	}
+
+		/**
+		 * One row per registered wire name; the row set is fixed at dispatcher {@code build()} (FR-034).
+		 * <p>
+		 * Deliberately <b>without</b> a reducer: the map's value type is a {@code JsonRpcMethodStats}
+		 * pojo, and a sum reducer on the map would be applied to the values themselves. Under a worker
+		 * pool the aggregation happens one level down — each row's {@code EventStats}/{@code ValueStats}
+		 * members combine via {@code JmxStats.add} — which is what makes the aggregated attribute equal
+		 * the sum over workers (FR-038, verified by the multi-worker test).
+		 */
+		@JmxAttribute
+		public Map<String, JsonRpcMethodStats> getMethodStats() {
+			return methodStats;
+		}
+
+		@JmxAttribute(reducer = JmxReducerSum.class, extraSubAttributes = "totalCount")
+		public EventStats getTotalRequests() {
+			return totalRequests;
+		}
+
+		@JmxAttribute(reducer = JmxReducerSum.class, extraSubAttributes = "totalCount")
+		public EventStats getTotalErrors() {
+			return totalErrors;
+		}
+
+		@JmxAttribute(reducer = JmxReducerSum.class, extraSubAttributes = "totalCount")
+		public EventStats getMethodNotFound() {
+			return methodNotFound;
+		}
+
+		@JmxAttribute(reducer = JmxReducerSum.class, extraSubAttributes = "totalCount")
+		public EventStats getMalformedDocuments() {
+			return malformedDocuments;
+		}
+
+		/**
+		 * The number of registered wire names. Deliberately <b>without</b> a reducer: it is identical on every
+		 * worker, and the platform's default aggregation ({@code JmxReducerDistinct}) reads the single correct
+		 * value — a sum reducer would report {@code workers × methods} on the aggregated bean, exactly like the
+		 * read-only {@link #getMaxBatchSize()}/{@link #getMaxJsonDepth()} neighbours.
+		 */
+		@JmxAttribute
+		public int getRegisteredMethods() {
+			return methodStats.size();
+		}
+
+		/**
+		 * The effective process-wide {@code JsonRpcLimits} value — read-only, so an operator can observe what is
+		 * in force even though no config key sets it (FR-037).
+		 */
+		@JmxAttribute(description = "effective JsonRpcLimits.MAX_BATCH_SIZE (process-wide, read-only)")
+		public int getMaxBatchSize() {
+			return JsonRpcLimits.MAX_BATCH_SIZE;
+		}
+
+		@JmxAttribute(description = "effective JsonRpcLimits.MAX_JSON_DEPTH (process-wide, read-only)")
+		public int getMaxJsonDepth() {
+			return JsonRpcLimits.MAX_JSON_DEPTH;
+		}
+
+		@Override
+		public String toString() {
+			return "JmxInspector[" + methodStats.size() + " methods, " +
+				totalRequests.getTotalCount() + " totalRequests, " +
+				totalErrors.getTotalCount() + " totalErrors]";
+		}
+	}
 
 	private JsonRpcDispatcher(Reactor reactor) {
 		super(reactor);
@@ -173,6 +398,16 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		}
 
 		/**
+		 * Installs the observation seam. The inspector's per-method table is pre-populated from the frozen
+		 * {@code wireNames()} inside {@link #doBuild()}; a throwing inspector never breaks a dispatch (FR-040).
+		 */
+		public Builder withInspector(Inspector inspector) {
+			checkNotBuilt(this);
+			JsonRpcDispatcher.this.inspector = Objects.requireNonNull(inspector, "inspector");
+			return this;
+		}
+
+		/**
 		 * @throws JsonRpcContractException if any registered interface breaks the contract, or if two
 		 *                                  interfaces claim the same wire name (FR-036, FR-037)
 		 */
@@ -203,6 +438,11 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 
 			JsonRpcDispatcher.this.handlers = built;
 			JsonRpcDispatcher.this.wireNames = Collections.unmodifiableSet(built.keySet());
+			// FR-034: wire the inspector to the handler table only now that wireNames is frozen, so the
+			// per-method rows are exactly the registered names and nothing can grow the set afterwards.
+			// Called through the Inspector interface (default no-op) so the resolution path matches
+			// getStats()'s BaseInspector.lookup — a composite inspector reached there is reached here too
+			if (inspector != null) inspector.initialize(JsonRpcDispatcher.this.wireNames);
 			return JsonRpcDispatcher.this;
 		}
 	}
@@ -283,6 +523,16 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		return wireNames;
 	}
 
+	/**
+	 * The JMX view of this dispatcher — {@code null} unless an inspector resolving to a
+	 * {@link JmxInspector} is installed. Deliberately <b>not</b> reactor-thread-guarded: JMX reads invoke
+	 * this getter on the JMX thread (contract §6: with no inspector the whole surface reads as absent).
+	 */
+	@JmxAttribute(name = "")
+	public @Nullable JmxInspector getStats() {
+		return BaseInspector.lookup(inspector, JmxInspector.class);
+	}
+
 	@Override
 	public String toString() {
 		return "JsonRpcDispatcher[" + handlers.size() + " methods]";
@@ -318,14 +568,22 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 			case JsonRpcResponse ignored -> Promise.of(JsonRpcOutput.none());
 			// FR-051: feature 01 already produced the normative error object; re-deriving it would be a
 			// second answer to one question
-			case JsonRpcMalformed malformed -> Promise.of(JsonRpcOutput.single(malformed.toResponse()));
+			case JsonRpcMalformed malformed -> {
+				notifyMalformed();
+				yield Promise.of(JsonRpcOutput.single(malformed.toResponse()));
+			}
 		};
 	}
 
 	private Promise<JsonRpcOutput> dispatchRequest(JsonRpcRequest request) {
 		Handler handler = handlers.get(request.method());
 		// FR-041: a miss answers -32601 and invokes nothing at all
-		if (handler == null) return Promise.of(error(request.id(), JsonRpcErrors.METHOD_NOT_FOUND));
+		if (handler == null) {
+			notifyMethodNotFound(request.method());
+			return Promise.of(error(request.id(), JsonRpcErrors.METHOD_NOT_FOUND));
+		}
+
+		notifyRequest(handler.descriptor);
 
 		Object[] args;
 		try {
@@ -333,19 +591,32 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		} catch (Exception e) {
 			// FR-045: the decoder's message embeds the offending input by construction, so it is dropped here
 			// rather than mapped into the error object
+			notifyError(handler.descriptor, JsonRpcErrors.INVALID_PARAMS.code(), 0);
 			return Promise.of(error(request.id(), JsonRpcErrors.INVALID_PARAMS));
 		}
 
+		long startNanos = System.nanoTime();
 		return handler.invoke(args)
 			.map(
-				value -> respond(handler.descriptor, request.id(), value),
-				e -> error(request.id(), errorOf(e)));
+				value -> {
+					notifyResponse(handler.descriptor, durationMillis(startNanos));
+					return respond(handler.descriptor, request.id(), value);
+				},
+				e -> {
+					notifyError(handler.descriptor, codeOf(e), durationMillis(startNanos));
+					return error(request.id(), errorOf(e));
+				});
 	}
 
 	private Promise<JsonRpcOutput> dispatchNotification(io.activej.jsonrpc.JsonRpcNotification notification) {
 		Handler handler = handlers.get(notification.method());
 		// §4.1 forbids answering a notification, so an unknown one is dropped rather than turned into -32601
-		if (handler == null) return Promise.of(JsonRpcOutput.none());
+		if (handler == null) {
+			notifyMethodNotFound(notification.method());
+			return Promise.of(JsonRpcOutput.none());
+		}
+
+		notifyRequest(handler.descriptor);
 
 		Object[] args;
 		try {
@@ -353,14 +624,20 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		} catch (Exception e) {
 			// FR-050: nothing goes on the wire, but nothing is swallowed either
 			reportFailure(handler.descriptor, e);
+			notifyError(handler.descriptor, JsonRpcErrors.INVALID_PARAMS.code(), 0);
 			return Promise.of(JsonRpcOutput.none());
 		}
 
+		long startNanos = System.nanoTime();
 		return handler.invoke(args)
 			.map(
-				value -> JsonRpcOutput.none(),
+				value -> {
+					notifyResponse(handler.descriptor, durationMillis(startNanos));
+					return JsonRpcOutput.none();
+				},
 				e -> {
 					reportFailure(handler.descriptor, e);
+					notifyError(handler.descriptor, codeOf(e), durationMillis(startNanos));
 					return JsonRpcOutput.none();
 				});
 	}
@@ -372,6 +649,60 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 			// a failure handler that itself fails must not turn a notification into a failed dispatch;
 			// totality (FR-038a) outranks the diagnostic
 		}
+	}
+
+	// ---------------------------------------------------------------------------------------------------
+	// Inspector callbacks — each guarded, each wrapped so a throwing inspector cannot break totality (FR-040).
+	// ---------------------------------------------------------------------------------------------------
+
+	private void notifyRequest(JsonRpcMethodDescriptor descriptor) {
+		if (inspector == null) return;
+		try {
+			inspector.onRequest(descriptor);
+		} catch (Throwable ignored) {
+			// an inspector that itself fails must not break totality (FR-040)
+		}
+	}
+
+	private void notifyResponse(JsonRpcMethodDescriptor descriptor, long durationMillis) {
+		if (inspector == null) return;
+		try {
+			inspector.onResponse(descriptor, durationMillis);
+		} catch (Throwable ignored) {
+			// an inspector that itself fails must not break totality (FR-040)
+		}
+	}
+
+	private void notifyError(JsonRpcMethodDescriptor descriptor, int errorCode, long durationMillis) {
+		if (inspector == null) return;
+		try {
+			inspector.onError(descriptor, errorCode, durationMillis);
+		} catch (Throwable ignored) {
+			// an inspector that itself fails must not break totality (FR-040)
+		}
+	}
+
+	private void notifyMethodNotFound(String requestedName) {
+		if (inspector == null) return;
+		try {
+			inspector.onMethodNotFound(requestedName);
+		} catch (Throwable ignored) {
+			// an inspector that itself fails must not break totality (FR-040)
+		}
+	}
+
+	private void notifyMalformed() {
+		if (inspector == null) return;
+		try {
+			inspector.onMalformed();
+		} catch (Throwable ignored) {
+			// an inspector that itself fails must not break totality (FR-040)
+		}
+	}
+
+	/** Invocation duration in whole milliseconds, never negative — the synchronous case is {@code 0}. */
+	private static long durationMillis(long startNanos) {
+		return Math.max(0, (System.nanoTime() - startNanos) / 1_000_000);
 	}
 
 	/**
@@ -405,6 +736,14 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 	 */
 	private static JsonRpcError errorOf(Exception e) {
 		return e instanceof JsonRpcException jsonRpc ? jsonRpc.getError() : JsonRpcErrors.INTERNAL_ERROR;
+	}
+
+	/**
+	 * The code the {@link Inspector} callbacks report: a {@link JsonRpcException}'s own code, or {@code -32603}
+	 * — the same choice {@link #errorOf} makes for the document itself.
+	 */
+	private static int codeOf(Exception e) {
+		return e instanceof JsonRpcException jsonRpc ? jsonRpc.getError().code() : JsonRpcErrors.INTERNAL_ERROR.code();
 	}
 
 	private static JsonRpcOutput error(JsonRpcId id, JsonRpcError error) {

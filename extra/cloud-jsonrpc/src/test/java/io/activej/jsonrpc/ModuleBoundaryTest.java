@@ -27,6 +27,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -50,6 +51,9 @@ import static org.junit.Assert.fail;
  *     {@code io.activej.jsonrpc.transport} (and their subpackages), but stay rejected everywhere else in
  *     this module, including {@code io.activej.jsonrpc} and {@code io.activej.jsonrpc.impl}. The other
  *     seven forbidden prefixes remain module-wide.</li>
+ *     <li><b>FR-042</b> — the {@code io.activej.jmx} and {@code io.activej.common.inspector} prefixes
+ *     are permitted in {@code io.activej.jsonrpc.service} (and its subpackages) only: the service layer
+ *     is where per-method observability lives, and the transport SPI must not carry it.</li>
  *     <li><b>FR-022</b> — no field (and no {@code record} component) is declared as a
  *     {@code com.dslplatform.json.JsonReader}. A retained reader is the obvious first implementation of a
  *     deferred payload and it is wrong: dsl-json's index space does not survive a buffer refill, so the
@@ -69,7 +73,9 @@ public class ModuleBoundaryTest {
 		"io.activej.csp",
 		"io.activej.codegen",
 		"io.activej.rpc",
-		"org.slf4j"
+		"org.slf4j",
+		"io.activej.jmx",
+		"io.activej.common.inspector"
 	);
 
 	/**
@@ -83,6 +89,17 @@ public class ModuleBoundaryTest {
 	private static final Set<String> PERMITTED_PACKAGES = Set.of(
 		"io.activej.jsonrpc.service",
 		"io.activej.jsonrpc.transport"
+	);
+
+	/**
+	 * The prefixes confined to a single package instead of being forbidden module-wide, and the packages
+	 * that may import them. Unlike {@link #PACKAGE_SCOPED_PREFIXES} — which the service <i>and</i>
+	 * transport packages share — JMX and the inspector are permitted in the service package only
+	 * (FR-042): the transport is a transport-agnostic SPI and must not carry observability types.
+	 */
+	private static final Map<String, Set<String>> PACKAGE_SCOPED_PREFIXES_BY_PACKAGE = Map.of(
+		"io.activej.jmx", Set.of("io.activej.jsonrpc.service"),
+		"io.activej.common.inspector", Set.of("io.activej.jsonrpc.service")
 	);
 
 	private static final Pattern IMPORT = Pattern.compile("^\\s*import\\s+(?:static\\s+)?([\\w.$]+)\\s*;");
@@ -158,6 +175,34 @@ public class ModuleBoundaryTest {
 	}
 
 	@Test
+	public void jmxAndInspectorPermittedOnlyInServicePackage() throws IOException {
+		// FR-042: the JMX annotations and the inspector base types are allowed in io.activej.jsonrpc.service
+		// (and its subpackages) and nowhere else — the transport SPI in particular must not carry them.
+		Path root = tmp.newFolder("jmx-scan").toPath();
+		writeSyntheticSource(root, "io.activej.jsonrpc.service", "InService",
+			"io.activej.jmx.api.JmxAttribute", "io.activej.common.inspector.BaseInspector");
+		writeSyntheticSource(root, "io.activej.jsonrpc.service.impl", "InServiceImpl",
+			"io.activej.common.inspector.AbstractInspector");
+		writeSyntheticSource(root, "io.activej.jsonrpc.transport", "InTransport",
+			"io.activej.jmx.api.JmxAttribute");
+		writeSyntheticSource(root, "io.activej.jsonrpc", "InEnvelope",
+			"io.activej.common.inspector.BaseInspector", "io.activej.jmx.api.JmxAttribute");
+		writeSyntheticSource(root, "io.activej.jsonrpc.impl", "InEnvelopeImpl",
+			"io.activej.jmx.api.JmxAttribute");
+
+		List<String> violations = findForbiddenImportViolations(root);
+
+		for (String violation : violations) {
+			assertTrue("io.activej.jsonrpc.service (and its subpackages) must never be flagged for " +
+					   "jmx/inspector, but got: " + violation,
+				!violation.contains("InService.java") && !violation.contains("InServiceImpl.java"));
+		}
+		assertEquals("io.activej.jsonrpc.transport, .jsonrpc and .jsonrpc.impl must each reject the " +
+					 "scoped prefixes (1, 2 and 1 violations respectively): " + violations,
+			4, violations.size());
+	}
+
+	@Test
 	public void noRetainedJsonReader() {
 		List<String> violations = new ArrayList<>();
 		for (Path source : sourcesUnder(mainRoot())) {
@@ -191,7 +236,8 @@ public class ModuleBoundaryTest {
 	private static List<String> findForbiddenImportViolations(Path root) {
 		List<String> violations = new ArrayList<>();
 		for (Path source : sourcesUnder(root)) {
-			boolean scopePermitted = isPermittedPackage(packageOf(root, source));
+			boolean scopePermitted = isPermittedPackage(packageOf(root, source), PERMITTED_PACKAGES);
+			String pkg = packageOf(root, source);
 			String text = read(source);
 			for (String line : text.split("\n")) {
 				Matcher matcher = IMPORT.matcher(line);
@@ -200,6 +246,8 @@ public class ModuleBoundaryTest {
 				for (String forbidden : FORBIDDEN_IMPORT_PREFIXES) {
 					if (!(imported.equals(forbidden) || imported.startsWith(forbidden + "."))) continue;
 					if (scopePermitted && PACKAGE_SCOPED_PREFIXES.contains(forbidden)) continue;
+					Set<String> permitted = PACKAGE_SCOPED_PREFIXES_BY_PACKAGE.get(forbidden);
+					if (permitted != null && isPermittedPackage(pkg, permitted)) continue;
 					violations.add(source + " imports " + imported + " (forbidden prefix " + forbidden + ")");
 				}
 			}
@@ -207,8 +255,8 @@ public class ModuleBoundaryTest {
 		return violations;
 	}
 
-	private static boolean isPermittedPackage(String pkg) {
-		for (String permitted : PERMITTED_PACKAGES) {
+	private static boolean isPermittedPackage(String pkg, Set<String> permittedPackages) {
+		for (String permitted : permittedPackages) {
 			if (pkg.equals(permitted) || pkg.startsWith(permitted + ".")) return true;
 		}
 		return false;
