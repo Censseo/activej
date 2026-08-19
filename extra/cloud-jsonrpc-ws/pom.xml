@@ -4,33 +4,51 @@
 
   <parent>
     <groupId>io.activej</groupId>
-    <artifactId>extra-launchers</artifactId>
+    <artifactId>activej-extra</artifactId>
     <version>6.0-SNAPSHOT</version>
     <relativePath>../pom.xml</relativePath>
   </parent>
 
-  <artifactId>activej-launchers-jsonrpc</artifactId>
+  <artifactId>activej-jsonrpc-ws</artifactId>
 
-  <name>ActiveJ : Launchers : JSON-RPC</name>
+  <name>ActiveJ : Extra : JSON-RPC over WebSocket</name>
   <description>
-    JSON-RPC 2.0 launchers for ActiveJ project.
+    JSON-RPC 2.0 bidirectional transport over WebSocket: a servlet, a session registry and a
+    per-connection transport for ActiveJ project.
   </description>
 
   <dependencies>
     <dependency>
       <groupId>io.activej</groupId>
-      <artifactId>activej-jsonrpc-http</artifactId>
+      <artifactId>activej-jsonrpc</artifactId>
       <version>${project.version}</version>
     </dependency>
+
     <dependency>
       <groupId>io.activej</groupId>
-      <artifactId>activej-jsonrpc-ws</artifactId>
+      <artifactId>activej-http</artifactId>
       <version>${project.version}</version>
     </dependency>
+
     <dependency>
       <groupId>io.activej</groupId>
-      <artifactId>activej-launchers-common</artifactId>
+      <artifactId>activej-common</artifactId>
       <version>${project.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-jsonrpc</artifactId>
+      <version>${project.version}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-test</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 
@@ -42,7 +60,7 @@
         <configuration>
           <archive>
             <manifestEntries>
-              <Automatic-Module-Name>io.activej.launchers.jsonrpc</Automatic-Module-Name>
+              <Automatic-Module-Name>io.activej.jsonrpc.transport.ws</Automatic-Module-Name>
             </manifestEntries>
           </archive>
         </configuration>

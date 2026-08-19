@@ -4,6 +4,34 @@
 
 ### Notable additions
 
+- **A bidirectional JSON-RPC 2.0 transport over WebSocket.** New profile-gated
+  module `extra/cloud-jsonrpc-ws` (`activej-jsonrpc-ws`): `JsonRpcWsTransport`
+  binds the JSON-RPC transport SPI to core-http's message-level WebSocket API (one
+  JSON-RPC document per TEXT message, in both directions), and
+  `JsonRpcWsServlet`/`JsonRpcWsSession` give the server an enumerable registry of
+  live connections — each carrying a full `JsonRpcClient` for server-initiated
+  calls, plus `broadcast(...)` for pushing a notification to every client. The 30
+  JSON-RPC 2.0 conformance vectors are replayed in **both** directions over real
+  sockets with an empty skip set (the WS transport tier raised above the envelope
+  tier makes `envelope-too-large` reach the decoder and answer `-32001`).
+
+  **Breaking for launcher users:** the JSON-RPC launchers now mount a WebSocket
+  endpoint at `jsonrpc.ws.path` (default `/ws`) beside the existing HTTP POST
+  route on the same server. Set `jsonrpc.ws.path=` to an **empty string** to
+  disable the mount entirely (the servlet is then not constructed) — this is
+  also required when WebSockets are disabled JVM-wide via
+  `-DIWebSocket.enabled=false`, since the default mount would otherwise fail
+  startup at wiring. No other `jsonrpc.ws.*` key exists, and a scalar
+  `jsonrpc.ws` value is not one either; setting either fails startup loudly
+  naming the key. A deployment serving long-lived sessions should set
+  `http.readWriteTimeout=0 seconds` — the 60 s default sweep closes upgraded
+  connections regardless of frame traffic (the duration format requires
+  whitespace before the unit; `0s` does not parse). The mounted
+  `JsonRpcWsServlet` is an ordinary DI binding — inject it, or under the
+  worker-pool launcher retrieve each worker's via
+  `WorkerPool.getInstances(JsonRpcWsServlet.class)`, to reach `sessions()`,
+  `broadcast(...)` and the per-session server-initiated clients.
+
 - **A turnkey JSON-RPC 2.0 launcher family, and per-method JMX metrics on the
   dispatcher.** New profile-gated module `extra/launchers/jsonrpc`
   (`activej-launchers-jsonrpc`): `JsonRpcServerLauncher` (one eventloop),

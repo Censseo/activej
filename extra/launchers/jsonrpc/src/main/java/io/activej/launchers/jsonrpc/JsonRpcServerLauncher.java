@@ -58,11 +58,14 @@ import static io.activej.launchers.initializers.Initializers.ofEventloop;
  * derived by the service graph: the HTTP server stops before the eventloop it runs on (FR-053).
  * <p>
  * Configuration follows {@code HttpServerLauncher} exactly: built-in defaults ←
- * {@code jsonrpc-server.properties} ← {@code -Dconfig.<key>=<value>}. The three keys this launcher
- * introduces are {@code jsonrpc.path}, {@code jsonrpc.maxBodySize} and {@code jsonrpc.emptyResponseCode}.
+ * {@code jsonrpc-server.properties} ← {@code -Dconfig.<key>=<value>}. The keys this launcher
+ * introduces are {@code jsonrpc.path}, {@code jsonrpc.maxBodySize}, {@code jsonrpc.emptyResponseCode}
+ * and — since feature 06 (FR-101) — {@code jsonrpc.ws.path} (default {@code /ws}; empty disables the
+ * WebSocket endpoint, which co-mounts beside POST on the same server).
  * The four keys that deliberately do <b>not</b> exist — {@code jsonrpc.maxBatchSize},
- * {@code jsonrpc.maxJsonDepth}, {@code jsonrpc.callTimeout}, {@code jsonrpc.maxInFlight} — fail startup
- * loudly (FR-036, see {@link #onStart()}).
+ * {@code jsonrpc.maxJsonDepth}, {@code jsonrpc.callTimeout}, {@code jsonrpc.maxInFlight} — every
+ * {@code jsonrpc.ws.*} key other than {@code jsonrpc.ws.path}, and a scalar {@code jsonrpc.ws}
+ * value, fail startup loudly (FR-036, see {@link #onStart()}).
  *
  * @see Launcher
  */
@@ -146,9 +149,13 @@ public abstract class JsonRpcServerLauncher extends Launcher {
 	}
 
 	/**
-	 * FR-036 fail-closed: rejects the four {@code jsonrpc.*} keys that deliberately do not exist
-	 * (contracts/config-keys.md §4), naming the key and the controlling {@code ApplicationSettings}
-	 * property. Shared by {@link JsonRpcServerLauncher} and
+	 * FR-036 fail-closed: rejects the {@code jsonrpc.*} keys that deliberately do not exist
+	 * (contracts/config-keys.md §4) — the four feature-09 keys, naming the key and the controlling
+	 * {@code ApplicationSettings} property — and, since feature 06 (FR-101), every {@code ws.*}
+	 * child key other than {@code path}, naming the full key. A <b>scalar</b> {@code jsonrpc.ws}
+	 * value (e.g. {@code jsonrpc.ws=/ws}, a plausible typo for the one real key) is rejected too:
+	 * the node carries no children, so the child-key loop alone would miss it and silently mount
+	 * the default. Shared by {@link JsonRpcServerLauncher} and
 	 * {@link MultithreadedJsonRpcServerLauncher}.
 	 */
 	static void rejectNonKeys(Config jsonrpc) {
@@ -161,6 +168,22 @@ public abstract class JsonRpcServerLauncher extends Launcher {
 			"a per-call deadline is not yet available. The connection-level http.readWriteTimeout bounds a stalled request meanwhile.");
 		rejectIfPresent(children, "maxInFlight",
 			"an in-flight bound is not yet available — the dispatcher deliberately keeps no in-flight registry.");
+		// FR-101: the ws.* subtree admits exactly ws.path; every other key under it is a non-key,
+		// rejected naming the full key (contracts/config-keys.md). getChild("ws") of a config with
+		// no ws subtree is EMPTY, so a deployment without WebSocket keys walks an empty map.
+		Config ws = jsonrpc.getChild("ws");
+		if (ws.hasValue()) {
+			throw new IllegalStateException(
+				"Configuration key 'jsonrpc.ws' is not supported: the only WebSocket key is 'jsonrpc.ws.path'.\n" +
+				"(Set jsonrpc.ws.path to a path, or to an empty value to disable the WebSocket endpoint.)");
+		}
+		for (String key : ws.getChildren().keySet()) {
+			if (!"path".equals(key)) {
+				throw new IllegalStateException(
+					"Configuration key 'jsonrpc.ws." + key + "' is not supported: the only WebSocket key is 'jsonrpc.ws.path'.\n" +
+					"(Set jsonrpc.ws.path to a path, or to an empty value to disable the WebSocket endpoint.)");
+			}
+		}
 	}
 
 	private static void rejectIfPresent(Map<String, Config> children, String key, String why) {

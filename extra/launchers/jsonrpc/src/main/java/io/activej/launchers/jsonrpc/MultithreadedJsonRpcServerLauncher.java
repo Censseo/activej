@@ -24,6 +24,7 @@ import io.activej.http.AsyncServlet;
 import io.activej.http.HttpMethod;
 import io.activej.http.HttpServer;
 import io.activej.http.RoutingServlet;
+import io.activej.inject.InstanceProvider;
 import io.activej.inject.annotation.Inject;
 import io.activej.inject.annotation.Provides;
 import io.activej.inject.annotation.ProvidesIntoSet;
@@ -35,6 +36,7 @@ import io.activej.json.JsonCodecFactory;
 import io.activej.jsonrpc.JsonRpcLimits;
 import io.activej.jsonrpc.service.JsonRpcDispatcher;
 import io.activej.jsonrpc.transport.http.JsonRpcServlet;
+import io.activej.jsonrpc.transport.ws.JsonRpcWsServlet;
 import io.activej.launcher.Launcher;
 import io.activej.net.PrimaryServer;
 import io.activej.reactor.nio.NioReactor;
@@ -154,12 +156,35 @@ public abstract class MultithreadedJsonRpcServerLauncher extends Launcher {
 			.build();
 	}
 
+	/**
+	 * The servlet behind the WebSocket mount — one per worker, bound so the application can reach
+	 * its worker's registry via {@code WorkerPool.getInstances(JsonRpcWsServlet.class)}. Resolved
+	 * lazily and never constructed at startup when the endpoint is disabled (see
+	 * {@link JsonRpcModule#wsServlet} — a lookup while disabled yields an unmounted servlet with an
+	 * always-empty registry).
+	 */
 	@Provides
 	@Worker
-	AsyncServlet rootServlet(NioReactor reactor, JsonRpcServlet servlet, Config config) {
-		return RoutingServlet.builder(reactor)
-			.with(HttpMethod.POST, config.getChild("jsonrpc").get("path", "/"), servlet)
-			.build();
+	JsonRpcWsServlet wsServlet(NioReactor reactor, JsonRpcDispatcher dispatcher) {
+		return JsonRpcWsServlet.builder(reactor, dispatcher).build();
+	}
+
+	@Provides
+	@Worker
+	AsyncServlet rootServlet(NioReactor reactor, JsonRpcServlet servlet, InstanceProvider<JsonRpcWsServlet> wsServlet, Config config) {
+		Config jsonrpc = config.getChild("jsonrpc");
+		RoutingServlet.Builder builder = RoutingServlet.builder(reactor)
+			.with(HttpMethod.POST, jsonrpc.get("path", "/"), servlet);
+		// FR-100/FR-101/FR-102: the WebSocket endpoint co-mounts beside POST on the same HttpServer.
+		// An empty jsonrpc.ws.path disables it — the lazy InstanceProvider is never resolved, so no
+		// JsonRpcWsServlet is constructed (sidestepping IWebSocket.ENABLED's checkState in the
+		// WebSocketServlet constructor, research R9). Both route sites (JsonRpcModule and
+		// MultithreadedJsonRpcServerLauncher) are edited identically (CHK049).
+		String wsPath = jsonrpc.get("ws.path", "/ws");
+		if (!wsPath.isEmpty()) {
+			builder.withWebSocket(wsPath, wsServlet.get());
+		}
+		return builder.build();
 	}
 
 	@Provides
