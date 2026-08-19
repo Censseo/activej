@@ -169,9 +169,11 @@ public final class WebSocketBufsToFrames extends AbstractCommunicatingProcess
 				boolean msgMasked = maskAndLen < 0;
 				if (this.masked && !msgMasked) {
 					onProtocolError(MASK_REQUIRED);
+					return;
 				}
 				if (!this.masked && msgMasked) {
 					onProtocolError(MASK_SHOULD_NOT_BE_PRESENT);
+					return;
 				}
 				maskIndex = msgMasked ? 0 : -1;
 				byte length = (byte) (maskAndLen & LAST_7_BITS_MASK);
@@ -199,7 +201,11 @@ public final class WebSocketBufsToFrames extends AbstractCommunicatingProcess
 				} else {
 					len = lenBuf.readLong();
 					if (len < 0) {
+						// stop parsing here like every other error branch: onProtocolError closes the
+						// process and recycles state, so falling through would parse on recycled buffers
+						lenBuf.recycle();
 						onProtocolError(INVALID_PAYLOAD_LENGTH);
+						return;
 					}
 				}
 				lenBuf.recycle();

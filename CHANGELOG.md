@@ -324,6 +324,17 @@ Fixes a latent platform defect found while verifying this surface against a real
 
 ### Notable fixes
 
+- **WebSocket frame parsing no longer continues after a protocol error** (in
+  `core-http`'s `WebSocketBufsToFrames`). Three error branches reported the
+  violation and then fell through into further parsing on the closed, recycled
+  parser state: the mask-required / mask-not-allowed branches of the length
+  byte, and the 8-byte extended length with the most significant bit set (a
+  negative, peer-controlled length that then reached payload parsing). All
+  three now stop immediately, like every other error branch. Regression tests:
+  `WebSocketBufsToFramesTest` (`unmaskedFrameWhenMaskIsRequiredIsAProtocolError`,
+  `maskedFrameWhenMaskIsNotExpectedIsAProtocolError`,
+  `negativeLongLengthIsAProtocolError`, each with a chunked variant).
+
 - **`ChannelConsumer.acceptAll(Iterator)` no longer leaks the not-yet-accepted items
   on failure** (in `core-csp`). A failed `accept` mid-iteration used to recycle the
   *iterator* via `Recyclers.recycle(it)` — a no-op for the iterator every production

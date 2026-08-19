@@ -14,8 +14,13 @@ import org.junit.Test;
 import static io.activej.bytebuf.ByteBuf.wrapForReading;
 import static io.activej.http.IWebSocket.Frame.FrameType.*;
 import static io.activej.http.TestUtils.*;
+import static io.activej.http.WebSocketConstants.INVALID_PAYLOAD_LENGTH;
+import static io.activej.http.WebSocketConstants.MASK_REQUIRED;
+import static io.activej.http.WebSocketConstants.MASK_SHOULD_NOT_BE_PRESENT;
 import static io.activej.promise.TestUtils.await;
+import static io.activej.promise.TestUtils.awaitException;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.stream.Collectors.toList;
 import static org.junit.Assert.*;
 
 public final class WebSocketBufsToFramesTest {
@@ -142,5 +147,95 @@ public final class WebSocketBufsToFramesTest {
 			.streamTo(ChannelConsumers.ofConsumer($ -> fail())));
 
 		assertEquals("Hello", pongMessage.takeRemaining().asString(UTF_8));
+	}
+
+	@Test
+	public void unmaskedFrameWhenMaskIsRequiredIsAProtocolError() {
+		// Unmasked "Hello" message, RFC 6455 - 5.7, sent to a decoder that requires masking
+		byte[] frame = new byte[]{(byte) 0x81, (byte) 0x05, (byte) 0x48, (byte) 0x65, (byte) 0x6c, (byte) 0x6c, (byte) 0x6f};
+
+		WebSocketBufsToFrames bufsToFrames = WebSocketBufsToFrames.create(MAX_MESSAGE_SIZE, failOnItem(), failOnItem(), true);
+
+		Exception exception = awaitException(ChannelSuppliers.ofValue(wrapForReading(frame))
+			.transformWith(bufsToFrames)
+			.toCollector(toList()));
+
+		assertSame(MASK_REQUIRED, exception);
+		assertEquals(Integer.valueOf(1002), ((WebSocketException) exception).getCode());
+		assertSame(MASK_REQUIRED, awaitException(bufsToFrames.getCloseReceivedPromise()));
+	}
+
+	@Test
+	public void unmaskedFrameWhenMaskIsRequiredIsAProtocolErrorChunked() {
+		byte[] frame = new byte[]{(byte) 0x81, (byte) 0x05, (byte) 0x48, (byte) 0x65, (byte) 0x6c, (byte) 0x6c, (byte) 0x6f};
+
+		Exception exception = awaitException(ChannelSuppliers.ofValue(wrapForReading(frame))
+			.transformWith(chunker())
+			.transformWith(WebSocketBufsToFrames.create(MAX_MESSAGE_SIZE, failOnItem(), failOnItem(), true))
+			.toCollector(toList()));
+
+		assertSame(MASK_REQUIRED, exception);
+	}
+
+	@Test
+	public void maskedFrameWhenMaskIsNotExpectedIsAProtocolError() {
+		// Masked "Hello" message, RFC 6455 - 5.7, sent to a decoder that expects unmasked frames
+		byte[] frame = new byte[]{(byte) 0x81, (byte) 0x85, (byte) 0x37, (byte) 0xfa, (byte) 0x21,
+			(byte) 0x3d, (byte) 0x7f, (byte) 0x9f, (byte) 0x4d, (byte) 0x51, (byte) 0x58};
+
+		WebSocketBufsToFrames bufsToFrames = WebSocketBufsToFrames.create(MAX_MESSAGE_SIZE, failOnItem(), failOnItem(), false);
+
+		Exception exception = awaitException(ChannelSuppliers.ofValue(wrapForReading(frame))
+			.transformWith(bufsToFrames)
+			.toCollector(toList()));
+
+		assertSame(MASK_SHOULD_NOT_BE_PRESENT, exception);
+		assertEquals(Integer.valueOf(1002), ((WebSocketException) exception).getCode());
+		assertSame(MASK_SHOULD_NOT_BE_PRESENT, awaitException(bufsToFrames.getCloseReceivedPromise()));
+	}
+
+	@Test
+	public void maskedFrameWhenMaskIsNotExpectedIsAProtocolErrorChunked() {
+		byte[] frame = new byte[]{(byte) 0x81, (byte) 0x85, (byte) 0x37, (byte) 0xfa, (byte) 0x21,
+			(byte) 0x3d, (byte) 0x7f, (byte) 0x9f, (byte) 0x4d, (byte) 0x51, (byte) 0x58};
+
+		Exception exception = awaitException(ChannelSuppliers.ofValue(wrapForReading(frame))
+			.transformWith(chunker())
+			.transformWith(WebSocketBufsToFrames.create(MAX_MESSAGE_SIZE, failOnItem(), failOnItem(), false))
+			.toCollector(toList()));
+
+		assertSame(MASK_SHOULD_NOT_BE_PRESENT, exception);
+	}
+
+	@Test
+	public void negativeLongLengthIsAProtocolError() {
+		// RFC 6455 - 5.2: the 8-byte extended payload length is a 63-bit unsigned integer, its most
+		// significant bit MUST be 0. A length with the bit set reads as a negative long and must be
+		// rejected as a protocol error — not carried into mask/payload parsing
+		byte[] frame = new byte[]{(byte) 0x82, (byte) 0x7F,
+			(byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF};
+
+		WebSocketBufsToFrames bufsToFrames = WebSocketBufsToFrames.create(MAX_MESSAGE_SIZE, failOnItem(), failOnItem(), false);
+
+		Exception exception = awaitException(ChannelSuppliers.ofValue(wrapForReading(frame))
+			.transformWith(bufsToFrames)
+			.toCollector(toList()));
+
+		assertSame(INVALID_PAYLOAD_LENGTH, exception);
+		assertEquals(Integer.valueOf(1002), ((WebSocketException) exception).getCode());
+		assertSame(INVALID_PAYLOAD_LENGTH, awaitException(bufsToFrames.getCloseReceivedPromise()));
+	}
+
+	@Test
+	public void negativeLongLengthIsAProtocolErrorChunked() {
+		byte[] frame = new byte[]{(byte) 0x82, (byte) 0x7F,
+			(byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF};
+
+		Exception exception = awaitException(ChannelSuppliers.ofValue(wrapForReading(frame))
+			.transformWith(chunker())
+			.transformWith(WebSocketBufsToFrames.create(MAX_MESSAGE_SIZE, failOnItem(), failOnItem(), false))
+			.toCollector(toList()));
+
+		assertSame(INVALID_PAYLOAD_LENGTH, exception);
 	}
 }
