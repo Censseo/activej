@@ -352,6 +352,19 @@ Fixes a latent platform defect found while verifying this surface against a real
 
 ### Notable fixes
 
+- **`WebSocketServlet` no longer strands the request body stream when an upgrade is
+  refused** (in `core-http`). `takeBodyStream()` used to run *before* `onRequest`,
+  with the recycler wired only to the *returned* promise's exception path — so a
+  synchronous throw out of `onRequest`, or a `101` response illegally carrying a
+  body, bypassed it and leaked the already-buffered pooled `ByteBuf` (and, in the
+  body case, the response's own body too). The servlet now takes the stream only
+  once a legal `101` has been produced; every refusal and every failure before
+  that point leaves the stream with the request, which its owner
+  (`HttpServerConnection`) recycles the same way it does for any other servlet.
+  Regression tests: `WebSocketServletUpgradeFailureTest`
+  (`aThrowFromOnRequestDoesNotStrandTheRequestBodyStream`,
+  `aOneOhOneCarryingABodyDoesNotStrandTheRequestBodyStreamNorItsOwnBody`).
+
 - **WebSocket frame parsing no longer continues after a protocol error** (in
   `core-http`'s `WebSocketBufsToFrames`). Three error branches reported the
   violation and then fell through into further parsing on the closed, recycled

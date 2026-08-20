@@ -18,7 +18,6 @@ package io.activej.http;
 
 import io.activej.bytebuf.ByteBuf;
 import io.activej.common.Checks;
-import io.activej.csp.consumer.ChannelConsumers;
 import io.activej.csp.queue.ChannelZeroBuffer;
 import io.activej.csp.supplier.ChannelSupplier;
 import io.activej.promise.Promise;
@@ -58,6 +57,12 @@ public abstract class WebSocketServlet extends AbstractReactive
 		checkState(IWebSocket.ENABLED, "Web sockets are disabled by application settings");
 	}
 
+	/**
+	 * Decides whether the upgrade is accepted. A {@code 101} response accepts it and MUST carry neither
+	 * a body nor a body stream; any other code refuses it and is sent as is. Refusing by failing — a
+	 * failed promise or a throw — is equally supported: the request body stream is taken only once a
+	 * legal {@code 101} has been produced, so no failure path can strand it.
+	 */
 	protected Promise<HttpResponse> onRequest(HttpRequest request) {
 		return HttpResponse.ofCode(101).toPromise();
 	}
@@ -69,48 +74,49 @@ public abstract class WebSocketServlet extends AbstractReactive
 		if (CHECKS) checkInReactorThread(this);
 		return validateHeaders(request)
 			.<String>thenCallback(cb -> processAnswer(request, cb))
-			.then(answer -> {
-				ChannelSupplier<ByteBuf> rawStream = request.takeBodyStream();
-				assert rawStream != null;
-
-				return onRequest(request)
-					.whenException(e -> recycleStream(rawStream))
-					.map(response -> {
-						if (response.getCode() != 101) {
-							recycleStream(rawStream);
-							return response;
-						}
-
-						checkState(response.body == null && response.bodyStream == null, "Illegal body or stream");
-
-						ChannelZeroBuffer<ByteBuf> buffer = new ChannelZeroBuffer<>();
-
-						response.bodyStream = buffer.getSupplier();
-						response.headers.add(UPGRADE, WEBSOCKET_HEADER);
-						response.headers.add(CONNECTION, UPGRADE_HEADER);
-						response.headers.add(SEC_WEBSOCKET_ACCEPT, HttpHeaderValue.of(answer));
-
-						WebSocketFramesToBufs encoder = WebSocketFramesToBufs.create(false);
-						WebSocketBufsToFrames decoder = WebSocketBufsToFrames.create(
-							request.maxBodySize,
-							encoder::sendPong,
-							ByteBuf::recycle,
-							true);
-
-						bindWebSocketTransformers(rawStream, encoder, decoder);
-
-						onWebSocket(new WebSocket(
-							request,
-							response,
-							rawStream.transformWith(decoder),
-							buffer.getConsumer().transformWith(encoder),
-							decoder::onProtocolError,
-							request.maxBodySize
-						));
-
+			.then(answer -> onRequest(request)
+				.map(response -> {
+					if (response.getCode() != 101) {
 						return response;
-					});
-			});
+					}
+
+					if (response.body != null || response.bodyStream != null) {
+						response.recycleBody();
+						throw new IllegalStateException("Illegal body or stream");
+					}
+
+					// The ownership of the request body stream is transferred here and nowhere earlier:
+					// until this point every refusal and every failure leaves the stream with the
+					// request, whose owner (HttpServerConnection) recycles it.
+					ChannelSupplier<ByteBuf> rawStream = request.takeBodyStream();
+
+					ChannelZeroBuffer<ByteBuf> buffer = new ChannelZeroBuffer<>();
+
+					response.bodyStream = buffer.getSupplier();
+					response.headers.add(UPGRADE, WEBSOCKET_HEADER);
+					response.headers.add(CONNECTION, UPGRADE_HEADER);
+					response.headers.add(SEC_WEBSOCKET_ACCEPT, HttpHeaderValue.of(answer));
+
+					WebSocketFramesToBufs encoder = WebSocketFramesToBufs.create(false);
+					WebSocketBufsToFrames decoder = WebSocketBufsToFrames.create(
+						request.maxBodySize,
+						encoder::sendPong,
+						ByteBuf::recycle,
+						true);
+
+					bindWebSocketTransformers(rawStream, encoder, decoder);
+
+					onWebSocket(new WebSocket(
+						request,
+						response,
+						rawStream.transformWith(decoder),
+						buffer.getConsumer().transformWith(encoder),
+						decoder::onProtocolError,
+						request.maxBodySize
+					));
+
+					return response;
+				}));
 	}
 
 	private static void bindWebSocketTransformers(ChannelSupplier<ByteBuf> rawStream, WebSocketFramesToBufs encoder, WebSocketBufsToFrames decoder) {
@@ -152,9 +158,5 @@ public abstract class WebSocketServlet extends AbstractReactive
 			return;
 		}
 		cb.set(getWebSocketAnswer(header.trim()));
-	}
-
-	private static void recycleStream(ChannelSupplier<ByteBuf> rawStream) {
-		rawStream.streamTo(ChannelConsumers.recycling());
 	}
 }
