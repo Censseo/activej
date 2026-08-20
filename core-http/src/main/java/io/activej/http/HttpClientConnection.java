@@ -342,6 +342,15 @@ public final class HttpClientConnection extends AbstractHttpConnection {
 					encoder.closeEx(e);
 				}
 			});
+
+		// see WebSocketServlet#bindWebSocketTransformers — closeReceivedPromise never settles when this
+		// side closes first, so the read half is released on closeSent AND processCompletion instead
+		encoder.getCloseSentPromise()
+			.subscribe(($, closeSentException) -> decoder.getProcessCompletion()
+				.subscribe(($2, processException) -> decoder.closeInput(
+					processException != null ? processException :
+						closeSentException != null ? closeSentException :
+							REGULAR_CLOSE)));
 	}
 
 	private void readHttpResponse() {

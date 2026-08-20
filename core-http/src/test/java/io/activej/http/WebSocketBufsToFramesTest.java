@@ -1,6 +1,7 @@
 package io.activej.http;
 
 import io.activej.bytebuf.ByteBuf;
+import io.activej.bytebuf.ByteBufPool;
 import io.activej.bytebuf.ByteBufs;
 import io.activej.csp.consumer.ChannelConsumers;
 import io.activej.csp.supplier.ChannelSupplier;
@@ -237,5 +238,28 @@ public final class WebSocketBufsToFramesTest {
 			.toCollector(toList()));
 
 		assertSame(INVALID_PAYLOAD_LENGTH, exception);
+	}
+
+	@Test
+	public void closeInputRecyclesTheBytesBufferedWhenTheProtocolErrorWasRaised() {
+		// Pooled on purpose: ByteBuf.wrapForReading(byte[]), used by every other test in this class, is
+		// unpooled and invisible to ByteBufRule — which is why none of them exercise the read half at
+		// all. The two header bytes are consumed before MASK_REQUIRED fires, leaving the five payload
+		// bytes still buffered inside the input BinaryChannelSupplier when the process closes.
+		byte[] helloUnmasked = {(byte) 0x81, (byte) 0x05, (byte) 0x48, (byte) 0x65, (byte) 0x6c, (byte) 0x6c, (byte) 0x6f};
+		ByteBuf frame = ByteBufPool.allocate(helloUnmasked.length);
+		frame.put(helloUnmasked);
+
+		WebSocketBufsToFrames decoder = WebSocketBufsToFrames.create(MAX_MESSAGE_SIZE, failOnItem(), failOnItem(), true);
+
+		// closeInput is what the WebSocket teardown chain calls once the CLOSE frame has been written;
+		// called here directly, inside the promise chain so its posted recycle task still runs before
+		// awaitException's eventloop.run() reaches quiescence
+		Exception exception = awaitException(ChannelSuppliers.ofValue(frame)
+			.transformWith(decoder)
+			.toCollector(toList())
+			.whenException(decoder::closeInput));
+
+		assertSame(MASK_REQUIRED, exception);
 	}
 }

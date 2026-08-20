@@ -21,7 +21,6 @@ import io.activej.bytebuf.ByteBufs;
 import io.activej.common.exception.TruncatedDataException;
 import io.activej.csp.ChannelOutput;
 import io.activej.csp.binary.BinaryChannelInput;
-import io.activej.csp.binary.BinaryChannelSupplier;
 import io.activej.csp.binary.decoder.ByteBufsDecoder;
 import io.activej.csp.consumer.ChannelConsumer;
 import io.activej.csp.dsl.WithBinaryChannelInput;
@@ -58,7 +57,7 @@ public final class WebSocketBufsToFrames extends AbstractCommunicatingProcess
 	private final SettablePromise<WebSocketException> closeReceivedPromise = new SettablePromise<>();
 
 	private ByteBufs bufs;
-	private BinaryChannelSupplier input;
+	private SanitizedBinaryChannelSupplier input;
 	private ChannelConsumer<Frame> output;
 
 	private int maskIndex;
@@ -317,6 +316,24 @@ public final class WebSocketBufsToFrames extends AbstractCommunicatingProcess
 		checkInReactorThread(this);
 		closeReceivedPromise.trySetException(e);
 		closeEx(e);
+	}
+
+	/**
+	 * Closes the read half: recycles the bytes buffered but not yet decoded and cascades to the
+	 * underlying raw stream, which also cancels any socket read still in flight (a read landing after
+	 * the process ended would otherwise be added to the shared {@link ByteBufs} and stranded there).
+	 * <p>
+	 * Deliberately closes the <b>unsanitized</b> supplier: closing the sanitized wrapper would re-enter
+	 * {@link #closeEx(Exception)} and fail a process that is completing cleanly.
+	 * <p>
+	 * Must not be called from {@link #doClose(Exception)} or {@code afterProcess}: both run before the
+	 * outgoing CLOSE frame is written, and the cascade reaches the socket, which drops pending writes.
+	 */
+	void closeInput(Exception e) {
+		checkInReactorThread(this);
+		if (input != null) {
+			input.getUnsanitizedSupplier().closeEx(e);
+		}
 	}
 
 	@Override

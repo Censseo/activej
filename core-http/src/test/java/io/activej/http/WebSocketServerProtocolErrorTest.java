@@ -30,12 +30,6 @@ import static org.junit.Assert.*;
  * must answer with a {@code 1002} close frame and tear the connection down, rather than keep decoding
  * against already recycled state.
  */
-// The bytes of the offending frame that are already buffered when the protocol error is raised are stranded in
-// the input BinaryChannelSupplier: WebSocketBufsToFrames.doClose() closes only its output, so onCleanup() (which
-// recycles those bufs) never runs. That leak is pre-existing and common to EVERY protocol-error path here - it
-// reproduces identically with a RESERVED_BITS_SET frame, whose branch has always returned - so it is unrelated
-// to the missing-return this test covers, and fixing it would mean changing when the read half is closed.
-@ByteBufRule.IgnoreLeaks("Leftover buffered frame bytes are stranded on any WebSocket protocol error, see above")
 public final class WebSocketServerProtocolErrorTest {
 	@ClassRule
 	public static final EventloopRule eventloopRule = new EventloopRule();

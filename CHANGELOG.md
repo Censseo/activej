@@ -365,6 +365,40 @@ Fixes a latent platform defect found while verifying this surface against a real
   (`aThrowFromOnRequestDoesNotStrandTheRequestBodyStream`,
   `aOneOhOneCarryingABodyDoesNotStrandTheRequestBodyStreamNorItsOwnBody`).
 
+- **`WebSocketBufsToFrames` now releases its read half instead of leaking it on
+  every close** (in `core-http`). `doClose()` used to close only the outgoing side;
+  the bytes still buffered in the input `BinaryChannelSupplier` — and any socket
+  read still in flight — were never recycled, on any of a protocol error, a
+  non-1000 peer close, or a locally-initiated `closeEx`. A direct `input.closeEx()`
+  from `doClose()` was not an option: `doClose()` runs *before* the outgoing CLOSE
+  frame is written, and cascading into the socket at that point would drop the
+  pending write. The new package-private `closeInput(Exception)` instead closes the
+  *unsanitized* underlying supplier — recycling the buffered bytes and cancelling
+  any in-flight read without re-entering the process's own `closeEx` — and is
+  triggered from both `WebSocketServlet` (server) and `HttpClientConnection`
+  (client) once the CLOSE frame has been sent **and** the decoder has finished,
+  however it finished; gating on `closeSentPromise` alone is not enough, since that
+  promise never settles when this side closes first. Three existing
+  `@ByteBufRule.IgnoreLeaks` opt-outs are removed as a direct result:
+  `WebSocketServerProtocolErrorTest`, and (built only under `-P extra`)
+  `extra/cloud-jsonrpc-ws`'s `JsonRpcWsOversizeTest` and (narrowed rather than fully
+  removed — see below) `JsonRpcWsPurgeTest`. Regression tests:
+  `WebSocketBufsToFramesTest#closeInputRecyclesTheBytesBufferedWhenTheProtocolErrorWasRaised`
+  (pooled bufs, to actually exercise `ByteBufRule` — the class's other tests use
+  unpooled `ByteBuf.wrapForReading`, which the rule cannot see), plus the three
+  `@IgnoreLeaks` removals themselves as regression proof, plus
+  `JsonRpcWsHostileTest`'s RSV1 frame test now sends the complete frame instead of
+  truncating it at the offending byte to dodge this same leak.
+
+  A related, *different* defect surfaced verifying this fix and is left unfixed:
+  one row of `JsonRpcWsPurgeTest`'s four-row purge matrix (peer error close) still
+  strands a raw 16 KB `TcpSocket.onReadReady` read buffer, confirmed with a
+  `ByteBufPool` allocation-site probe to be unrelated to `WebSocketBufsToFrames` —
+  an in-flight low-level socket read orphaned when that test harness's
+  belt-and-suspenders raw-socket `closeEx` cuts the connection mid-read. That is a
+  `core-net` defect, out of scope for this fix; `JsonRpcWsPurgeTest` keeps a
+  narrowed `@IgnoreLeaks` naming only that one row.
+
 - **WebSocket frame parsing no longer continues after a protocol error** (in
   `core-http`'s `WebSocketBufsToFrames`). Three error branches reported the
   violation and then fell through into further parsing on the closed, recycled

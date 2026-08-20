@@ -101,23 +101,27 @@ import static org.junit.Assert.assertTrue;
  * <i>inside</i> the awaited chain, after the purge is fully observed. That is a reused-component
  * limitation (SC-007 forbids editing it), not a gap in this module's purge: the purge itself — every
  * call failing, both tables empty, exactly-once {@code onClosed} — is exactly what the rows assert.
- * A second core-http quirk concerns the leak rules: the <b>non-1000</b> close rows ((c), (d)) strand
- * one socket read buffer in the inbound decoder — core-http's {@code WebSocketBufsToFrames} closes
- * the decoder abruptly on a non-1000 close ({@code onCloseReceived → closeEx}), and the read buffer
- * already delivered to the {@code BinaryChannelSupplier} is never recycled (its {@code onCleanup}
- * never runs). The clean-close rows ((a), (b)) are leak-free. {@code @IgnoreLeaks} is therefore
- * class-level — a {@code @ClassRule} cannot honor a method-level opt-out — with the justification
- * below; this is the exact precedent of {@code JsonRpcWsOversizeTest} (same core-http read-pipeline
- * leak, SC-007 forbids the fix, tracked for T018). {@code WsPair.closeAll()} is then the
- * belt-and-suspenders cleanup. Rules per FR-079.
+ * A second core-http quirk concerns the leak rules. The non-1000 close rows used to strand one socket
+ * read buffer in the inbound decoder — core-http's {@code WebSocketBufsToFrames} closed the decoder
+ * abruptly on a non-1000 close without recycling the {@code BinaryChannelSupplier}'s buffered bytes —
+ * and that defect is now fixed at the source ({@code WebSocketBufsToFrames#closeInput}, released once
+ * the CLOSE frame is written and the decoder has finished). Three of the four rows are leak-free as a
+ * result: (a) abrupt TCP loss, (b) peer clean close, and (d) local {@code closeEx}. Row (c), peer
+ * error close, still strands one buffer, but from a different and deeper layer, confirmed with a
+ * one-off allocation-site probe: a raw {@code TcpSocket.onReadReady} read buffer, in flight when the
+ * harness's belt-and-suspenders {@code serverTcp}/{@code clientTcp} {@code closeEx} below cuts the
+ * socket mid-read. That is a `core-net` defect, not `WebSocketBufsToFrames`'s, and out of scope for
+ * the fix that cleared the other three rows. {@code @IgnoreLeaks} is therefore still class-level — a
+ * {@code @ClassRule} cannot honor a method-level opt-out — narrowed to row (c) alone; see the
+ * justification below. Rules per FR-079.
  */
-@IgnoreLeaks("the non-1000 close rows (c), (d) strand one core-http socket read buffer in the "
-			 + "WebSocketBufsToFrames inbound pipeline (onCloseReceived closes the decoder without "
-			 + "recycling the BinaryChannelSupplier's bufs) — reproduced identically by "
-			 + "JsonRpcWsOversizeTest. Not a JsonRpcWsTransport leak: its only ByteBuf ownership is "
-			 + "the BINARY refusal path (R8), proven leak-free in JsonRpcWsHostileTest, and the "
-			 + "clean-close rows (a), (b) are verified leak-free. Core modules may not be modified "
-			 + "(SC-007); reported for the Phase 6 hardening pass (T018).")
+@IgnoreLeaks("row (c), peer error close, strands one raw TcpSocket.onReadReady read buffer — a "
+			 + "core-net defect (an in-flight read orphaned when the harness's belt-and-suspenders "
+			 + "closeEx cuts the socket mid-read), confirmed with an allocation-site probe. Not "
+			 + "WebSocketBufsToFrames: that leak (the one this annotation used to cover on all four "
+			 + "rows) is fixed, and rows (a), (b), (d) are verified leak-free. Not a JsonRpcWsTransport "
+			 + "leak either: its only ByteBuf ownership is the BINARY refusal path (R8), proven "
+			 + "leak-free in JsonRpcWsHostileTest.")
 public final class JsonRpcWsPurgeTest {
 	@ClassRule
 	public static final EventloopRule eventloopRule = new EventloopRule();

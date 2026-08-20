@@ -345,16 +345,19 @@ public final class JsonRpcWsHostileTest {
 				closed::set));
 		});
 
-		// The frame's first header byte, and nothing after it: FIN | RSV1 | TEXT. The violation lives
-		// in that byte and the decoder refuses it there (processOpCode's RSV_MASK test is the first
-		// thing it does), so the rest of the frame would add nothing to the oracle — and it would
-		// cost the leak scan: any byte written after the refusal is stranded in core-http's
-		// closed read pipeline, the pre-existing 16 kb TcpSocket.onReadReady leak that
-		// JsonRpcWsOversizeTest documents and opts out of. Measured both ways: the full 8-byte frame
-		// strands one buffer, the header byte alone strands none. Cutting the frame at the offending
-		// byte is what lets this test keep ByteBufRule strict for the whole class.
-		byte[] rsvBitSetHeader = {(byte) 0xC1};
-		await(rawFrameExchange(pair.port(), rsvBitSetHeader));
+		// The full RFC 6455 frame, not just its offending byte: FIN | RSV1 | TEXT, masked, "He". The
+		// violation lives in the first byte and the decoder refuses it there (processOpCode's RSV_MASK
+		// test is the first thing it does), so the six bytes that follow are still buffered inside the
+		// input BinaryChannelSupplier when the process closes. Those bytes used to be stranded — this
+		// test previously had to cut the frame at the header byte to keep ByteBufRule strict for the
+		// class, because core-http's WebSocketBufsToFrames never closed its input. Fixed in core-http
+		// (WebSocketBufsToFrames#closeInput, released once the CLOSE frame is written and the decoder
+		// has finished): the full frame below is now the positive assertion that it recycles.
+		byte[] rsvBitSetFrame = {
+			(byte) 0xC1, (byte) 0x82,
+			(byte) 0x37, (byte) 0xfa, (byte) 0x21, (byte) 0x3d,   // mask
+			(byte) 0x7f, (byte) 0x9f};                            // "He" masked
+		await(rawFrameExchange(pair.port(), rsvBitSetFrame));
 
 		assertThat(closed.get(), instanceOf(WebSocketException.class));
 		assertEquals(Integer.valueOf(1002), ((WebSocketException) closed.get()).getCode());

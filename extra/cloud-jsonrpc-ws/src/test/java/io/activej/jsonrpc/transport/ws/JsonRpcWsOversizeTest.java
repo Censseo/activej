@@ -27,7 +27,6 @@ import io.activej.reactor.nio.NioReactor;
 import io.activej.test.rules.ActivePromisesRule;
 import io.activej.test.rules.ByteBufRule;
 import io.activej.test.rules.EventloopRule;
-import io.activej.test.rules.ByteBufRule.IgnoreLeaks;
 import org.jetbrains.annotations.Nullable;
 import org.junit.ClassRule;
 import org.junit.Test;
@@ -48,22 +47,11 @@ import static org.junit.Assert.fail;
  * server's decoder fires close {@code 1009} on the oversize frame's header, before a complete
  * document exists to decode, so the envelope's {@code -32001} can never be produced.
  * <p>
- * <b>{@code @IgnoreLeaks} — with justification.</b> This test deliberately cuts the connection
- * mid-read: the server rejects the message while the client's payload is still arriving and the
- * server's raw-read pipeline still holds one 16 kb read buffer ({@code TcpSocket.onReadReady}). That
- * buffer is stranded by core-http's read pipeline when a connection is closed mid-read — reproduced
- * identically by a plain WebSocket client/server with <i>no</i> transport and no session (a scratch
- * repro confirmed it). It is therefore a pre-existing leak in the reused core-http stack, not in this
- * module: {@code JsonRpcWsTransport}'s only ByteBuf ownership is the BINARY refusal path (R8), which
- * {@code JsonRpcWsHostileTest#testBinaryMessageRejectedWith1003AndPayloadRecycled} proves leak-free.
- * Core modules may not be modified (SC-007), so the leak-scan opt-out is the honest scoping here; the
- * leak is reported for the Phase 6 hardening pass (T018). Kept in its own class so the opt-out does
- * not silence the leak scan for the transport's own recycle proof.
+ * The connection is cut mid-read on purpose (the server rejects the message while the client's
+ * payload is still arriving); this used to strand one read buffer in core-http's WebSocket decoder
+ * ({@code WebSocketBufsToFrames} never closed its input) and required a documented
+ * {@code @IgnoreLeaks} here. Fixed in core-http; this class is leak-checked like any other.
  */
-@IgnoreLeaks("FR-091's mandated oversize test cuts the connection mid-read; core-http strands one "
-			 + "read buffer on that path (reproduced without this module). Not a JsonRpcWsTransport "
-			 + "leak — its only ByteBuf ownership, the BINARY refusal path, is leak-checked in "
-			 + "JsonRpcWsHostileTest. Core modules may not be touched (SC-007).")
 public final class JsonRpcWsOversizeTest {
 	@ClassRule
 	public static final EventloopRule eventloopRule = new EventloopRule();

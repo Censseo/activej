@@ -128,6 +128,17 @@ public abstract class WebSocketServlet extends AbstractReactive
 		decoder.getProcessCompletion()
 			.whenResult(() -> encoder.sendCloseFrame(REGULAR_CLOSE))
 			.whenException(encoder::closeEx);
+
+		// The read half is released once the CLOSE frame has been written AND the decoder has finished,
+		// however it finished. It cannot be gated on closeReceivedPromise: that promise is never settled
+		// when this side closes first, and it cannot be released any earlier than closeSentPromise,
+		// because closing it tears the socket down before the CLOSE frame is guaranteed to be flushed.
+		encoder.getCloseSentPromise()
+			.subscribe(($, closeSentException) -> decoder.getProcessCompletion()
+				.subscribe(($2, processException) -> decoder.closeInput(
+					processException != null ? processException :
+						closeSentException != null ? closeSentException :
+							REGULAR_CLOSE)));
 	}
 
 	private static boolean isUpgradeHeaderMissing(HttpMessage message) {
