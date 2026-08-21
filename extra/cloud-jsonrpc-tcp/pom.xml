@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.activej</groupId>
+    <artifactId>activej-extra</artifactId>
+    <version>6.0-SNAPSHOT</version>
+    <relativePath>../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>activej-jsonrpc-tcp</artifactId>
+
+  <name>ActiveJ : Extra : JSON-RPC over TCP</name>
+  <description>
+    JSON-RPC 2.0 bidirectional transport over framed TCP: JSON Lines framing (one LF-terminated
+    document per message), a server with a session registry and a per-connection transport for
+    ActiveJ project.
+  </description>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-jsonrpc</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-net</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-csp</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-common</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-bytebuf</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-promise</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-eventloop</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-jsonrpc</artifactId>
+      <version>${project.version}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-test</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+
+    <!--
+      Test scope only, and only for the cross-transport overhead harness
+      (src/test/.../tcp/baseline/TransportOverheadHarness.java): the comparison needs BOTH transports
+      live on loopback, so the HTTP leg is a real JsonRpcServlet behind a real HttpServer/HttpClient.
+      src/main stays free of io.activej.http — JsonRpcTcpModuleBoundaryTest scans it and refuses the
+      prefix outright.
+    -->
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-jsonrpc-http</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.activej</groupId>
+      <artifactId>activej-http</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <configuration>
+          <archive>
+            <manifestEntries>
+              <Automatic-Module-Name>io.activej.jsonrpc.transport.tcp</Automatic-Module-Name>
+            </manifestEntries>
+          </archive>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+</project>

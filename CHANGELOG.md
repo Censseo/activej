@@ -4,6 +4,55 @@
 
 ### Notable additions
 
+- **A JSON-RPC 2.0 transport over framed TCP.** New profile-gated module
+  `extra/cloud-jsonrpc-tcp` (`activej-jsonrpc-tcp`) — the **third** JSON-RPC
+  transport, and the one with nothing underneath it. The framing is **JSON
+  Lines**: one complete JSON-RPC document — single or batch — per line,
+  terminated by exactly one LF byte, in **both** directions, with no preamble, no
+  handshake and no negotiation, so `printf '…\n' | nc host port` is a supported
+  way to talk to the endpoint. `JsonRpcTcpTransport` is the duplex transport
+  (`of(reactor, socket)` for an accepted connection, `connect(reactor, address)`
+  for a client); `JsonRpcTcpServer` accepts connections and turns each into a
+  `JsonRpcTcpSession` — a per-connection `JsonRpcClient` — that the server can
+  enumerate (`sessions()`), `broadcast(...)` to, and initiate calls on. The 30
+  JSON-RPC 2.0 conformance vectors replay over **real sockets in both
+  directions** with an empty skip set. No new framing code: the inbound framing
+  is `core-csp`'s existing LF-terminated decoder, whose size bound applies
+  **during** accumulation, and the accept loop, `withAcceptFilter(...)`, the SSL
+  listen variants and the drain are `AbstractReactiveServer`'s. `core-*` is
+  untouched and `extra/cloud-jsonrpc` gained no main-source change.
+
+  Two size tiers are active on every message, and the stricter one wins:
+  `withMaxMessageSize(MemSize)` on the transport/server (default
+  `JsonRpcLimits.MAX_BODY_SIZE`, `1mb`, enforced during accumulation — the
+  connection closes and no buffer of the attempted size is ever allocated) over
+  `JsonRpcLimits.MAX_BODY_SIZE` in the envelope decoder (`-32001 Request too
+  large`, connection survives). With the defaults equal the transport tier wins
+  and `-32001` is unreachable; raise the transport tier strictly above the
+  envelope tier to make that answer observable. **No `ApplicationSettings` key
+  exists in this module.** Framing violations (an empty line, no terminator
+  within the tier) close the connection; JSON-level errors (`-32700`, `-32600`,
+  …) are answered and the connection stays up. `Content-Length` (LSP-style)
+  framing, a version handshake and automatic reconnection with call replay are
+  **documented refusals**, not omissions; TLS is composed
+  (`withSslListenAddresses(...)` / `SslTcpSocket`), with nothing TLS-specific in
+  the module.
+
+  The JSON-RPC launchers in `extra/launchers/jsonrpc` gain one config key,
+  `jsonrpc.tcp.port`, **disabled by default**: absent or empty means no
+  `JsonRpcTcpServer` is constructed and **no socket is opened**, so existing
+  deployments are unaffected. This is deliberately asymmetric with
+  `jsonrpc.ws.path`'s enabled default — the WebSocket route rides the existing
+  HTTP listener, whereas a raw TCP port opens a **new** socket that is plaintext
+  and unauthenticated by design, which makes opening it an explicit deployment
+  decision. `jsonrpc.tcp.*` admits exactly that one key; anything else (and a
+  scalar `jsonrpc.tcp` value) fails startup loudly naming the key.
+
+  **No default-build impact.** The whole JSON-RPC line is gated behind
+  `-P extra`, which CI does not pass: `mvn -T1C verify` builds neither this
+  module nor anything that depends on it, and no default-profile module changed.
+  Use `mvn -P extra verify`.
+
 - **A bidirectional JSON-RPC 2.0 transport over WebSocket.** New profile-gated
   module `extra/cloud-jsonrpc-ws` (`activej-jsonrpc-ws`): `JsonRpcWsTransport`
   binds the JSON-RPC transport SPI to core-http's message-level WebSocket API (one
