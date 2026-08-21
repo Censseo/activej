@@ -25,7 +25,9 @@ import io.activej.http.HttpResponse;
 import io.activej.http.IWebSocket;
 import io.activej.http.WebSocketServlet;
 import io.activej.jsonrpc.service.JsonRpcClient;
+import io.activej.jsonrpc.service.JsonRpcContractException;
 import io.activej.jsonrpc.service.JsonRpcDispatcher;
+import io.activej.jsonrpc.service.JsonRpcService;
 import io.activej.jsonrpc.transport.JsonRpcTransport;
 import io.activej.jsonrpc.transport.ws.fixtures.ClientApi;
 import io.activej.jsonrpc.transport.ws.fixtures.ClientApiImpl;
@@ -57,13 +59,15 @@ import static io.activej.promise.TestUtils.await;
 import static io.activej.test.TestUtils.assertCompleteFn;
 import static java.util.List.of;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
  * The session contract (T008, US1): a session is created on upgrade and deregistered exactly once
  * on close (FR-032), the live set is published as a snapshot (FR-033), a broadcast reaches every
- * session with one session's failure contained (FR-033, US1 scenario 3), a client with no handler
+ * session with one session's failure contained (FR-033, US1 scenario 3) and a broken broadcast
+ * interface reaching the caller instead of the failure handlers, a client with no handler
  * ignores the notification and stays connected (US1 scenario 2), and a dispatcher from another
  * reactor is refused at build under {@code CHECKS} (FR-031). Rules per FR-079.
  * <p>
@@ -239,6 +243,51 @@ public final class JsonRpcWsSessionTest {
 		assertEquals("the live set reflects A's close", 1, liveAfterClose.get());
 		assertEquals("the broadcast reached the remaining session", 1, broadcastDelivered.get());
 		assertEquals("the dead session's failure was contained, not thrown", 1, failuresObserved.get());
+		pairA.closeAll();
+		pairB.closeAll();
+	}
+
+	@Test
+	public void testBroadcastContractErrorReachesTheCallerNotEveryFailureHandler() {
+		// FR-033's containment is for per-session faults — a dead connection, the publisher's own throw.
+		// A broken broadcast interface is the broadcaster's programming error, and every session's
+		// proxy(...) refuses it identically (the contract is a property of the interface): the caller,
+		// the only one who can fix it, gets the JsonRpcContractException at the first session — once —
+		// rather than N failure-handler reports no operator can act on.
+		List<Exception> failures = new ArrayList<>();
+		JsonRpcWsServlet servlet = JsonRpcWsServlet.builder(reactor(), serverDispatcher())
+			.withFailureHandler(failures::add)
+			.build();
+		UserEventsImpl eventsA = new UserEventsImpl();
+		UserEventsImpl eventsB = new UserEventsImpl();
+		Ref<JsonRpcWsTransport> transportA = new Ref<>();
+		Ref<JsonRpcWsTransport> transportB = new Ref<>();
+		Ref<JsonRpcContractException> contractError = new Ref<>();
+		WsPair pairA = WsPair.serverUpgrade(reactor(), servlet);
+		WsPair pairB = WsPair.serverUpgrade(reactor(), servlet);
+
+		await(pairA.connect()
+			.then(wsA -> {
+				transportA.set(JsonRpcWsTransport.of(reactor(), wsA));
+				setupClient(reactor(), transportA.get(), eventsA);
+				return pairB.connect();
+			})
+			.then(wsB -> {
+				transportB.set(JsonRpcWsTransport.of(reactor(), wsB));
+				setupClient(reactor(), transportB.get(), eventsB);
+				try {
+					servlet.broadcast(BrokenEvents.class, events -> events.userChanged(1));
+				} catch (JsonRpcContractException e) {
+					contractError.set(e);
+				}
+				return Promise.complete();
+			})
+			.whenComplete(() -> closeTransports(transportA, transportB)));
+
+		assertNotNull("the broken interface reached the broadcast caller", contractError.get());
+		assertTrue("no contract fault was routed to a session's failure handling", failures.isEmpty());
+		assertTrue("no session was invoked before the refusal", eventsA.ids().isEmpty());
+		assertTrue("no session was invoked before the refusal", eventsB.ids().isEmpty());
 		pairA.closeAll();
 		pairB.closeAll();
 	}
@@ -634,6 +683,16 @@ public final class JsonRpcWsSessionTest {
 
 	private static NioReactor reactor() {
 		return (NioReactor) Reactor.getCurrentReactor();
+	}
+
+	/**
+	 * An interface that breaks the shared contract (rule 2, FR-022): an abstract method carrying
+	 * neither annotation. {@code proxy(BrokenEvents.class)} refuses it identically on every session —
+	 * the shape a broadcast must not mistake for a per-session fault.
+	 */
+	@JsonRpcService("broken")
+	private interface BrokenEvents {
+		void userChanged(long id);
 	}
 
 	private static JsonRpcTransport.Listener listener(Consumer<byte[]> onDocument, Consumer<@Nullable Exception> onClosed) {

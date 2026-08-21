@@ -133,6 +133,13 @@ for (JsonRpcWsSession session : wsServlet.sessions()) {
 }
 ```
 
+A broadcast's per-session failures are **contained**: one dead connection's send failure is routed
+to that session's failure handling and never aborts the iteration. The one failure not contained is
+a `JsonRpcContractException` from `session.proxy(clientInterface)` — a broken interface is the
+broadcaster's own programming error and every session's proxy refuses it identically, so it
+propagates to the broadcast caller at the first session rather than producing one failure-handler
+report per session that no operator can act on.
+
 Session cardinality **is** open-connection cardinality: the registry adds no second bound, and the
 connection tier's own limits (file descriptors, the host server's sweeps) govern it. Admission
 control is core-http's `onRequest` seam — override it (or decorate with an auth servlet) to answer a

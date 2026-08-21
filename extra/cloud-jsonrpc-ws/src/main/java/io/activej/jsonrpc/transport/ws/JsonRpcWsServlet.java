@@ -22,6 +22,7 @@ import io.activej.common.ref.Ref;
 import io.activej.http.IWebSocket;
 import io.activej.http.WebSocketServlet;
 import io.activej.json.JsonCodecFactory;
+import io.activej.jsonrpc.service.JsonRpcContractException;
 import io.activej.jsonrpc.service.JsonRpcDispatcher;
 import io.activej.reactor.Reactor;
 
@@ -49,7 +50,8 @@ import static io.activej.reactor.Reactive.checkInReactorThread;
  * bound; the connection tier's own limits (file descriptors, the host server's sweeps) govern it.
  * {@link #sessions()} publishes a reactor-confined snapshot; {@link #broadcast(Class, Consumer)}
  * iterates one such snapshot, and a session's failure is routed to that session's failure handling —
- * never thrown into the iteration (FR-033).
+ * never thrown into the iteration (FR-033). The single carve-out is a {@link
+ * JsonRpcContractException}: the broadcaster's own programming error, propagated to the caller once.
  * <p>
  * <b>Admission (FR-036).</b> The application-level gate is core-http's {@code onRequest} seam,
  * composed in front of this servlet (e.g. a {@code BasicAuthServlet} decorator): a non-{@code 101}
@@ -171,6 +173,12 @@ public final class JsonRpcWsServlet extends WebSocketServlet {
 	 * session's failure to that session's failure handling — it never aborts the iteration. A
 	 * notification is never answered (§4.1), so the clients receive one document and send nothing
 	 * back.
+	 * <p>
+	 * One exception is <b>not</b> contained: a {@link JsonRpcContractException} from
+	 * {@code proxy(clientInterface)}. A broken interface is the broadcaster's own programming error
+	 * and every session's proxy rejects it identically, so it propagates to the caller at the first
+	 * session — before any invocation ran — rather than being reported once per session, which only
+	 * the caller can act on.
 	 */
 	public <T> void broadcast(Class<T> clientInterface, Consumer<T> invocation) {
 		checkInReactorThread(this);
@@ -179,6 +187,10 @@ public final class JsonRpcWsServlet extends WebSocketServlet {
 		for (JsonRpcWsSession session : sessions()) {
 			try {
 				invocation.accept(session.proxy(clientInterface));
+			} catch (JsonRpcContractException e) {
+				// not a per-session fault: the contract is a property of the interface, so every session
+				// refuses it the same way — the caller, the only one who can fix it, gets it once
+				throw e;
 			} catch (RuntimeException e) {
 				session.reportFailure(e);
 			}
