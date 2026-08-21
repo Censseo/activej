@@ -16,6 +16,7 @@
 
 package io.activej.launchers.jsonrpc;
 
+import io.activej.common.initializer.Initializer;
 import io.activej.config.Config;
 import io.activej.config.ConfigModule;
 import io.activej.eventloop.Eventloop;
@@ -25,6 +26,8 @@ import io.activej.http.HttpMethod;
 import io.activej.http.HttpServer;
 import io.activej.http.RoutingServlet;
 import io.activej.inject.InstanceProvider;
+import io.activej.inject.Key;
+import io.activej.inject.annotation.Eager;
 import io.activej.inject.annotation.Inject;
 import io.activej.inject.annotation.Provides;
 import io.activej.inject.annotation.ProvidesIntoSet;
@@ -36,11 +39,13 @@ import io.activej.json.JsonCodecFactory;
 import io.activej.jsonrpc.JsonRpcLimits;
 import io.activej.jsonrpc.service.JsonRpcDispatcher;
 import io.activej.jsonrpc.transport.http.JsonRpcServlet;
+import io.activej.jsonrpc.transport.tcp.JsonRpcTcpServer;
 import io.activej.jsonrpc.transport.ws.JsonRpcWsServlet;
 import io.activej.launcher.Launcher;
 import io.activej.net.PrimaryServer;
 import io.activej.reactor.nio.NioReactor;
 import io.activej.service.ServiceGraphModule;
+import io.activej.service.ServiceGraphModuleSettings;
 import io.activej.worker.WorkerPool;
 import io.activej.worker.WorkerPoolModule;
 import io.activej.worker.WorkerPools;
@@ -71,6 +76,11 @@ import static io.activej.launchers.initializers.Initializers.ofPrimaryServer;
  * are those of {@link JsonRpcServerLauncher}. The {@code jsonrpc.*} non-keys of
  * {@code config-keys.md} §4 are rejected in {@link #onStart()} through the same fail-closed check as
  * the single-worker launcher (FR-036).
+ * <p>
+ * Since feature 07 (FR-100…FR-103) {@code jsonrpc.tcp.port} additionally mounts a framed-TCP endpoint,
+ * <b>disabled by default</b>: with a port set, one {@link JsonRpcTcpServer} per worker sits behind a
+ * {@link PrimaryServer} accepting on the primary reactor, so a connection is served by whichever worker
+ * accepted it and each worker's session registry sees only its own connections.
  *
  * @see Launcher
  */
@@ -193,6 +203,75 @@ public abstract class MultithreadedJsonRpcServerLauncher extends Launcher {
 		return HttpServer.builder(reactor, servlet)
 			.initialize(ofHttpWorker(config.getChild("http")))
 			.build();
+	}
+
+	/**
+	 * One framed-TCP server <b>per worker</b> (FR-103), each with its own dispatcher, session registry
+	 * and transports on that worker's reactor. It carries <b>no listen address</b>: the primary acceptor
+	 * built by {@link #tcpMount} owns the socket and hands accepted channels over, exactly as the HTTP
+	 * worker servers are fed by {@code PrimaryServer}. Cross-worker {@code sessions()} and {@code
+	 * broadcast(...)} are out of scope — each registry sees only the connections its own worker accepted.
+	 * <p>
+	 * Created only when {@code jsonrpc.tcp.port} carries a value, because only {@link #tcpMount} asks for
+	 * these instances (FR-102).
+	 */
+	@Provides
+	@Worker
+	JsonRpcTcpServer tcpServer(
+		NioReactor reactor, JsonRpcDispatcher dispatcher, OptionalDependency<JsonCodecFactory> codecFactory
+	) {
+		return JsonRpcTcpServer.builder(reactor, dispatcher)
+			.withCodecFactory(codecFactory.orElse(JsonCodecFactory.defaultInstance()))
+			.build();
+	}
+
+	/**
+	 * The wiring-time mount decision (research D9): with {@code jsonrpc.tcp.port} absent or empty nothing
+	 * is created at all — no worker server, no acceptor, no socket (FR-102). With a port, the per-worker
+	 * servers are resolved here, while {@link Config} is still readable and before any reactor is running,
+	 * and a {@link PrimaryServer} over them accepts on the primary reactor. It is <b>not</b> a binding of
+	 * its own — the unqualified {@code PrimaryServer} key belongs to the HTTP acceptor — which is why it
+	 * reaches the service graph through {@link JsonRpcTcpServerServiceAdapter} instead.
+	 * <p>
+	 * {@code workerPool} arrives as an {@link InstanceProvider} rather than directly: a binding that
+	 * depends on {@code WorkerPool} and is not itself worker instances makes {@code ServiceGraphModule}
+	 * log {@code "Unsupported service ... worker instances is expected"}.
+	 */
+	@Provides
+	@Eager
+	JsonRpcTcpMount tcpMount(NioReactor primaryReactor, Config config, InstanceProvider<WorkerPool> workerPool) {
+		Integer port = JsonRpcModule.tcpPort(config.getChild("jsonrpc"));
+		if (port == null) return JsonRpcTcpMount.disabled();
+		return JsonRpcTcpMount.of(PrimaryServer.builder(primaryReactor,
+				workerPool.get().getInstances(JsonRpcTcpServer.class).getList())
+			.withListenPort(port)
+			.build());
+	}
+
+	/**
+	 * ADR-025's shape, plus one ordering edge the DI graph cannot express: when the endpoint is enabled,
+	 * the acceptor must stop before the worker servers drain their sessions, so the mount is declared to
+	 * depend on the per-worker {@link JsonRpcTcpServer}s. The worker servers themselves stay graph-managed
+	 * by the platform's {@code forReactiveServer} adapter — that is what closes each of them on its own
+	 * reactor, in order, before its eventloop stops.
+	 * <p>
+	 * ⚠ Unlike {@link JsonRpcModule}'s single-eventloop equivalent, this registration carries <b>no</b>
+	 * {@code withExcludedKey(Key.of(JsonRpcTcpServer.class))}. That exclusion is needed there because the
+	 * single-eventloop {@code JsonRpcTcpServer} <i>is</i> the directly-listening object the mount wraps —
+	 * without it, {@code forReactiveServer} would start/stop the same server a second time. Here each
+	 * per-worker {@link #tcpServer} carries no listen address at all ({@code listen()} no-ops on an empty
+	 * address list), so the platform picking it up anyway opens no second socket and closes/stops it once,
+	 * same as the pre-existing {@code @Worker HttpServer}. The asymmetry is deliberate, not a drift.
+	 */
+	@ProvidesIntoSet
+	Initializer<ServiceGraphModuleSettings> tcpServiceGraphSettings(Config config) {
+		boolean enabled = JsonRpcModule.tcpPort(config.getChild("jsonrpc")) != null;
+		return settings -> {
+			settings.withKey(Key.of(JsonRpcTcpMount.class), JsonRpcTcpServerServiceAdapter.create());
+			if (enabled) {
+				settings.withDependency(Key.of(JsonRpcTcpMount.class), Key.of(JsonRpcTcpServer.class));
+			}
+		};
 	}
 
 	@Provides

@@ -16,21 +16,28 @@
 
 package io.activej.launchers.jsonrpc;
 
+import io.activej.common.initializer.Initializer;
 import io.activej.config.Config;
 import io.activej.http.AsyncServlet;
 import io.activej.http.HttpMethod;
 import io.activej.http.HttpServer;
 import io.activej.http.RoutingServlet;
 import io.activej.inject.InstanceProvider;
+import io.activej.inject.Key;
+import io.activej.inject.annotation.Eager;
 import io.activej.inject.annotation.Provides;
+import io.activej.inject.annotation.ProvidesIntoSet;
 import io.activej.inject.binding.OptionalDependency;
 import io.activej.inject.module.AbstractModule;
 import io.activej.json.JsonCodecFactory;
 import io.activej.jsonrpc.JsonRpcLimits;
 import io.activej.jsonrpc.service.JsonRpcDispatcher;
 import io.activej.jsonrpc.transport.http.JsonRpcServlet;
+import io.activej.jsonrpc.transport.tcp.JsonRpcTcpServer;
 import io.activej.jsonrpc.transport.ws.JsonRpcWsServlet;
 import io.activej.reactor.nio.NioReactor;
+import io.activej.service.ServiceGraphModuleSettings;
+import org.jetbrains.annotations.Nullable;
 
 import java.util.Set;
 
@@ -53,6 +60,11 @@ import static io.activej.launchers.initializers.Initializers.ofHttpServer;
  * {@code sessions()}, {@code broadcast(...)} and each session's server-initiated client. It is
  * resolved lazily and only when {@code jsonrpc.ws.path} is non-empty, so a disabled endpoint
  * constructs nothing at startup.
+ * <p>
+ * The {@link JsonRpcTcpServer} is bound the same lazy way and is <b>disabled by default</b>
+ * (FR-100…FR-102): it is resolved only when {@code jsonrpc.tcp.port} carries a value, because — unlike
+ * the WebSocket route, which rides the HTTP listener that already exists — it opens a <b>new</b>
+ * listening socket, plaintext and unauthenticated by design.
  */
 public final class JsonRpcModule extends AbstractModule {
 	@Provides
@@ -124,5 +136,62 @@ public final class JsonRpcModule extends AbstractModule {
 		return HttpServer.builder(reactor, rootServlet)
 			.initialize(ofHttpServer(config.getChild("http")))
 			.build();
+	}
+
+	/**
+	 * The framed-TCP endpoint — its <b>own</b> listener, on the same reactor and behind the same
+	 * {@link JsonRpcDispatcher} as the POST and WebSocket routes (FR-100). Bound lazily: {@link
+	 * #tcpMount} resolves it only when {@code jsonrpc.tcp.port} carries a value, so a deployment that
+	 * left the key alone constructs no server and opens no socket (FR-102).
+	 * <p>
+	 * The port is read here, at wiring time — the only point at which {@link Config} is readable — and
+	 * {@code 0} binds an ephemeral port, which {@code getBoundAddresses()} reports back (ADR-028). A
+	 * lookup of this binding while the endpoint is disabled yields a server listening on port {@code 0}
+	 * that nothing ever starts: the provider cannot re-check the key at lookup time.
+	 */
+	@Provides
+	JsonRpcTcpServer tcpServer(
+		NioReactor reactor, JsonRpcDispatcher dispatcher, OptionalDependency<JsonCodecFactory> codecFactory, Config config
+	) {
+		Integer port = tcpPort(config.getChild("jsonrpc"));
+		return JsonRpcTcpServer.builder(reactor, dispatcher)
+			.withCodecFactory(codecFactory.orElse(JsonCodecFactory.defaultInstance()))
+			.withListenPort(port == null ? 0 : port)
+			.build();
+	}
+
+	/**
+	 * The wiring-time mount decision (research D9). {@code reactor} is a declared dependency so that the
+	 * service graph — which derives its edges from the DI graph — orders this mount against the eventloop
+	 * that runs the listener: the endpoint must close before its reactor stops.
+	 */
+	@Provides
+	@Eager
+	JsonRpcTcpMount tcpMount(NioReactor reactor, Config config, InstanceProvider<JsonRpcTcpServer> tcpServer) {
+		if (tcpPort(config.getChild("jsonrpc")) == null) return JsonRpcTcpMount.disabled();
+		return JsonRpcTcpMount.of(tcpServer.get());
+	}
+
+	/**
+	 * ADR-025's shape: the mount joins the service graph through a settings initializer, and the
+	 * {@link JsonRpcTcpServer} key is excluded from it so that the listener has exactly <b>one</b> owner
+	 * — this adapter — rather than being adapted a second time by the platform's {@code
+	 * forReactiveServer}.
+	 */
+	@ProvidesIntoSet
+	Initializer<ServiceGraphModuleSettings> tcpServiceGraphSettings() {
+		return settings -> settings
+			.withKey(Key.of(JsonRpcTcpMount.class), JsonRpcTcpServerServiceAdapter.create())
+			.withExcludedKey(Key.of(JsonRpcTcpServer.class));
+	}
+
+	/**
+	 * The one TCP key, read from the {@code jsonrpc} subtree: {@code null} when absent or empty — the
+	 * endpoint is off — and the port otherwise (contracts/config-keys.md). Shared with
+	 * {@link MultithreadedJsonRpcServerLauncher}, which wires the same key through the worker scope.
+	 */
+	static @Nullable Integer tcpPort(Config jsonrpc) {
+		if (jsonrpc.get("tcp.port", "").isEmpty()) return null;
+		return jsonrpc.get(ofInteger(), "tcp.port");
 	}
 }

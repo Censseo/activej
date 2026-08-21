@@ -62,10 +62,15 @@ import static io.activej.launchers.initializers.Initializers.ofEventloop;
  * introduces are {@code jsonrpc.path}, {@code jsonrpc.maxBodySize}, {@code jsonrpc.emptyResponseCode}
  * and — since feature 06 (FR-101) — {@code jsonrpc.ws.path} (default {@code /ws}; empty disables the
  * WebSocket endpoint, which co-mounts beside POST on the same server).
+ * Since feature 07 there is one more: {@code jsonrpc.tcp.port}, the framed-TCP endpoint's own listener,
+ * <b>disabled by default</b> — absent or empty means no server is constructed and no socket is opened.
+ * The asymmetry is deliberate: the WebSocket route rides the HTTP listener that already exists, while a
+ * raw TCP port opens a new one, plaintext and unauthenticated by design.
  * The four keys that deliberately do <b>not</b> exist — {@code jsonrpc.maxBatchSize},
  * {@code jsonrpc.maxJsonDepth}, {@code jsonrpc.callTimeout}, {@code jsonrpc.maxInFlight} — every
- * {@code jsonrpc.ws.*} key other than {@code jsonrpc.ws.path}, and a scalar {@code jsonrpc.ws}
- * value, fail startup loudly (FR-036, see {@link #onStart()}).
+ * {@code jsonrpc.ws.*} key other than {@code jsonrpc.ws.path}, every {@code jsonrpc.tcp.*} key other
+ * than {@code jsonrpc.tcp.port}, and a scalar {@code jsonrpc.ws} or {@code jsonrpc.tcp} value, fail
+ * startup loudly (FR-036, see {@link #onStart()}).
  *
  * @see Launcher
  */
@@ -155,7 +160,8 @@ public abstract class JsonRpcServerLauncher extends Launcher {
 	 * child key other than {@code path}, naming the full key. A <b>scalar</b> {@code jsonrpc.ws}
 	 * value (e.g. {@code jsonrpc.ws=/ws}, a plausible typo for the one real key) is rejected too:
 	 * the node carries no children, so the child-key loop alone would miss it and silently mount
-	 * the default. Shared by {@link JsonRpcServerLauncher} and
+	 * the default. Since feature 07 the {@code tcp.*} subtree is checked identically, admitting
+	 * {@code tcp.port} alone. Shared by {@link JsonRpcServerLauncher} and
 	 * {@link MultithreadedJsonRpcServerLauncher}.
 	 */
 	static void rejectNonKeys(Config jsonrpc) {
@@ -182,6 +188,22 @@ public abstract class JsonRpcServerLauncher extends Launcher {
 				throw new IllegalStateException(
 					"Configuration key 'jsonrpc.ws." + key + "' is not supported: the only WebSocket key is 'jsonrpc.ws.path'.\n" +
 					"(Set jsonrpc.ws.path to a path, or to an empty value to disable the WebSocket endpoint.)");
+			}
+		}
+		// FR-101, feature 07: the tcp.* subtree admits exactly tcp.port, the same shape — including the
+		// scalar `jsonrpc.tcp` typo, which carries no children for the key loop to find and would
+		// otherwise be swallowed silently while the endpoint stayed off.
+		Config tcp = jsonrpc.getChild("tcp");
+		if (tcp.hasValue()) {
+			throw new IllegalStateException(
+				"Configuration key 'jsonrpc.tcp' is not supported: the only TCP key is 'jsonrpc.tcp.port'.\n" +
+				"(Set jsonrpc.tcp.port to a port, or leave it unset to keep the TCP endpoint disabled.)");
+		}
+		for (String key : tcp.getChildren().keySet()) {
+			if (!"port".equals(key)) {
+				throw new IllegalStateException(
+					"Configuration key 'jsonrpc.tcp." + key + "' is not supported: the only TCP key is 'jsonrpc.tcp.port'.\n" +
+					"(Set jsonrpc.tcp.port to a port, or leave it unset to keep the TCP endpoint disabled.)");
 			}
 		}
 	}
