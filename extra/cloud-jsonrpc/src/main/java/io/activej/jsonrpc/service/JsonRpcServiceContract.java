@@ -67,7 +67,9 @@ import java.util.Set;
  *     <li>a method does not declare {@code void} (FR-027);</li>
  *     <li>no raw {@code Promise}, no {@code Promise<?>}, no unbound type variable (FR-028);</li>
  *     <li>every parameter type and the result type resolve to a codec (FR-029);</li>
- *     <li>no two parameters of one method share a {@link JsonRpcParam} name (FR-043a).</li>
+ *     <li>no two parameters of one method share a {@link JsonRpcParam} name (FR-043a);</li>
+ *     <li>no wire name lies in the {@code rpc.} namespace the specification reserves for protocol-level
+ *     methods (FR-001).</li>
  * </ol>
  * {@code static} and {@code private} interface methods are ignored, and a {@code default} method is ignored
  * unless it is annotated (FR-023). Methods inherited from super-interfaces participate (FR-024), but a
@@ -174,6 +176,18 @@ public final class JsonRpcServiceContract {
 			String own = notification ? notificationAnnotation.value() : methodAnnotation.value();
 			if (own.isEmpty()) own = method.getName();
 			String wireName = prefix.isEmpty() ? own : prefix + '.' + own;
+
+			// FR-001: the whole 'rpc.' prefix is the specification's, not the author's, and this
+			// implementation answers one name inside it. Reported before the name is claimed, so that two
+			// methods reaching into the namespace are two reserved-name violations rather than one of these
+			// and one duplicate — every offending method is named
+			if (wireName.startsWith("rpc.")) {
+				violations.add("wire name '" + wireName + "' declared by " + where(method) + " lies in the " +
+							   "reserved 'rpc.' namespace; JSON-RPC 2.0 reserves that prefix for " +
+							   "protocol-level methods such as rpc.discover — rename the method or the " +
+							   "@JsonRpcService prefix (FR-001)");
+				continue;
+			}
 
 			Method claimant = claimedNames.putIfAbsent(wireName, method);
 			if (claimant != null) {

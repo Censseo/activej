@@ -16,6 +16,7 @@
 
 package io.activej.jsonrpc.service;
 
+import io.activej.common.inspector.AbstractInspector;
 import io.activej.inject.Key;
 import io.activej.jmx.DynamicMBeanFactory;
 import io.activej.jmx.JmxBeanSettings;
@@ -23,6 +24,7 @@ import io.activej.jmx.JmxRegistry;
 import io.activej.jsonrpc.JsonRpcError;
 import io.activej.jsonrpc.JsonRpcErrors;
 import io.activej.jsonrpc.JsonRpcLimits;
+import io.activej.jsonrpc.schema.OpenRpcInfo;
 import io.activej.jsonrpc.service.fixtures.FailingApi;
 import io.activej.jsonrpc.service.fixtures.FailingApiImpl;
 import io.activej.jsonrpc.service.fixtures.UserApi;
@@ -31,6 +33,7 @@ import io.activej.reactor.Reactor;
 import io.activej.test.rules.ActivePromisesRule;
 import io.activej.test.rules.ByteBufRule;
 import io.activej.test.rules.EventloopRule;
+import org.jetbrains.annotations.Nullable;
 import org.junit.Before;
 import org.junit.ClassRule;
 import org.junit.Test;
@@ -273,8 +276,130 @@ public class JsonRpcJmxAttributesTest {
 	}
 
 	// ---------------------------------------------------------------------------------------------------
+	// Feature 018 — rpc.discover is an ordinary member of the closed row set, or absent (FR-033).
+	// ---------------------------------------------------------------------------------------------------
+
+	@Test
+	public void discoveryDisabledKeepsRpcDiscoverOutOfTheSetHandedToInitialize() {
+		RecordingInspector recording = new RecordingInspector();
+		JsonRpcDispatcher built = dispatcherBuilder().withInspector(recording).build();
+
+		assertNotNull("initialize(...) must fire exactly once, at build()", recording.wireNames);
+		assertEquals(built.wireNames(), recording.wireNames);
+		assertFalse("rpc.discover is not registered unless withDiscovery(...) was called: " + recording.wireNames,
+			recording.wireNames.contains(RPC_DISCOVER));
+	}
+
+	@Test
+	public void discoveryEnabledPutsRpcDiscoverInTheSetHandedToInitialize() {
+		RecordingInspector recording = new RecordingInspector();
+		JsonRpcDispatcher built = dispatcherBuilder()
+			.withDiscovery(DISCOVERY_INFO)
+			.withInspector(recording)
+			.build();
+
+		assertNotNull(recording.wireNames);
+		// the set handed to initialize() IS the frozen table's key set — discovery included, nothing else
+		assertEquals(built.wireNames(), recording.wireNames);
+		assertTrue("rpc.discover must join the closed set at build(): " + recording.wireNames,
+			recording.wireNames.contains(RPC_DISCOVER));
+	}
+
+	@Test
+	public void discoveryDisabledHasNoRpcDiscoverRow() throws Exception {
+		TabularData methodStats = (TabularData) mbs.getAttribute(dispatcherName(), "methodStats");
+		assertFalse(rowKeys(methodStats).contains(RPC_DISCOVER));
+		assertEquals(dispatcher.wireNames(), rowKeys(methodStats));
+	}
+
+	@Test
+	public void discoveryEnabledGivesRpcDiscoverItsOwnMethodStatsRow() throws Exception {
+		MBeanServer server = MBeanServerFactory.newMBeanServer();
+		JsonRpcDispatcher discovering = dispatcherBuilder()
+			.withDiscovery(DISCOVERY_INFO)
+			.withInspector(new JsonRpcDispatcher.JmxInspector())
+			.build();
+		JmxRegistry.create(server, DynamicMBeanFactory.create())
+			.registerSingleton(Key.of(JsonRpcDispatcher.class), discovering, JmxBeanSettings.create());
+		ObjectName name = server
+			.queryNames(new ObjectName("io.activej.jsonrpc.service:type=JsonRpcDispatcher"), null)
+			.iterator().next();
+
+		assertEquals(discovering.wireNames(), rowKeys((TabularData) server.getAttribute(name, "methodStats")));
+		assertNotNull("rpc.discover must have its own row",
+			((TabularData) server.getAttribute(name, "methodStats")).get(new Object[]{RPC_DISCOVER}));
+
+		// FR-033: a served rpc.discover is counted on its own row and never through the aggregate-only
+		// onMethodNotFound path — "no wire-text keying" is the same rule read from the other side
+		await(discovering.dispatch(
+			("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"" + RPC_DISCOVER + "\"}").getBytes(UTF_8)));
+
+		CompositeData row = (CompositeData) ((TabularData) server.getAttribute(name, "methodStats"))
+			.get(new Object[]{RPC_DISCOVER});
+		assertNotNull(row);
+		assertEquals(1L, row.get("successfulRequests_totalCount"));
+		assertEquals(0L, server.getAttribute(name, "methodNotFound_totalCount"));
+		assertEquals(1L, server.getAttribute(name, "totalRequests_totalCount"));
+
+		// and the set stays closed: a neighbouring reserved name moves the aggregate and creates no row
+		await(discovering.dispatch(
+			"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"rpc.discoverX\"}".getBytes(UTF_8)));
+
+		assertEquals(discovering.wireNames(), rowKeys((TabularData) server.getAttribute(name, "methodStats")));
+		assertEquals(1L, server.getAttribute(name, "methodNotFound_totalCount"));
+	}
+
+	// ---------------------------------------------------------------------------------------------------
 	// Helpers.
 	// ---------------------------------------------------------------------------------------------------
+
+	/** The one name feature 018 adds to a dispatcher. */
+	private static final String RPC_DISCOVER = "rpc.discover";
+
+	/** Application-supplied identity; this test asserts the row set, never the document's content. */
+	private static final OpenRpcInfo DISCOVERY_INFO = new OpenRpcInfo("JsonRpcJmxAttributesTest", "1.0.0");
+
+	/** The same two services {@link #setUp()} registers, so a discovery row is the only possible difference. */
+	private static JsonRpcDispatcher.Builder dispatcherBuilder() {
+		return JsonRpcDispatcher.builder(Reactor.getCurrentReactor())
+			.withService(UserApi.class, new UserApiImpl())
+			.withService(FailingApi.class, new FailingApiImpl());
+	}
+
+	private static Set<String> rowKeys(TabularData tabularData) {
+		Set<String> keys = new HashSet<>();
+		for (Object rowKey : tabularData.keySet()) {
+			keys.add(((List<?>) rowKey).get(0).toString());
+		}
+		return keys;
+	}
+
+	/** Captures the one argument {@code doBuild()} hands {@link JsonRpcDispatcher.Inspector#initialize(Set)}. */
+	private static final class RecordingInspector
+		extends AbstractInspector<JsonRpcDispatcher.Inspector>
+		implements JsonRpcDispatcher.Inspector {
+		private @Nullable Set<String> wireNames;
+
+		@Override
+		public void initialize(Set<String> wireNames) {
+			this.wireNames = Set.copyOf(wireNames);
+		}
+
+		@Override
+		public void onRequest(JsonRpcMethodDescriptor descriptor) {}
+
+		@Override
+		public void onResponse(JsonRpcMethodDescriptor descriptor, long durationMillis) {}
+
+		@Override
+		public void onError(JsonRpcMethodDescriptor descriptor, int errorCode, long durationMillis) {}
+
+		@Override
+		public void onMethodNotFound(String requestedName) {}
+
+		@Override
+		public void onMalformed() {}
+	}
 
 	private Set<String> attributeNames(ObjectName name) throws Exception {
 		Set<String> names = new HashSet<>();

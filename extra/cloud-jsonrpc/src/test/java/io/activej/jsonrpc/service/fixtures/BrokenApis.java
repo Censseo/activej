@@ -164,6 +164,30 @@ public final class BrokenApis {
 	}
 
 	// -------------------------------------------------------------------------------------------------
+	// Rule 10 — no wire name in the reserved 'rpc.' namespace (FR-001).
+	// -------------------------------------------------------------------------------------------------
+
+	/**
+	 * A service prefix of exactly {@code rpc}: <b>every</b> method of it lands in the namespace JSON-RPC 2.0
+	 * reserves for protocol-level methods — {@code rpc.discover} included, which is precisely the name this
+	 * implementation's own discovery method answers to.
+	 */
+	@JsonRpcService("rpc")
+	public interface ReservedNamespaceByPrefix {
+		@JsonRpcMethod("discover")
+		Promise<User> discover();
+
+		@JsonRpcNotification("touch")
+		void touch(@JsonRpcParam("id") long id);
+	}
+
+	/** No {@code @JsonRpcService} at all — the method's own name spells the reserved namespace itself. */
+	public interface ReservedNamespaceByMethodName {
+		@JsonRpcMethod("rpc.discover")
+		Promise<User> describe();
+	}
+
+	// -------------------------------------------------------------------------------------------------
 	// A diamond — one erased signature declared independently by two unrelated super-interfaces (FR-024).
 	// -------------------------------------------------------------------------------------------------
 

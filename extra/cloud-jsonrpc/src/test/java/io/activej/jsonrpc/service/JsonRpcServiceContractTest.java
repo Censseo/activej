@@ -38,8 +38,8 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * User story 1 and 3 — the startup contract: introspection of one annotated interface, and the nine
- * validation rules, every violation reported at once (FR-019…FR-034, FR-043a).
+ * User story 1 and 3 — the startup contract: introspection of one annotated interface, and the ten
+ * validation rules, every violation reported at once (FR-019…FR-034, FR-043a, and feature 018's FR-001).
  * <p>
  * Nothing here builds a dispatcher, opens anything or invokes an implementation: a contract is a property of
  * the <b>interface alone</b> (FR-034), which is exactly why it can be checked before a port is opened.
@@ -366,6 +366,51 @@ public class JsonRpcServiceContractTest {
 	}
 
 	// ---------------------------------------------------------------------------------------------------
+	// T003 — rule 10: the reserved 'rpc.' namespace (feature 018, FR-001).
+	// ---------------------------------------------------------------------------------------------------
+
+	@Test
+	public void rule10_aWireNameInTheReservedRpcNamespaceIsAViolation() {
+		List<String> violations = violationsOf(BrokenApis.ReservedNamespaceByPrefix.class);
+
+		assertEquals("every offending method is reported, not just the first: " + violations,
+			2, violations.size());
+		assertTrue("the offending wire name must be named: " + violations,
+			anyContains(violations, "'rpc.discover'"));
+		assertTrue("a notification is no exception: " + violations, anyContains(violations, "'rpc.touch'"));
+
+		for (String violation : violations) {
+			assertTrue("the Java method must be named: " + violation,
+				violation.contains(BrokenApis.ReservedNamespaceByPrefix.class.getName()));
+			assertTrue("the reserved prefix must be named: " + violation, violation.contains("rpc."));
+		}
+		assertTrue(violations.toString(), anyContains(violations, "discover()"));
+		assertTrue(violations.toString(), anyContains(violations, "touch(long)"));
+	}
+
+	@Test
+	public void rule10_theReservedNamespaceIsRejectedFromTheMethodsOwnNameToo() {
+		// no @JsonRpcService prefix: the reserved namespace is reached by the method's own name alone
+		List<String> violations = violationsOf(BrokenApis.ReservedNamespaceByMethodName.class);
+
+		assertEquals(violations.toString(), 1, violations.size());
+		String violation = violations.get(0);
+		assertTrue("the offending wire name must be named: " + violation, violation.contains("'rpc.discover'"));
+		assertTrue("the Java method must be named: " + violation, violation.contains("describe"));
+		assertTrue("the Java method must be named: " + violation,
+			violation.contains(BrokenApis.ReservedNamespaceByMethodName.class.getName()));
+	}
+
+	@Test
+	public void rule10_isNotAViolationForANameThatMerelyBeginsWithTheLettersRpc() {
+		// the reserved prefix is exactly "rpc." — 'rpcs.get' and a bare 'rpc' are outside it
+		assertEquals(Set.of("rpcs.get"),
+			JsonRpcServiceContract.of(NearMissPrefixApi.class, CODECS).methods().keySet());
+		assertEquals(Set.of("rpc", "rpcx.get"),
+			JsonRpcServiceContract.of(NearMissNameApi.class, CODECS).methods().keySet());
+	}
+
+	// ---------------------------------------------------------------------------------------------------
 	// T015 — generic resolution (FR-028, research threat 2).
 	// ---------------------------------------------------------------------------------------------------
 
@@ -493,6 +538,22 @@ public class JsonRpcServiceContractTest {
 		@Override
 		@JsonRpcMethod("get")
 		Promise<User> get(@JsonRpcParam("id") long id);
+	}
+
+	/** {@code rpcs.} is not {@code rpc.} — the reserved prefix is the four literal characters, dot included. */
+	@JsonRpcService("rpcs")
+	public interface NearMissPrefixApi {
+		@JsonRpcMethod("get")
+		Promise<String> get();
+	}
+
+	/** A bare {@code rpc} names no namespace, and {@code rpcx.} is somebody else's. */
+	public interface NearMissNameApi {
+		@JsonRpcMethod("rpc")
+		Promise<String> rpc();
+
+		@JsonRpcMethod("rpcx.get")
+		Promise<String> get();
 	}
 
 	public interface CrudApi<T> {

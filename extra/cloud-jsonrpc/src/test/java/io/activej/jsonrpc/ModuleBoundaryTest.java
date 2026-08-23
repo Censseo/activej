@@ -34,6 +34,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -49,11 +50,12 @@ import static org.junit.Assert.fail;
  *     <li><b>FR-108 / FR-109</b> — the reactor and {@code Promise} prefixes are <i>package-scoped</i>
  *     rather than module-wide: they are permitted inside {@code io.activej.jsonrpc.service} and
  *     {@code io.activej.jsonrpc.transport} (and their subpackages), but stay rejected everywhere else in
- *     this module, including {@code io.activej.jsonrpc} and {@code io.activej.jsonrpc.impl}. The other
- *     seven forbidden prefixes remain module-wide.</li>
+ *     this module, including {@code io.activej.jsonrpc}, {@code io.activej.jsonrpc.impl} and
+ *     {@code io.activej.jsonrpc.schema}. The other seven forbidden prefixes remain module-wide.</li>
  *     <li><b>FR-042</b> — the {@code io.activej.jmx} and {@code io.activej.common.inspector} prefixes
  *     are permitted in {@code io.activej.jsonrpc.service} (and its subpackages) only: the service layer
- *     is where per-method observability lives, and the transport SPI must not carry it.</li>
+ *     is where per-method observability lives, and neither the transport SPI nor the schema package may
+ *     carry it.</li>
  *     <li><b>FR-022</b> — no field (and no {@code record} component) is declared as a
  *     {@code com.dslplatform.json.JsonReader}. A retained reader is the obvious first implementation of a
  *     deferred payload and it is wrong: dsl-json's index space does not survive a buffer refill, so the
@@ -102,6 +104,21 @@ public class ModuleBoundaryTest {
 		"io.activej.common.inspector", Set.of("io.activej.jsonrpc.service")
 	);
 
+	/**
+	 * The synchronous package feature 018 added for OpenRPC schema generation.
+	 * <p>
+	 * It is named here only so the rule can be asserted rather than inferred. Generation is pure descriptor
+	 * reading — no reactor, no {@code Promise} — so the package deliberately appears in <i>neither</i>
+	 * {@link #PERMITTED_PACKAGES} nor any value of {@link #PACKAGE_SCOPED_PREFIXES_BY_PACKAGE}, and therefore
+	 * inherits the module's <b>default</b> treatment: every prefix of {@link #FORBIDDEN_IMPORT_PREFIXES} is
+	 * refused in it, the reactor, {@code Promise}, JMX and the inspector included.
+	 * <p>
+	 * That inheritance is automatic — {@link #findForbiddenImportViolations} classifies by package prefix and
+	 * needs no per-package registration — which is exactly why it is worth pinning: a scan that stopped
+	 * reaching this package would keep reporting zero violations forever.
+	 */
+	private static final String SCHEMA_PACKAGE = "io.activej.jsonrpc.schema";
+
 	private static final Pattern IMPORT = Pattern.compile("^\\s*import\\s+(?:static\\s+)?([\\w.$]+)\\s*;");
 
 	/**
@@ -145,6 +162,10 @@ public class ModuleBoundaryTest {
 			"io.activej.promise.Promise", "io.activej.reactor.Reactor");
 		writeSyntheticSource(root, "io.activej.jsonrpc.impl", "InEnvelopeImpl",
 			"io.activej.promise.Promise", "io.activej.reactor.Reactor");
+		writeSyntheticSource(root, SCHEMA_PACKAGE, "InSchema",
+			"io.activej.promise.Promise", "io.activej.reactor.Reactor");
+		writeSyntheticSource(root, SCHEMA_PACKAGE + ".impl", "InSchemaImpl",
+			"io.activej.promise.Promise", "io.activej.reactor.Reactor");
 
 		List<String> violations = findForbiddenImportViolations(root);
 
@@ -158,6 +179,11 @@ public class ModuleBoundaryTest {
 					 "(2 violations each): " + violations,
 			4, violations.stream()
 				.filter(v -> v.contains("InEnvelope.java") || v.contains("InEnvelopeImpl.java"))
+				.count());
+		assertEquals(SCHEMA_PACKAGE + " and its subpackages are synchronous by decision and must reject both " +
+					 "scoped prefixes (2 violations each): " + violations,
+			4, violations.stream()
+				.filter(v -> v.contains("InSchema.java") || v.contains("InSchemaImpl.java"))
 				.count());
 	}
 
@@ -189,6 +215,8 @@ public class ModuleBoundaryTest {
 			"io.activej.common.inspector.BaseInspector", "io.activej.jmx.api.JmxAttribute");
 		writeSyntheticSource(root, "io.activej.jsonrpc.impl", "InEnvelopeImpl",
 			"io.activej.jmx.api.JmxAttribute");
+		writeSyntheticSource(root, SCHEMA_PACKAGE, "InSchema",
+			"io.activej.jmx.api.JmxAttribute", "io.activej.common.inspector.BaseInspector");
 
 		List<String> violations = findForbiddenImportViolations(root);
 
@@ -197,9 +225,12 @@ public class ModuleBoundaryTest {
 					   "jmx/inspector, but got: " + violation,
 				!violation.contains("InService.java") && !violation.contains("InServiceImpl.java"));
 		}
-		assertEquals("io.activej.jsonrpc.transport, .jsonrpc and .jsonrpc.impl must each reject the " +
-					 "scoped prefixes (1, 2 and 1 violations respectively): " + violations,
-			4, violations.size());
+		assertEquals(SCHEMA_PACKAGE + " describes a service, it does not observe one: both confined prefixes " +
+					 "must be rejected there: " + violations,
+			2, violations.stream().filter(v -> v.contains("InSchema.java")).count());
+		assertEquals("io.activej.jsonrpc.transport, .jsonrpc, .jsonrpc.impl and .jsonrpc.schema must each " +
+					 "reject the scoped prefixes (1, 2, 1 and 2 violations respectively): " + violations,
+			6, violations.size());
 	}
 
 	@Test
@@ -225,6 +256,46 @@ public class ModuleBoundaryTest {
 				 "survive a buffer refill, so a captured [start, end) pair outlives its meaning:\n\t" +
 				 String.join("\n\t", violations));
 		}
+	}
+
+	@Test
+	public void schemaPackageIsInNeitherAllowlist() {
+		// The schema package's synchronous property is a decision (spec 018, "Package decision"), so it is
+		// asserted against the tables themselves rather than only through a behavioural symptom: adding
+		// io.activej.jsonrpc.schema to either allowlist must fail HERE, at the line that states the rule.
+		for (String pkg : List.of(SCHEMA_PACKAGE, SCHEMA_PACKAGE + ".impl")) {
+			assertFalse(pkg + " must not be permitted to import the reactor or Promise — generation is pure " +
+						"descriptor reading, and the offline export must stay usable with no reactor at all",
+				isPermittedPackage(pkg, PERMITTED_PACKAGES));
+			for (Map.Entry<String, Set<String>> confined : PACKAGE_SCOPED_PREFIXES_BY_PACKAGE.entrySet()) {
+				assertFalse(pkg + " must not be permitted to import " + confined.getKey() +
+							" — observability is the service layer's (FR-042)",
+					isPermittedPackage(pkg, confined.getValue()));
+			}
+		}
+	}
+
+	@Test
+	public void theScannerActuallySeesTheSchemaPackage() {
+		// guards the guard, per package. noForbiddenImport() reports zero violations both when the schema
+		// package is clean and when the walk never reaches it; only this assertion tells the two apart, so a
+		// future refactor that narrows the scan fails loudly here instead of silently exempting a package.
+		Path root = mainRoot();
+		List<Path> schemaSources = sourcesUnder(root).stream()
+			.filter(source -> isPermittedPackage(packageOf(root, source), Set.of(SCHEMA_PACKAGE)))
+			.toList();
+
+		assertFalse(SCHEMA_PACKAGE + " was not reached by the src/main scan rooted at " + root.toAbsolutePath() +
+					" — either the package moved or the walk no longer covers it",
+			schemaSources.isEmpty());
+
+		List<String> violations = findForbiddenImportViolations(root).stream()
+			.filter(v -> schemaSources.stream().anyMatch(source -> v.startsWith(source + " ")))
+			.toList();
+		assertTrue(SCHEMA_PACKAGE + " is synchronous by decision and inherits the module's default refusal of " +
+				   "every forbidden prefix — the reactor, Promise, JMX and the inspector included:\n\t" +
+				   String.join("\n\t", violations),
+			violations.isEmpty());
 	}
 
 	@Test
