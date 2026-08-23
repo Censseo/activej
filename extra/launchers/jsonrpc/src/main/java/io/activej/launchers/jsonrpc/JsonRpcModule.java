@@ -31,7 +31,9 @@ import io.activej.inject.binding.OptionalDependency;
 import io.activej.inject.module.AbstractModule;
 import io.activej.json.JsonCodecFactory;
 import io.activej.jsonrpc.JsonRpcLimits;
+import io.activej.jsonrpc.schema.OpenRpcInfo;
 import io.activej.jsonrpc.service.JsonRpcDispatcher;
+import io.activej.jsonrpc.transport.http.JsonRpcDiscoveryServlet;
 import io.activej.jsonrpc.transport.http.JsonRpcServlet;
 import io.activej.jsonrpc.transport.tcp.JsonRpcTcpServer;
 import io.activej.jsonrpc.transport.ws.JsonRpcWsServlet;
@@ -65,6 +67,12 @@ import static io.activej.launchers.initializers.Initializers.ofHttpServer;
  * (FR-100…FR-102): it is resolved only when {@code jsonrpc.tcp.port} carries a value, because — unlike
  * the WebSocket route, which rides the HTTP listener that already exists — it opens a <b>new</b>
  * listening socket, plaintext and unauthenticated by design.
+ * <p>
+ * The {@link JsonRpcDiscoveryServlet} follows the same lazy shape, keyed on {@code jsonrpc.discovery.path}
+ * (feature 018, FR-003/FR-041/FR-042). It rides the existing HTTP listener like the WebSocket route, yet
+ * it is <b>off by default</b> too: the OpenRPC document names every wire method and describes every
+ * parameter and result type, so it is a disclosure surface an operator opts into. Switching it on also
+ * switches on the dispatcher's {@code rpc.discover} entry — one document, generated once, served by both.
  */
 public final class JsonRpcModule extends AbstractModule {
 	@Provides
@@ -72,7 +80,8 @@ public final class JsonRpcModule extends AbstractModule {
 		NioReactor reactor,
 		OptionalDependency<Set<JsonRpcServiceBinding>> bindings,
 		OptionalDependency<JsonCodecFactory> codecFactory,
-		OptionalDependency<JsonRpcDispatcher.Inspector> inspector
+		OptionalDependency<JsonRpcDispatcher.Inspector> inspector,
+		Config config
 	) {
 		JsonRpcDispatcher.Builder builder = JsonRpcDispatcher.builder(reactor)
 			.withCodecFactory(codecFactory.orElse(JsonCodecFactory.defaultInstance()));
@@ -84,6 +93,13 @@ public final class JsonRpcModule extends AbstractModule {
 		}
 		if (inspector.isPresent()) {
 			builder.withInspector(inspector.get());
+		}
+		// FR-003/FR-013: presence of jsonrpc.discovery.path is the switch (ADR-042). Absent or empty and
+		// withDiscovery is never called at all — the dispatcher's rpc.discover entry does not exist, no
+		// document is generated, and discoveryDocument() stays null
+		OpenRpcInfo discoveryInfo = discoveryInfo(config.getChild("jsonrpc"));
+		if (discoveryInfo != null) {
+			builder.withDiscovery(discoveryInfo);
 		}
 		return builder.build();
 	}
@@ -113,8 +129,29 @@ public final class JsonRpcModule extends AbstractModule {
 		return JsonRpcWsServlet.builder(reactor, dispatcher).build();
 	}
 
+	/**
+	 * The read-only OpenRPC {@code GET} endpoint (FR-041) — an ordinary binding, so an application that
+	 * composes its own {@link RoutingServlet} can mount it wherever it likes. {@link #rootServlet}
+	 * resolves it lazily through the {@link InstanceProvider} and only when {@code jsonrpc.discovery.path}
+	 * carries a value, so a deployment with discovery off constructs nothing at startup.
+	 * <p>
+	 * A lookup while discovery is disabled yields a servlet over a dispatcher that holds no document; it
+	 * answers {@code 404}, exactly as the unmounted path does (the servlet's own {@code null}-document
+	 * branch). As with {@link #wsServlet}, the provider cannot re-check the key at lookup time —
+	 * {@link Config} is readable during startup only.
+	 */
 	@Provides
-	AsyncServlet rootServlet(NioReactor reactor, JsonRpcServlet servlet, InstanceProvider<JsonRpcWsServlet> wsServlet, Config config) {
+	JsonRpcDiscoveryServlet discoveryServlet(NioReactor reactor, JsonRpcDispatcher dispatcher) {
+		return JsonRpcDiscoveryServlet.create(reactor, dispatcher);
+	}
+
+	@Provides
+	AsyncServlet rootServlet(
+		NioReactor reactor, JsonRpcServlet servlet,
+		InstanceProvider<JsonRpcWsServlet> wsServlet,
+		InstanceProvider<JsonRpcDiscoveryServlet> discoveryServlet,
+		Config config
+	) {
 		Config jsonrpc = config.getChild("jsonrpc");
 		RoutingServlet.Builder builder = RoutingServlet.builder(reactor)
 			.with(HttpMethod.POST, jsonrpc.get("path", "/"), servlet);
@@ -127,6 +164,7 @@ public final class JsonRpcModule extends AbstractModule {
 		if (!wsPath.isEmpty()) {
 			builder.withWebSocket(wsPath, wsServlet.get());
 		}
+		mountDiscovery(builder, jsonrpc, discoveryServlet);
 		return builder.build();
 	}
 
@@ -193,5 +231,85 @@ public final class JsonRpcModule extends AbstractModule {
 	static @Nullable Integer tcpPort(Config jsonrpc) {
 		if (jsonrpc.get("tcp.port", "").isEmpty()) return null;
 		return jsonrpc.get(ofInteger(), "tcp.port");
+	}
+
+	/**
+	 * The one discovery switch, read from the {@code jsonrpc} subtree: {@code null} when
+	 * {@code jsonrpc.discovery.path} is absent or empty — discovery is <b>off</b>, no document is
+	 * generated and no route is mounted — and the path otherwise (contracts/config-keys.md).
+	 * <p>
+	 * <b>Presence is the switch</b> (ADR-042), and here it may default to <i>on</i>-able because the
+	 * endpoint rides the {@link HttpServer} the deployment already runs — yet it defaults to
+	 * <b>off</b> anyway, for the other half of the rule: the document names every wire method and
+	 * describes every parameter and result type, so an upgrade must not start disclosing a surface
+	 * nobody asked to publish.
+	 * <p>
+	 * Shared with {@link MultithreadedJsonRpcServerLauncher}, which mounts the same route per worker.
+	 */
+	static @Nullable String discoveryPath(Config jsonrpc) {
+		String path = jsonrpc.get("discovery.path", "");
+		return path.isEmpty() ? null : path;
+	}
+
+	/**
+	 * The OpenRPC Info Object the dispatcher is built with, or {@code null} when discovery is off.
+	 * <p>
+	 * Both members are REQUIRED by OpenRPC and <b>neither is invented here</b> (FR-013): nothing derives
+	 * a title from a class name or a version from a POM. A deployment that switched discovery on without
+	 * describing it has asked for a document it has not named, so startup fails <b>naming the key it
+	 * left out</b> — the line's fail-closed posture (ADR-037), and the same shape as the
+	 * {@code workers <= 0} refusal: raised from a provider, at wiring time, before anything is listening.
+	 */
+	static @Nullable OpenRpcInfo discoveryInfo(Config jsonrpc) {
+		if (discoveryPath(jsonrpc) == null) return null;
+		return new OpenRpcInfo(requiredInfoMember(jsonrpc, "title"), requiredInfoMember(jsonrpc, "version"));
+	}
+
+	/**
+	 * The presence check on one required Info Object member.
+	 * <p>
+	 * <b>{@code isBlank()}, not {@code isEmpty()}.</b> The rule this check enforces is that a published
+	 * document is never <i>unnamed</i>, and a whitespace-only title names a service exactly as poorly as
+	 * a missing one — every consumer renders it blank — while passing an emptiness test. A deployment
+	 * that set the key to {@code "   "} has still not described the document it switched on, so it is
+	 * refused the same way, naming the same key.
+	 * <p>
+	 * The <b>value</b> is never trimmed: whatever the application supplied is carried into the document
+	 * verbatim (FR-013, rule M9). Only the check ignores surrounding whitespace.
+	 */
+	private static String requiredInfoMember(Config jsonrpc, String member) {
+		String value = jsonrpc.get("discovery.info." + member, "");
+		if (value.isBlank()) {
+			throw new IllegalStateException(
+				"Configuration key 'jsonrpc.discovery.info." + member + "' is required when discovery is " +
+				"enabled, and must not be blank: OpenRPC requires both info.title and info.version, and the " +
+				"launcher never invents them.\n" +
+				"(Set jsonrpc.discovery.info." + member + " to a non-blank value, or leave " +
+				"jsonrpc.discovery.path empty to keep discovery disabled.)");
+		}
+		return value;
+	}
+
+	/**
+	 * The {@code GET} mount, shared verbatim by <b>both</b> route-construction sites — this module's
+	 * {@link #rootServlet} and {@link MultithreadedJsonRpcServerLauncher}'s {@code @Worker} one. Editing
+	 * one without the other is this module's standing defect shape, so the two call one method.
+	 * <p>
+	 * <b>Mounted method-agnostically, deliberately.</b> {@code with(path, servlet)} lands on
+	 * {@code RoutingServlet}'s any-method slot rather than the {@code GET} one, and that is what keeps a
+	 * {@code jsonrpc.discovery.path} equal to {@code jsonrpc.path} (or to any other already-mounted path)
+	 * working: the router prefers a method-specific slot over the any-method one, so {@code POST} still
+	 * reaches {@link JsonRpcServlet} while {@code GET} — and every other method — reaches the discovery
+	 * servlet. Mounting on {@code GET} alone would instead make a non-{@code GET} request to that path
+	 * fall through to the router's bare {@code 404}; the pinned {@code 405} + {@code Allow: GET} is the
+	 * <b>servlet's own</b> answer ({@link JsonRpcDiscoveryServlet}), never the router's, precisely so the
+	 * status holds however the endpoint is mounted.
+	 */
+	static void mountDiscovery(
+		RoutingServlet.Builder builder, Config jsonrpc, InstanceProvider<JsonRpcDiscoveryServlet> discoveryServlet
+	) {
+		String discoveryPath = discoveryPath(jsonrpc);
+		if (discoveryPath == null) return;
+		builder.with(discoveryPath, discoveryServlet.get());
 	}
 }

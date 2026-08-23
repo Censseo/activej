@@ -37,7 +37,9 @@ import io.activej.inject.module.Module;
 import io.activej.jmx.JmxModule;
 import io.activej.json.JsonCodecFactory;
 import io.activej.jsonrpc.JsonRpcLimits;
+import io.activej.jsonrpc.schema.OpenRpcInfo;
 import io.activej.jsonrpc.service.JsonRpcDispatcher;
+import io.activej.jsonrpc.transport.http.JsonRpcDiscoveryServlet;
 import io.activej.jsonrpc.transport.http.JsonRpcServlet;
 import io.activej.jsonrpc.transport.tcp.JsonRpcTcpServer;
 import io.activej.jsonrpc.transport.ws.JsonRpcWsServlet;
@@ -81,6 +83,12 @@ import static io.activej.launchers.initializers.Initializers.ofPrimaryServer;
  * <b>disabled by default</b>: with a port set, one {@link JsonRpcTcpServer} per worker sits behind a
  * {@link PrimaryServer} accepting on the primary reactor, so a connection is served by whichever worker
  * accepted it and each worker's session registry sees only its own connections.
+ * <p>
+ * Since feature 018 {@code jsonrpc.discovery.path} additionally mounts a read-only OpenRPC {@code GET}
+ * endpoint <b>per worker</b> (and switches on {@code rpc.discover} on every worker's dispatcher),
+ * <b>disabled by default</b>. Each worker generates the document from the same contracts and the same
+ * {@code jsonrpc.discovery.info.*} values, so whichever worker the {@link PrimaryServer} hands a
+ * connection to answers with identical bytes.
  *
  * @see Launcher
  */
@@ -143,7 +151,8 @@ public abstract class MultithreadedJsonRpcServerLauncher extends Launcher {
 		NioReactor reactor,
 		OptionalDependency<Set<JsonRpcServiceBinding>> bindings,
 		OptionalDependency<JsonCodecFactory> codecFactory,
-		JsonRpcDispatcher.Inspector inspector
+		JsonRpcDispatcher.Inspector inspector,
+		Config config
 	) {
 		JsonRpcDispatcher.Builder builder = JsonRpcDispatcher.builder(reactor)
 			.withCodecFactory(codecFactory.orElse(JsonCodecFactory.defaultInstance()))
@@ -152,6 +161,13 @@ public abstract class MultithreadedJsonRpcServerLauncher extends Launcher {
 			@SuppressWarnings("unchecked")
 			Class<Object> serviceType = (Class<Object>) binding.serviceType();
 			builder.withService(serviceType, binding.implementation());
+		}
+		// FR-003/FR-013, read through the same shared helper as JsonRpcModule: each worker computes the
+		// same document from the same contracts and the same OpenRpcInfo, so every worker answers
+		// rpc.discover — and the GET route below — with identical bytes
+		OpenRpcInfo discoveryInfo = JsonRpcModule.discoveryInfo(config.getChild("jsonrpc"));
+		if (discoveryInfo != null) {
+			builder.withDiscovery(discoveryInfo);
 		}
 		return builder.build();
 	}
@@ -179,9 +195,25 @@ public abstract class MultithreadedJsonRpcServerLauncher extends Launcher {
 		return JsonRpcWsServlet.builder(reactor, dispatcher).build();
 	}
 
+	/**
+	 * The read-only OpenRPC {@code GET} endpoint — one per worker, over that worker's dispatcher
+	 * (FR-041). Resolved lazily and never constructed when {@code jsonrpc.discovery.path} is absent or
+	 * empty (see {@link JsonRpcModule#discoveryServlet}).
+	 */
 	@Provides
 	@Worker
-	AsyncServlet rootServlet(NioReactor reactor, JsonRpcServlet servlet, InstanceProvider<JsonRpcWsServlet> wsServlet, Config config) {
+	JsonRpcDiscoveryServlet discoveryServlet(NioReactor reactor, JsonRpcDispatcher dispatcher) {
+		return JsonRpcDiscoveryServlet.create(reactor, dispatcher);
+	}
+
+	@Provides
+	@Worker
+	AsyncServlet rootServlet(
+		NioReactor reactor, JsonRpcServlet servlet,
+		InstanceProvider<JsonRpcWsServlet> wsServlet,
+		InstanceProvider<JsonRpcDiscoveryServlet> discoveryServlet,
+		Config config
+	) {
 		Config jsonrpc = config.getChild("jsonrpc");
 		RoutingServlet.Builder builder = RoutingServlet.builder(reactor)
 			.with(HttpMethod.POST, jsonrpc.get("path", "/"), servlet);
@@ -194,6 +226,9 @@ public abstract class MultithreadedJsonRpcServerLauncher extends Launcher {
 		if (!wsPath.isEmpty()) {
 			builder.withWebSocket(wsPath, wsServlet.get());
 		}
+		// feature 018: the discovery GET route, mounted through the SAME helper as JsonRpcModule's site
+		// so the two cannot drift — see JsonRpcModule.mountDiscovery for why it is method-agnostic
+		JsonRpcModule.mountDiscovery(builder, jsonrpc, discoveryServlet);
 		return builder.build();
 	}
 
