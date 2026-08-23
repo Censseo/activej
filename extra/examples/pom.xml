@@ -19,6 +19,7 @@
     <module>dataflow</module>
     <module>multilog-sql-demo</module>
     <module>memcache</module>
+    <module>jsonrpc</module>
   </modules>
 
   <dependencies>
