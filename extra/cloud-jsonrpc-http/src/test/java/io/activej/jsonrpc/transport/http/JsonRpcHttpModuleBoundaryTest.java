@@ -54,10 +54,11 @@ import static org.junit.Assert.assertTrue;
  *     silence — no per-call deadline/timeout setting (FR-090), no in-flight concurrency bound
  *     (FR-091), no auth/CORS/rate-limiting code (FR-092), no JMX annotation (FR-093), no WebSocket
  *     and no raw-TCP code (FR-094), no HTTP/2- or HTTP/3-specific branch (FR-095), and no
- *     {@code GET} handling (FR-096). Each is asserted as the absence of the code tokens such an
- *     implementation could not avoid, one test per FR, on code lines only — documented prose about
- *     a rule is not a violation of it, so the Javadoc that <i>states</i> the negative space stays
- *     legal while the code that would <i>fill</i> it fails the build.</li>
+ *     {@code GET} handling of a JSON-RPC document (FR-096, <b>narrowed by feature 018</b> — see
+ *     {@link #NEGATIVE_SPACE_EXEMPT_FILE}). Each is asserted as the absence of the code tokens such
+ *     an implementation could not avoid, one test per FR, on code lines only — documented prose
+ *     about a rule is not a violation of it, so the Javadoc that <i>states</i> the negative space
+ *     stays legal while the code that would <i>fill</i> it fails the build.</li>
  * </ul>
  * A plain text scan is deliberate — no bytecode or reflection scanning library exists in this
  * module's dependency set, and adding one to police a rule about dependencies would be
@@ -206,21 +207,69 @@ public class JsonRpcHttpModuleBoundaryTest {
 		// such a branch would have to use (the "HTTP/2" prose spelling is comment-only and legal).
 		"FR-095 (no HTTP/2 or HTTP/3 branch)",
 		List.of("Http2", "Http3"),
-		// FR-096: JSON-RPC over GET is outside the parent idea — the method gate compares against
-		// HttpMethod.POST only, and any GET handling would have to reference the constant.
+		// FR-096: carrying a JSON-RPC document over GET is outside the parent idea — the JSON-RPC
+		// method gate compares against HttpMethod.POST only, and any GET handling of a document would
+		// have to reference the constant. Narrowed by feature 018 to every file but one, below.
 		"FR-096 (no GET handling)",
 		List.of("HttpMethod.GET")
+	);
+
+	/**
+	 * The negative space's one named exemption: FR key → the single {@code src/main} file allowed to
+	 * carry that FR's needles.
+	 * <p>
+	 * Feature 018 adds an OpenRPC discovery endpoint, which is a {@code GET} route by contract
+	 * ({@code specs/018-jsonrpc-schema-discovery/contracts/openrpc-mapping.md} §4). FR-096 is not
+	 * thereby retired — what it refuses is a <b>JSON-RPC document carried over GET</b>, and that stays
+	 * refused: {@link JsonRpcServlet} and {@link JsonRpcHttpClientTransport} may still not name the
+	 * constant, and the discovery servlet reads no document from the request at all. Exempting the one
+	 * file by name, rather than deleting the needle, keeps the rule binding everywhere it was binding
+	 * before and makes the carve-out greppable.
+	 * <p>
+	 * The exemption is itself checked — see {@link #theNegativeSpaceExemptionIsNarrowAndStillNeeded()}:
+	 * a stale exemption silently re-opens the rule it names, so it must keep naming a file that exists
+	 * and that actually carries the needle.
+	 */
+	private static final Map<String, String> NEGATIVE_SPACE_EXEMPT_FILE = Map.of(
+		"FR-096 (no GET handling)", "JsonRpcDiscoveryServlet.java"
 	);
 
 	/** One assertion per FR: none of its needles may appear on a code line of {@code src/main}. */
 	@Test
 	public void negativeSpaceIsAssertedPerRequirement() {
 		for (Map.Entry<String, List<String>> entry : NEGATIVE_SPACE.entrySet()) {
+			String exemptFile = NEGATIVE_SPACE_EXEMPT_FILE.get(entry.getKey());
 			for (String needle : entry.getValue()) {
-				List<String> violations = findOccurrenceViolations(mainRoot(), needle);
-				assertTrue(entry.getKey() + " — '" + needle + "' must stay out of src/main: " + violations,
+				List<String> violations = findOccurrenceViolations(mainRoot(), needle).stream()
+					.filter(violation -> exemptFile == null || !violation.contains(exemptFile))
+					.toList();
+				assertTrue(entry.getKey() + " — '" + needle + "' must stay out of src/main" +
+						   (exemptFile == null ? "" : " (except " + exemptFile + ")") + ": " + violations,
 					violations.isEmpty());
 			}
+		}
+	}
+
+	/**
+	 * Guards the exemption: every exempt file must exist and must actually carry at least one of the
+	 * needles it is exempted for. An exemption that has outlived its reason is a hole in the negative
+	 * space that nothing would ever report — the same rule the conformance harness applies to a stale
+	 * {@code skippedVectors()} entry.
+	 */
+	@Test
+	public void theNegativeSpaceExemptionIsNarrowAndStillNeeded() {
+		for (Map.Entry<String, String> exemption : NEGATIVE_SPACE_EXEMPT_FILE.entrySet()) {
+			List<String> needles = NEGATIVE_SPACE.get(exemption.getKey());
+			assertTrue("an exemption must name a live negative-space entry: " + exemption.getKey(),
+				needles != null);
+			List<String> excused = needles.stream()
+				.flatMap(needle -> findOccurrenceViolations(mainRoot(), needle).stream())
+				.filter(violation -> violation.contains(exemption.getValue()))
+				.toList();
+			assertTrue("the exemption of " + exemption.getValue() + " from " + exemption.getKey() +
+					   " is stale — that file no longer carries any of " + needles +
+					   ", so the exemption must be removed",
+				!excused.isEmpty());
 		}
 	}
 
