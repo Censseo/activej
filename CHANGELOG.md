@@ -4,6 +4,85 @@
 
 ### Notable additions
 
+- **OpenRPC schema discovery for the JSON-RPC line.** A service can now describe
+  itself: a built-in `rpc.discover` method answering an OpenRPC document derived
+  from the already-validated service contracts, the same document produced
+  offline by one static call, and an opt-in read-only HTTP `GET` endpoint serving
+  the very same bytes. **No new module carries production code** — the schema
+  model and generator are a new `io.activej.jsonrpc.schema` package inside
+  `extra/cloud-jsonrpc` (`activej-jsonrpc`), the endpoint is a new
+  `JsonRpcDiscoveryServlet` in `extra/cloud-jsonrpc-http` (`activej-jsonrpc-http`),
+  and the mount plus its keys are in `extra/launchers/jsonrpc`
+  (`activej-launchers-jsonrpc`). The only new Maven module is
+  `extra/examples/jsonrpc` (`examples-jsonrpc`) — a demonstration, and explicitly
+  not part of the domain contract — accompanied by the tutorial page
+  `docs/cloud-extras/jsonrpc-tutorial.md`.
+
+  `JsonRpcDispatcher.Builder.withDiscovery(OpenRpcInfo)` — or the equivalent
+  `withDiscovery(String title, String version)` — is the whole switch, and
+  **presence is the switch**: there is no `withDiscovery(boolean)`, and with the
+  method never called `rpc.discover` is simply not in the handler table, answered
+  `-32601` byte-indistinguishably from any other unregistered name. Enabled,
+  `build()` generates the document **once** and registers a dispatcher-owned entry
+  into the same frozen table user methods live in — so every transport carries it
+  for free (HTTP POST, WebSocket and framed TCP alike, with no change to the
+  `JsonRpcTransport` SPI), it gets its own JMX `methodStats` row rather than
+  moving the aggregate-only `methodNotFound` counter, and `discoveryDocument()`
+  hands out **the same array** the table entry answers with, so the two cannot
+  drift. `JsonRpcSchemaGenerator.generate(...)` / `generateBytes(...)` are static,
+  synchronous and reactor-free — that is how the offline export produces
+  byte-identical output with no dispatcher, no reactor and no transport at all.
+  The emitted `openrpc` member is `OpenRpcDocument.OPENRPC_VERSION`, pinned at
+  **`1.4.0`**; methods are sorted by wire name across every registered service.
+  Parameter and result types map to a pinned JSON Schema draft-07 subset, and
+  anything outside it — including a `record` with any component outside it, and
+  any recursive `record` — is emitted as the JSON literal `true` rather than
+  described incompletely. Nothing is derived or invented: `title` and `version`
+  are the application's, and there is no `servers`, `externalDocs` or
+  `components` member at all — not an unused field, no field.
+
+  `JsonRpcServiceContract` gains a **tenth rule**: a wire name in the `rpc.`
+  namespace JSON-RPC 2.0 reserves for protocol-level methods is refused at
+  `build()` / `proxy()` time, listed alongside every other violation of the
+  interface. A service that named a method into that namespace now fails at
+  startup rather than colliding with the built-in on the first call.
+
+  The launchers gain three keys, all under `jsonrpc.discovery.*`:
+  `jsonrpc.discovery.path` — **empty by default, meaning discovery is off** —
+  plus `jsonrpc.discovery.info.title` and `jsonrpc.discovery.info.version`,
+  **both required once the path is set**. Setting the path both enables the
+  dispatcher's `rpc.discover` entry and mounts the `GET` endpoint at that path,
+  method-agnostically, so the path may equal `jsonrpc.path`: `POST` still reaches
+  `JsonRpcServlet`, while a non-`GET` gets the discovery servlet's own `405` +
+  `Allow: GET`. Leaving an info member out **fails startup naming the key it left
+  out** — nothing derives a title from a class name or a version from a POM, and
+  a **blank** value counts as left out (the check trims, the value never does: a
+  configured title is carried into the document verbatim, padding included).
+  Unlike `jsonrpc.ws.path`, which defaults to `/ws` because it rides the HTTP
+  listener the deployment already runs, discovery defaults to **off** although it
+  rides that same listener: the document names every wire method and describes
+  every parameter and result type, so an upgrade must not start disclosing a
+  surface nobody asked to publish. A disabled deployment mounts no route and
+  exposes no path to probe. `jsonrpc.discovery.*` admits exactly those three
+  keys, all of them **leaves**; anything else — a scalar `jsonrpc.discovery` or
+  `jsonrpc.discovery.info` value, or a descendant of one of the three such as
+  `jsonrpc.discovery.info.title.extra` — fails startup loudly naming the key.
+
+  **No new `ApplicationSettings` key exists anywhere in this feature**, in any of
+  the three modules it touches. The JSON-RPC line's bounds are unchanged and
+  still the only ones: `JsonRpcLimits.MAX_BODY_SIZE` (`1mb`),
+  `JsonRpcLimits.MAX_BATCH_SIZE` (`100`) and `JsonRpcLimits.MAX_JSON_DEPTH`
+  (`64`), tunable as `-DJsonRpcLimits.maxBodySize=…`, `-DJsonRpcLimits.maxBatchSize=…`
+  and `-DJsonRpcLimits.maxJsonDepth=…`. The document is generated at `build()` and
+  served from that one shared array thereafter, so discovery introduces no
+  per-request bound to reason about and regenerates nothing per call.
+
+  **No default-build impact.** The whole JSON-RPC line is gated behind `-P extra`,
+  which CI does not pass: `mvn -T1C verify` builds none of the modules this
+  feature touches, and no `core-*` or other default-profile module changed. Use
+  `mvn -P extra verify`, and `mvn -P extra,examples verify` for the example
+  module, which lives under the `examples` profile of the `extra` tree.
+
 - **A JSON-RPC 2.0 transport over framed TCP.** New profile-gated module
   `extra/cloud-jsonrpc-tcp` (`activej-jsonrpc-tcp`) — the **third** JSON-RPC
   transport, and the one with nothing underneath it. The framing is **JSON
