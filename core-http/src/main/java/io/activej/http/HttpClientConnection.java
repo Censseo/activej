@@ -344,13 +344,31 @@ public final class HttpClientConnection extends AbstractHttpConnection {
 			});
 
 		// see WebSocketServlet#bindWebSocketTransformers — closeReceivedPromise never settles when this
-		// side closes first, so the read half is released on closeSent AND processCompletion instead
+		// side closes first, so the read half is released on closeSent AND processCompletion instead.
+		//
+		// The connection itself is closed from the very same gate, and for the very same reason: the
+		// subscription above (closeSent -> closeReceived) is the ONLY thing that calls
+		// closeWebSocketConnection, and it never fires when this side closes first. The CSP cascade
+		// still tears the raw socket down, so nothing looks wrong — but HttpClientConnection#onClosed
+		// never runs, and with it neither the response recycle nor `stashedBufs`, which holds the
+		// pooled ByteBuf the 101 response head was parsed out of. One 16 kB pooled buffer per such
+		// connection was leaked. Reproduced by WebSocketClientCloseWithBufferedInputTest: it needs at
+		// least two unread inbound messages, because with one the client's own read stays in flight and
+		// the peer's teardown reaches the connection through the normal read-error path instead.
+		//
+		// Both gates being settled means the CLOSE frame has been written and the decoder has finished,
+		// however it finished — i.e. the WebSocket is over — so closing here is never premature, and
+		// close()/closeEx() are idempotent for the handshake path that already closed above.
 		encoder.getCloseSentPromise()
 			.subscribe(($, closeSentException) -> decoder.getProcessCompletion()
-				.subscribe(($2, processException) -> decoder.closeInput(
-					processException != null ? processException :
-						closeSentException != null ? closeSentException :
-							REGULAR_CLOSE)));
+				.subscribe(($2, processException) -> {
+					Exception cause =
+						processException != null ? processException :
+							closeSentException != null ? closeSentException :
+								REGULAR_CLOSE;
+					decoder.closeInput(cause);
+					closeWebSocketConnection(cause);
+				}));
 	}
 
 	private void readHttpResponse() {

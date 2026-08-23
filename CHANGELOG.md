@@ -448,6 +448,31 @@ Fixes a latent platform defect found while verifying this surface against a real
   `core-net` defect, out of scope for this fix; `JsonRpcWsPurgeTest` keeps a
   narrowed `@IgnoreLeaks` naming only that one row.
 
+- **A client-side WebSocket closed with inbound messages still buffered no longer
+  orphans its `HttpClientConnection`** (in `core-http`). `bindWebSocketTransformers`
+  called `closeWebSocketConnection` from exactly one place — the
+  `closeSentPromise -> closeReceivedPromise` chain — and that chain never fires when
+  *this* side closes first, because the peer's CLOSE frame is never read and
+  `closeReceivedPromise` never settles. The raw socket was still torn down by the CSP
+  cascade, so nothing looked wrong: the eventloop went quiescent and no exception was
+  raised. But `HttpClientConnection#onClosed()` never ran, and with it neither
+  `response.recycle()` nor `stashedBufs.recycle()` — and `stashedBufs` holds the pooled
+  buffer the `101` response head was parsed out of, which the response's own header
+  tokens point into. **One 16 kB pooled `ByteBuf` was lost per such connection.** The
+  connection is now closed from the same `closeSent` **and** `processCompletion` gate
+  that already releases the read half (`closeInput`, above): both settled means the
+  CLOSE frame has been written and the decoder has finished, i.e. the WebSocket is
+  over, so it is never premature, and `close()`/`closeEx()` stay idempotent for the
+  handshake path that already closed. The trigger needs **at least two** unread inbound
+  messages: with one, the client's own socket read is still in flight and the peer's
+  teardown reaches the connection through the ordinary read-error path. Regression test:
+  `WebSocketClientCloseWithBufferedInputTest`. Found by the feature 018 (`rpc.discover`)
+  adversarial sweep, whose
+  `JsonRpcWsDiscoveryAdversarialTest#aPeerVanishingMidDiscoveryWriteTearsTheSessionDownCleanlyAndReportsOncePerLostAnswer`
+  reaches it naturally — a discovery answer is kilobytes, so a peer that hangs up while
+  several are queued is the realistic way into this state. Distinct from the `core-net`
+  row-(c) defect above, which still reproduces and keeps its narrowed `@IgnoreLeaks`.
+
 - **WebSocket frame parsing no longer continues after a protocol error** (in
   `core-http`'s `WebSocketBufsToFrames`). Three error branches reported the
   violation and then fell through into further parsing on the closed, recycled
