@@ -71,8 +71,16 @@ import static io.activej.launchers.initializers.Initializers.ofEventloop;
  * {@code GET} endpoint at that path — together with {@code jsonrpc.discovery.info.title} and
  * {@code jsonrpc.discovery.info.version}, which are <b>both required</b> once discovery is on: OpenRPC
  * requires them and this launcher never invents metadata, so leaving one out fails startup naming it.
- * The four keys that deliberately do <b>not</b> exist — {@code jsonrpc.maxBatchSize},
- * {@code jsonrpc.maxJsonDepth}, {@code jsonrpc.callTimeout}, {@code jsonrpc.maxInFlight} — every
+ * Since feature 019 there is one more: {@code jsonrpc.maxInFlight}, the dispatcher's concurrent-invocation
+ * ceiling (default {@link JsonRpcDispatcher#MAX_IN_FLIGHT}, 1000; below {@code 1} is refused at
+ * {@code build()}). Feature 014 reserved it as a non-key and this feature spends that reservation (FR-039).
+ * The bound is <b>per dispatcher</b>, so {@link MultithreadedJsonRpcServerLauncher} applies it per worker.
+ * Feature 019 also admitted {@code jsonrpc.callTimeout}, which is {@link JsonRpcClientModule}'s and is
+ * therefore simply unread by a server-only deployment.
+ * <p>
+ * The two keys that deliberately do <b>not</b> exist are {@code jsonrpc.maxBatchSize} and
+ * {@code jsonrpc.maxJsonDepth} — both read straight off the process-wide {@code JsonRpcLimits} statics,
+ * with no per-instance seam to configure. They, every
  * {@code jsonrpc.ws.*} key other than {@code jsonrpc.ws.path}, every {@code jsonrpc.tcp.*} key other
  * than {@code jsonrpc.tcp.port}, every {@code jsonrpc.discovery.*} key outside the three above, and a
  * scalar {@code jsonrpc.ws}, {@code jsonrpc.tcp}, {@code jsonrpc.discovery} or
@@ -165,8 +173,9 @@ public abstract class JsonRpcServerLauncher extends Launcher {
 
 	/**
 	 * FR-036 fail-closed: rejects the {@code jsonrpc.*} keys that deliberately do not exist
-	 * (contracts/config-keys.md §4) — the four feature-09 keys, naming the key and the controlling
-	 * {@code ApplicationSettings} property — and, since feature 06 (FR-101), every {@code ws.*}
+	 * (contracts/config-keys.md §4) — <b>two</b> of feature 09's four reserved keys, since feature 019
+	 * admitted {@code callTimeout} (FR-021) and {@code maxInFlight} (FR-039) — naming the key and the
+	 * controlling {@code ApplicationSettings} property, and, since feature 06 (FR-101), every {@code ws.*}
 	 * child key other than {@code path}, naming the full key. A <b>scalar</b> {@code jsonrpc.ws}
 	 * value (e.g. {@code jsonrpc.ws=/ws}, a plausible typo for the one real key) is rejected too:
 	 * the node carries no children, so the child-key loop alone would miss it and silently mount
@@ -183,10 +192,15 @@ public abstract class JsonRpcServerLauncher extends Launcher {
 			"the batch bound is process-wide and is read directly by JsonRpcDecoder. Set -DJsonRpcLimits.maxBatchSize=<n> instead.");
 		rejectIfPresent(children, "maxJsonDepth",
 			"the nesting bound is process-wide and is read directly by JsonRpcDecoder. Set -DJsonRpcLimits.maxJsonDepth=<n> instead.");
-		rejectIfPresent(children, "callTimeout",
-			"a per-call deadline is not yet available. The connection-level http.readWriteTimeout bounds a stalled request meanwhile.");
-		rejectIfPresent(children, "maxInFlight",
-			"an in-flight bound is not yet available — the dispatcher deliberately keeps no in-flight registry.");
+		// jsonrpc.callTimeout was reserved here by feature 014 and ADMITTED by feature 019 (FR-021): the
+		// per-call deadline now has a per-instance seam, JsonRpcClient.Builder.withCallTimeout, and
+		// JsonRpcClientModule consumes the key. A server-only deployment simply does not read it — which is
+		// the ordinary fate of a client key, not the silent downgrade this check exists to prevent.
+		// jsonrpc.maxInFlight was reserved here by the same feature and ADMITTED by feature 019 (FR-039):
+		// JsonRpcDispatcher.Builder.withMaxInFlight is the seam that was missing, and BOTH launchers read
+		// the key — the single-eventloop one once, the multi-worker one once per worker. Unlike the two
+		// keys above, this bound is per dispatcher rather than process-wide, which is exactly why a config
+		// key is the right shape for it and a JsonRpcLimits static was not
 		// FR-101: the ws.* subtree admits exactly ws.path; every other key under it is a non-key,
 		// rejected naming the full key (contracts/config-keys.md). getChild("ws") of a config with
 		// no ws subtree is EMPTY, so a deployment without WebSocket keys walks an empty map.
@@ -271,11 +285,17 @@ public abstract class JsonRpcServerLauncher extends Launcher {
 			"discovery disabled.)");
 	}
 
+	/**
+	 * The remedy line no longer promises a future per-instance override: feature 019 landed, spent the two
+	 * reservations it could ({@code callTimeout}, {@code maxInFlight}) and deliberately left these two
+	 * process-wide — {@code JsonRpcDecoder} reads the {@code JsonRpcLimits} statics directly and no
+	 * per-instance seam exists — so naming the system property is the whole of the answer.
+	 */
 	private static void rejectIfPresent(Map<String, Config> children, String key, String why) {
 		if (children.containsKey(key)) {
 			throw new IllegalStateException(
 				"Configuration key 'jsonrpc." + key + "' is not supported: " + why + "\n" +
-				"(A per-instance override is owned by feature 09.)");
+				"(There is no per-instance override: the bound is process-wide by design.)");
 		}
 	}
 

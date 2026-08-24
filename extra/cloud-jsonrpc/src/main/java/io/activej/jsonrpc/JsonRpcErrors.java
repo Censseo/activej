@@ -21,10 +21,10 @@ import io.activej.common.annotation.StaticFactories;
 import java.util.List;
 
 /**
- * The named error codes of JSON-RPC 2.0 §5.1, the four this implementation allocates, the two range
+ * The named error codes of JSON-RPC 2.0 §5.1, the five this implementation allocates, the two range
  * predicates, and the two construction paths (FR-015, FR-016).
  *
- * <h2>The nine constants</h2>
+ * <h2>The ten constants</h2>
  * <table border="1">
  *     <caption>named error codes</caption>
  *     <tr><th>Constant</th><th>Code</th><th>Message</th><th>Raised by</th></tr>
@@ -46,12 +46,15 @@ import java.util.List;
  *         <td>{@code Nesting too deep}</td><td>the decoder</td></tr>
  *     <tr><td>{@link #INVALID_RESPONSE}</td><td>{@code -32004}</td>
  *         <td>{@code Invalid response}</td><td>the decoder, client side</td></tr>
+ *     <tr><td>{@link #SERVER_BUSY}</td><td>{@code -32005}</td>
+ *         <td>{@code Server busy}</td><td>the dispatcher, at its in-flight bound</td></tr>
  * </table>
- * The last four sit inside the {@code -32099 … -32000} range §5.1 reserves for implementation-defined server
+ * The last five sit inside the {@code -32099 … -32000} range §5.1 reserves for implementation-defined server
  * errors. <b>They are published contract</b>: changing the meaning of one later is a breaking change and
  * needs a {@code CHANGELOG.md} entry. A peer that receives {@code -32600} cannot tell "your envelope was
  * malformed" from "your envelope was too big", and the two have different remedies — which is why they are
- * distinct codes rather than one.
+ * distinct codes rather than one. For the same reason {@code -32005} is not folded into {@code -32603}: an
+ * overloaded server and a broken one call for opposite remedies.
  *
  * <h2>Why the two factories differ (research Decision 12)</h2>
  * {@link #of} is application-facing and <b>refuses</b> a reserved code; {@link #ofAny} accepts any code and is
@@ -93,8 +96,16 @@ public final class JsonRpcErrors {
 	public static final JsonRpcError NESTING_TOO_DEEP = predefined(-32003, "Nesting too deep");
 	/** {@code -32004} — a peer's Response object violates §5 (both or neither of {@code result}/{@code error}). */
 	public static final JsonRpcError INVALID_RESPONSE = predefined(-32004, "Invalid response");
+	/** {@code -32005} — the dispatcher is at its in-flight bound; the request was shed, not attempted. */
+	public static final JsonRpcError SERVER_BUSY = predefined(-32005, "Server busy");
 
-	/** The nine named codes, in declaration order — the closed key set of a per-method error breakdown. */
+	/**
+	 * The nine named codes, in declaration order — the closed key set of a per-method error breakdown.
+	 * <p>
+	 * {@link #SERVER_BUSY} is deliberately <b>not</b> a member: an in-flight rejection never reached a handler,
+	 * so it belongs to no method and takes no per-method row. It is counted by the dispatcher's aggregate
+	 * {@code rejectedRequests} statistic instead.
+	 */
 	public static List<JsonRpcError> named() {
 		return List.of(
 			PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL_ERROR,

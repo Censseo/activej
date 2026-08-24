@@ -134,7 +134,7 @@ public class InMemoryTransportTest {
 	@Test
 	public void aDocumentPushedByThePeerReachesTheListener() {
 		// the SPI is duplex: the far side may speak first (feature 06's server -> client direction)
-		InMemoryTransport transport = silent();
+		InMemoryTransport transport = InMemoryTransport.silent();
 		transport.setListener(listener);
 
 		transport.deliverFromPeer(doc("{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}"));
@@ -255,6 +255,141 @@ public class InMemoryTransportTest {
 
 	// endregion
 
+	// region silent and on-demand answering
+
+	@Test
+	public void aSilentTransportRecordsEverythingAndAnswersNothing() {
+		InMemoryTransport transport = InMemoryTransport.silent();
+		transport.setListener(listener);
+
+		transport.send(REQUEST_1);
+		transport.send(REQUEST_2);
+
+		assertEquals("the peer that never responds", List.of(), listener.documents());
+		assertEquals(List.of(asString(REQUEST_1), asString(REQUEST_2)), transport.sentText());
+		assertEquals(0, transport.heldCount());
+	}
+
+	@Test
+	public void thePeerIsNotConsultedUntilTheAnswerIsAskedFor() {
+		// the property reorder mode cannot provide: the answer is not merely undelivered, it is uncomputed,
+		// so a test can place an event between the call and the answer's existence
+		List<String> seen = new ArrayList<>();
+		InMemoryTransport transport = InMemoryTransport.create(document -> {
+			seen.add(asString(document));
+			return Promise.of(document);
+		});
+		transport.setListener(listener);
+		transport.startDeferringAnswers();
+
+		Promise<Void> sent = transport.send(REQUEST_1);
+
+		assertTrue("the write completed even though the peer has not seen the document", sent.isResult());
+		assertEquals(List.of(), seen);
+		assertEquals(List.of(), listener.documents());
+		assertEquals(1, transport.deferredCount());
+		assertEquals(List.of(asString(REQUEST_1)), transport.deferredText());
+		assertTrue(transport.isDeferringAnswers());
+
+		transport.answerInOrder();
+
+		assertEquals(List.of(asString(REQUEST_1)), seen);
+		assertEquals(List.of(asString(REQUEST_1)), listener.documents());
+		assertEquals(0, transport.deferredCount());
+	}
+
+	@Test
+	public void aSingleDeferredDocumentCanBeAnsweredByIndex() {
+		InMemoryTransport transport = echoing();
+		transport.setListener(listener);
+		transport.startDeferringAnswers();
+
+		transport.send(REQUEST_1);
+		transport.send(REQUEST_2);
+		transport.send(REQUEST_3);
+
+		transport.answer(1);
+		assertEquals(List.of(asString(REQUEST_2)), listener.documents());
+		assertEquals(2, transport.deferredCount());
+
+		transport.answerInOrder();
+		assertEquals(List.of(asString(REQUEST_2), asString(REQUEST_1), asString(REQUEST_3)), listener.documents());
+		assertEquals(0, transport.deferredCount());
+	}
+
+	@Test
+	public void askingForAnAnswerNobodyDeferredFails() {
+		InMemoryTransport transport = echoing();
+		transport.setListener(listener);
+		transport.startDeferringAnswers();
+		transport.send(REQUEST_1);
+
+		try {
+			transport.answer(1);
+			fail("a fixture must not silently ignore an answer nobody can supply");
+		} catch (IndexOutOfBoundsException e) {
+			// expected
+		}
+	}
+
+	@Test
+	public void answeringResumesAfterOnDemandModeStops() {
+		InMemoryTransport transport = echoing();
+		transport.setListener(listener);
+		transport.startDeferringAnswers();
+		transport.send(REQUEST_1);
+
+		transport.stopDeferringAnswers();
+		transport.send(REQUEST_2);
+
+		assertFalse(transport.isDeferringAnswers());
+		assertEquals("stopping the mode answers nothing by itself — asking is explicit",
+			List.of(asString(REQUEST_2)), listener.documents());
+		assertEquals(1, transport.deferredCount());
+
+		transport.answerInOrder();
+		assertEquals(List.of(asString(REQUEST_2), asString(REQUEST_1)), listener.documents());
+	}
+
+	@Test
+	public void anAnswerGivenOnDemandIsStillSubjectToTheHold() {
+		// the two modes compose: on-demand decides WHEN the answer exists, the hold decides when it arrives
+		InMemoryTransport transport = echoing();
+		transport.setListener(listener);
+		transport.startDeferringAnswers();
+		transport.startHolding();
+		transport.send(REQUEST_1);
+
+		transport.answerInOrder();
+
+		assertEquals(List.of(), listener.documents());
+		assertEquals(1, transport.heldCount());
+
+		transport.releaseInOrder();
+		assertEquals(List.of(asString(REQUEST_1)), listener.documents());
+	}
+
+	@Test
+	public void nothingIsAnsweredAfterClose() {
+		List<String> seen = new ArrayList<>();
+		InMemoryTransport transport = InMemoryTransport.create(document -> {
+			seen.add(asString(document));
+			return Promise.of(document);
+		});
+		transport.setListener(listener);
+		transport.startDeferringAnswers();
+		transport.send(REQUEST_1);
+
+		transport.close();
+		transport.answerInOrder();
+
+		assertEquals("a closed transport reaches the peer with nothing it was deferring", List.of(), seen);
+		assertEquals(0, transport.deferredCount());
+		assertEquals(List.of(), listener.documents());
+	}
+
+	// endregion
+
 	// region closing
 
 	@Test
@@ -354,10 +489,6 @@ public class InMemoryTransportTest {
 
 	private static InMemoryTransport echoing() {
 		return InMemoryTransport.create(Promise::of);
-	}
-
-	private static InMemoryTransport silent() {
-		return InMemoryTransport.create(document -> Promise.of(EMPTY));
 	}
 
 	private static byte[] doc(String json) {

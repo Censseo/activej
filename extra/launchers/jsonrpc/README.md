@@ -54,7 +54,9 @@ Precedence: built-in defaults ← `jsonrpc-server.properties` (classpath, option
 | `jsonrpc.tcp.port` | `int` | **empty — disabled** | the framed-TCP listen port. Absent or empty: **no `JsonRpcTcpServer` is constructed and no socket is opened**. Set: the endpoint accepts LF-terminated JSON-RPC documents on that port, with the same dispatcher as the HTTP and WebSocket endpoints. `0` binds an ephemeral port — ask the server where it landed rather than reading the key back |
 | `jsonrpc.maxBodySize` | `MemSize` | `1mb` (`JsonRpcLimits.MAX_BODY_SIZE`) | the servlet-tier body bound; a larger declared `Content-Length` is `413`. A configured value **overrides** the process-wide default |
 | `jsonrpc.emptyResponseCode` | `int` | `204` | status for an empty dispatcher result (a lone notification). Only `200` or `204`; anything else is refused at build |
+| `jsonrpc.maxInFlight` | `int` | `1000` (`JsonRpcDispatcher.MAX_IN_FLIGHT`) | the dispatcher's ceiling on **concurrent service invocations**; at the ceiling a request is answered `-32005 Server busy` and a notification is answered nothing at all. **Per dispatcher** — under the multi-worker launcher each worker gets this ceiling *whole*, so the aggregate system-wide ceiling is `workers × maxInFlight`. Below `1` is refused at build: there is no value that disables the bound, an opt-out is a higher ceiling |
 | `jsonrpc.client.url` | `String` | `http://localhost:8080/` | the target endpoint of `JsonRpcClientModule`'s client (client-side wiring only, unused by the server launchers) |
+| `jsonrpc.callTimeout` | `Duration` | `30 seconds` (`JsonRpcClient.CALL_TIMEOUT`) | the per-call deadline of `JsonRpcClientModule`'s client (client-side wiring only). `0 seconds` disables it; a negative value fails wiring. ⚠ a `Duration` needs the space and a long-form unit — `250 millis` parses, `250ms` does not |
 
 ### Keys inherited unchanged
 
@@ -74,8 +76,12 @@ unconsumed keys `##` in the effective-config dump and does not fail, so the laun
 |---|---|
 | `jsonrpc.maxBatchSize` | `-DJsonRpcLimits.maxBatchSize=<n>` (process-wide, default `100`) |
 | `jsonrpc.maxJsonDepth` | `-DJsonRpcLimits.maxJsonDepth=<n>` (process-wide, default `64`) |
-| `jsonrpc.callTimeout` | not yet available — feature 09 owns it; `http.readWriteTimeout` bounds a stalled request meanwhile |
-| `jsonrpc.maxInFlight` | not yet available — feature 09 owns it |
+
+⚠ This table had **four** rows until feature 019. `jsonrpc.callTimeout` and `jsonrpc.maxInFlight` were
+reserved as fail-closed non-keys because no per-instance seam existed; `JsonRpcClient.Builder.withCallTimeout`
+and `JsonRpcDispatcher.Builder.withMaxInFlight` are those seams, so both are now **real keys** and are listed
+above. The two that remain are genuinely process-wide: `JsonRpcDecoder` reads the `JsonRpcLimits` statics
+directly and there is nothing per-instance to configure.
 
 Every other key under `jsonrpc.ws.*` — anything but `jsonrpc.ws.path` — is **also** rejected at
 startup, naming the key: the WebSocket surface admits exactly that one key
@@ -93,11 +99,14 @@ Example rejection message:
 ```
 Configuration key 'jsonrpc.maxBatchSize' is not supported: the batch bound is process-wide and is
 read directly by JsonRpcDecoder. Set -DJsonRpcLimits.maxBatchSize=<n> instead.
-(A per-instance override is owned by feature 09.)
+(There is no per-instance override: the bound is process-wide by design.)
 ```
 
 The effective process-wide values of both bounds are published read-only on the dispatcher MBean
-(`maxBatchSize`, `maxJsonDepth`), so an operator can always see what is in force.
+(`maxBatchSize`, `maxJsonDepth`), so an operator can always see what is in force. Since feature 019 the
+same MBean also publishes `maxInFlight` (this dispatcher's configured ceiling — **per dispatcher**, not
+process-wide, unlike its two neighbors), the live `inFlight` gauge, and the cumulative `rejectedRequests`
+counter.
 
 The full key surface is defined normatively in the feature contract `contracts/config-keys.md`.
 

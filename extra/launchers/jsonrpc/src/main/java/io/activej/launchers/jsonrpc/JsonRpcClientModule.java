@@ -27,6 +27,8 @@ import io.activej.jsonrpc.transport.http.JsonRpcHttpClientTransport;
 import io.activej.reactor.nio.NioReactor;
 import io.activej.service.ServiceGraphModuleSettings;
 
+import static io.activej.config.converter.ConfigConverters.ofDuration;
+
 /**
  * Client-side wiring, <b>separate</b> from {@link JsonRpcModule} (FR-010a): a server-only application
  * never acquires a client binding, and the client's {@link JsonRpcClientServiceAdapter} registers only
@@ -38,6 +40,13 @@ import io.activej.service.ServiceGraphModuleSettings;
  * <p>
  * The target endpoint is configured with {@code jsonrpc.client.url} (default
  * {@code http://localhost:8080/}, matching the launcher's server default).
+ * <p>
+ * {@code jsonrpc.callTimeout} is this module's <b>second</b> key (feature 019, FR-021). Feature 014 reserved
+ * it as a fail-closed non-key because no per-instance seam existed; {@link JsonRpcClient.Builder} now has
+ * one, so the reservation is spent and the key is read here. Absent, {@link JsonRpcClient#CALL_TIMEOUT}
+ * stands (30 s); {@code 0 seconds} disables the deadline; a negative value fails wiring naming the setting.
+ * ⚠ It is a {@code Duration}, so it needs the space and a long-form unit — {@code 250 millis} parses,
+ * {@code 250ms} does not.
  */
 public final class JsonRpcClientModule extends AbstractModule {
 	@Provides
@@ -47,8 +56,12 @@ public final class JsonRpcClientModule extends AbstractModule {
 	}
 
 	@Provides
-	JsonRpcClient client(NioReactor reactor, JsonRpcHttpClientTransport transport) {
-		return JsonRpcClient.builder(reactor, transport).build();
+	JsonRpcClient client(NioReactor reactor, JsonRpcHttpClientTransport transport, Config config) {
+		// FR-021: the ApplicationSettings value is the default; a configured key overrides it per client,
+		// exactly as jsonrpc.maxBodySize overrides JsonRpcLimits.MAX_BODY_SIZE on the server side
+		return JsonRpcClient.builder(reactor, transport)
+			.withCallTimeout(config.getChild("jsonrpc").get(ofDuration(), "callTimeout", JsonRpcClient.CALL_TIMEOUT))
+			.build();
 	}
 
 	@ProvidesIntoSet

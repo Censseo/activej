@@ -19,10 +19,13 @@ package io.activej.jsonrpc.transport.http.fixtures;
 import io.activej.eventloop.Eventloop;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
 import java.util.concurrent.TimeUnit;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
@@ -138,6 +141,90 @@ public final class JsonRpcHttpRawExchange {
 			}
 		}
 	}
+
+	/**
+	 * The <b>during-accumulation</b> proof (FR-030): writes {@code head}, then pushes {@code block}
+	 * over and over — up to {@code attempt} bytes — and reports how many bytes the server was still
+	 * willing to take before it cut the connection. A server that bounded the body <i>during</i>
+	 * accumulation stops reading after roughly its own bound and closes; a server that buffered the
+	 * whole announced body first would keep consuming until all {@code attempt} bytes were in.
+	 * <p>
+	 * Non-blocking {@link SocketChannel} on purpose, not the blocking {@link Socket} the two helpers
+	 * above use: a blocking {@code write} has <b>no</b> timeout ({@code SO_TIMEOUT} bounds reads only),
+	 * so a server that stopped reading without closing would hang the suite instead of failing it —
+	 * the worst diagnostic there is (ADR-040's lesson, applied to the peer side). Every loop here is
+	 * bounded by a wall-clock deadline as well as by {@code attempt}, so the failure mode is a red
+	 * test with a byte count, never a hang.
+	 * <p>
+	 * Whatever the server sent back is returned too, but it is <b>not</b> guaranteed to survive: once
+	 * the peer has closed and we write again, the RST that comes back discards the receive buffer. The
+	 * wire form of the refusal is pinned by the exchange-based cases; this helper's assertion subject
+	 * is {@link Flood#written()}.
+	 */
+	public static Flood flood(Eventloop eventloop, JsonRpcHttpTestServer server, String head, byte[] block, long attempt)
+		throws Exception {
+		Thread eventloopThread = new Thread(eventloop);
+		eventloopThread.start();
+		try {
+			return flood(server.address(), head.getBytes(US_ASCII), block, attempt);
+		} finally {
+			try {
+				server.closeFuture().get(10, TimeUnit.SECONDS);
+			} finally {
+				eventloopThread.join(10_000);
+				if (eventloopThread.isAlive()) {
+					throw new IllegalStateException("the eventloop thread did not stop: a test left it running");
+				}
+			}
+		}
+	}
+
+	/** The bytes a {@link #flood} peer managed to push, and whether the server cut it off. */
+	public record Flood(long written, boolean refused, String received) {}
+
+	private static Flood flood(InetSocketAddress address, byte[] head, byte[] block, long attempt) throws IOException {
+		long deadline = System.currentTimeMillis() + FLOOD_DEADLINE_MILLIS;
+		ByteArrayOutputStream received = new ByteArrayOutputStream();
+		long written = 0;
+		try (SocketChannel channel = SocketChannel.open()) {
+			channel.connect(address);
+			channel.configureBlocking(false);
+			ByteBuffer headBuf = ByteBuffer.wrap(head);
+			ByteBuffer sink = ByteBuffer.allocate(4096);
+			ByteBuffer out = ByteBuffer.wrap(block);
+			while (headBuf.hasRemaining() && System.currentTimeMillis() < deadline) {
+				if (channel.write(headBuf) == 0) Thread.onSpinWait();
+			}
+			if (headBuf.hasRemaining()) {
+				throw new IOException("flood's own " + FLOOD_DEADLINE_MILLIS + "ms deadline expired before " +
+									   "the head was fully written -- the block-write loop below never started");
+			}
+			while (written < attempt && System.currentTimeMillis() < deadline) {
+				sink.clear();
+				int read = channel.read(sink);
+				if (read > 0) received.write(sink.array(), 0, read);
+				if (read == -1) return new Flood(written, true, received.toString(US_ASCII));
+				out.rewind();
+				int wrote = channel.write(out);
+				written += wrote;
+				if (wrote == 0 && read == 0) {
+					try {
+						Thread.sleep(1);
+					} catch (InterruptedException e) {
+						Thread.currentThread().interrupt();
+						throw new IOException(e);
+					}
+				}
+			}
+			return new Flood(written, false, received.toString(US_ASCII));
+		} catch (IOException e) {
+			// the peer closed and RST our next write: a refusal, observed from the other end
+			return new Flood(written, true, received.toString(US_ASCII));
+		}
+	}
+
+	/** Wall-clock bound on {@link #flood} — its failure mode must be a red test, never a hung suite. */
+	private static final long FLOOD_DEADLINE_MILLIS = 30_000;
 
 	/** A minimal HTTP/1.1 POST to the server root with an explicit {@code Content-Length} and {@code Connection: close}. */
 	public static String post(String body, String contentType) {

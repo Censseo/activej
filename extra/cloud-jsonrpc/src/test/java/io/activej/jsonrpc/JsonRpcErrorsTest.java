@@ -56,6 +56,44 @@ public class JsonRpcErrorsTest {
 		assertError(-32004, "Invalid response", JsonRpcErrors.INVALID_RESPONSE);
 	}
 
+	/**
+	 * T002 / FR-034 — the <b>fifth</b> implementation-defined code, allocated by feature
+	 * {@code 019-jsonrpc-robustness-ci} for the dispatcher's in-flight bound. It has exactly the same
+	 * published-contract status as the four above, so its code, its message and the absence of a {@code data}
+	 * member are asserted literally rather than derived: changing any of the three is a breaking wire change
+	 * (contracts/settings-and-errors.md §3).
+	 */
+	@Test
+	public void theFifthAllocatedCodeIsServerBusy() {
+		assertError(-32005, "Server busy", JsonRpcErrors.SERVER_BUSY);
+		assertTrue("-32005 carries no data", JsonRpcErrors.SERVER_BUSY.data().isAbsent());
+		assertTrue("-32005 must be reserved", JsonRpcErrors.isReserved(-32005));
+		assertTrue("-32005 must sit in the implementation-defined server-error sub-range -32099 … -32000",
+			JsonRpcErrors.isServerError(-32005));
+		assertEquals(JsonRpcErrors.SERVER_BUSY, JsonRpcErrors.ofAny(-32005, "Server busy", JsonRpcPayload.absent()));
+	}
+
+	@Test
+	public void serverBusyDoesNotCollideWithAnyEarlierAllocatedCode() {
+		for (JsonRpcError error : nine()) {
+			assertNotEquals("-32005 collides with an already-allocated code",
+				error.code(), JsonRpcErrors.SERVER_BUSY.code());
+		}
+	}
+
+	/**
+	 * {@link JsonRpcErrors#named()} is the <b>closed key set of a per-method error breakdown</b>, and
+	 * {@code -32005} is deliberately not a member of it: an in-flight rejection never reached a handler, so it
+	 * carries no wire name and takes no {@code methodStats} row — it is counted by the aggregate
+	 * {@code rejectedRequests} attribute instead (contracts/jmx-attributes.md §Deliberate non-additions).
+	 * Adding it here would silently widen every existing {@code errorsByCode} table from nine keys to ten.
+	 */
+	@Test
+	public void serverBusyIsNotAPerMethodErrorBreakdownKey() {
+		assertEquals(9, JsonRpcErrors.named().size());
+		assertFalse(JsonRpcErrors.named().contains(JsonRpcErrors.SERVER_BUSY));
+	}
+
 	@Test
 	public void allNineLiveInsideTheReservedRangeAndCarryNoData() {
 		for (JsonRpcError error : nine()) {
@@ -137,7 +175,7 @@ public class JsonRpcErrorsTest {
 
 	@Test
 	public void ofRejectsEveryCodeInTheReservedRange() {
-		for (int code : new int[]{-32768, -32700, -32603, -32600, -32100, -32099, -32004, -32001, -32000}) {
+		for (int code : new int[]{-32768, -32700, -32603, -32600, -32100, -32099, -32005, -32004, -32001, -32000}) {
 			IllegalArgumentException e = assertThrows("code " + code + " must be refused",
 				IllegalArgumentException.class, () -> JsonRpcErrors.of(code, "mine"));
 			assertTrue("the refusal must name the reserved range, got: " + e.getMessage(),

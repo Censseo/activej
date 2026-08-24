@@ -16,8 +16,11 @@
 
 package io.activej.jsonrpc.transport.http;
 
+import io.activej.common.MemSize;
 import io.activej.eventloop.Eventloop;
+import io.activej.http.AsyncServlet;
 import io.activej.jsonrpc.service.JsonRpcDispatcher;
+import io.activej.jsonrpc.transport.http.fixtures.JsonRpcHttpRawExchange.Flood;
 import io.activej.jsonrpc.transport.http.fixtures.JsonRpcHttpTestServer;
 import io.activej.jsonrpc.transport.http.fixtures.TestApi;
 import io.activej.jsonrpc.transport.http.fixtures.TestApiImpl;
@@ -35,6 +38,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static io.activej.jsonrpc.transport.http.fixtures.JsonRpcHttpRawExchange.exchange;
 import static io.activej.jsonrpc.transport.http.fixtures.JsonRpcHttpRawExchange.exchangeHead;
+import static io.activej.jsonrpc.transport.http.fixtures.JsonRpcHttpRawExchange.flood;
 import static io.activej.jsonrpc.transport.http.fixtures.JsonRpcHttpRawExchange.splitHeadAndBody;
 import static io.activej.promise.TestUtils.await;
 import static java.nio.charset.StandardCharsets.US_ASCII;
@@ -58,6 +62,12 @@ import static org.junit.Assert.assertTrue;
  *     before appending a chunk, so an accumulator reaching exactly {@code max} completes, and the
  *     servlet's up-front comparison is strict {@code >}, case 4 (plan decision D2).</li>
  * </ul>
+ * <b>Extended by feature 019 (T037)</b> with FR-030's own property — <i>a body announced or streamed
+ * beyond the bound never grows memory to that size, because the bound is applied <b>during</b>
+ * accumulation</i> — which the four cases above pin the <i>outcome</i> of but not the <i>property</i>:
+ * at 2 MB announced and 1.1 MB streamed, "capped early" and "buffered it all, then complained" produce
+ * the same wire bytes. The two added cases separate them, one per way of announcing a size.
+ * <p>
  * The ledger: case 1 was red (a {@code SocketTimeoutException} — the pre-T030 servlet calls
  * {@code loadBody} and waits for a body that never comes) until T030; case 2's original 400
  * expectation described the pre-T030 servlet and is superseded (see the case's javadoc — with the
@@ -222,6 +232,105 @@ public final class JsonRpcServlet413Test {
 			headAndBody[0].startsWith("HTTP/1.1 200 OK"));
 		assertEquals("the body must be the dispatcher's bytes, unaltered: " + response,
 			new String(expected, US_ASCII), headAndBody[1]);
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// FR-030 — the bound is applied DURING accumulation: neither an announced nor a streamed body
+	// beyond it ever grows memory to the size it claimed. Two halves, one per way of announcing.
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * FR-030, the <b>announced</b> half. The four cases above prove the {@code 413}; none of them
+	 * proves that nothing of the announced size was ever held, because 2 MB is a size a test JVM would
+	 * absorb without complaint either way. This one announces {@code 99,000,000} bytes — under the
+	 * connection tier's {@code 100mb}, so it is unambiguously row 3's and not the connection's — and
+	 * sends <b>zero</b> body bytes. The refusal still arrives, promptly, from inside the servlet
+	 * ({@code served == 1}): the decision was taken from the header alone, so the announced size was
+	 * never allocated, never accumulated and never even transmitted.
+	 * <p>
+	 * The proof is structural rather than statistical: a servlet that sized a buffer from the declared
+	 * length, or waited for the body before deciding, cannot answer here at all — {@code exchangeHead}
+	 * would time out against a body that is never coming, exactly as it did before T030 landed.
+	 */
+	@Test
+	public void aHugeDeclaredContentLengthIsRefusedWithoutEverReceivingIt() throws Exception {
+		AtomicInteger served = new AtomicInteger();
+		String head = exchangeHead(eventloop, listen(served),
+			"POST / HTTP/1.1\r\n" +
+				"Host: localhost\r\n" +
+				"Content-Type: application/json\r\n" +
+				"Content-Length: 99000000\r\n" +
+				"Connection: close\r\n" +
+				"\r\n");
+
+		String[] headAndBody = splitHeadAndBody(head);
+		assertTrue("99 MB announced, zero bytes sent, and still answered: " + head,
+			headAndBody[0].startsWith("HTTP/1.1 413 Payload Too Large"));
+		assertEquals("a 413 must carry no body: " + head, "", headAndBody[1]);
+		assertEquals("the servlet answered from the header alone (only it writes 413)", 1, served.get());
+	}
+
+	/**
+	 * FR-030, the <b>streamed</b> half — the case with no declared length for row 3 to refuse, where
+	 * the bound has to hold <i>while</i> the bytes arrive. Cases 3 above and
+	 * {@code JsonRpcServletBufferTest}'s path 4 both hand the whole oversized body to the socket and
+	 * then assert on the answer, which pins the connection tier's {@code 400} but says nothing about
+	 * when the accumulation stopped: with 1.1 MB and 33 kB bodies, "capped at 1 kB" and "buffered it
+	 * all, then complained" are observationally identical.
+	 * <p>
+	 * So this inverts the shape: a 1 kB-bound servlet, a chunked body with <b>no</b> declared length,
+	 * and a peer that keeps pushing 16 kB chunks until the server stops taking them —
+	 * {@value #FLOOD_ATTEMPT} bytes on offer. The assertion is the byte count the peer got away with.
+	 * A server that accumulated first would consume all 64 MB before answering; this one cuts the
+	 * connection after a small multiple of its own bound, so what it held can never have approached
+	 * what was streamed.
+	 * <p>
+	 * The threshold is deliberately loose ({@value #FLOOD_CEILING} — an eighth of the offer): the
+	 * exact figure includes both kernels' socket buffers, which are tuned by the host and are not this
+	 * module's to predict. What is being pinned is the order of magnitude, and the two candidate
+	 * behaviours are three orders apart.
+	 */
+	@Test
+	public void aStreamedBodyFarBeyondTheBoundIsCutOffDuringAccumulation() throws Exception {
+		JsonRpcServlet smallBound = JsonRpcServlet.builder(eventloop, dispatcher)
+			.withMaxBodySize(MemSize.kilobytes(1))
+			.build();
+		byte[] chunk = ("4000\r\n" + "x".repeat(16_384) + "\r\n").getBytes(US_ASCII);
+
+		Flood flood = flood(eventloop, listen(smallBound),
+			"POST / HTTP/1.1\r\n" +
+				"Host: localhost\r\n" +
+				"Content-Type: application/json\r\n" +
+				"Transfer-Encoding: chunked\r\n" +
+				"Connection: close\r\n" +
+				"\r\n",
+			chunk, FLOOD_ATTEMPT);
+
+		assertTrue("the server must cut the connection, not keep taking bytes: " + flood, flood.refused());
+		assertTrue("the bound is applied during accumulation: " + FLOOD_ATTEMPT + " bytes were offered " +
+				   "against a 1 kB bound and the server took " + flood.written(),
+			flood.written() < FLOOD_CEILING);
+	}
+
+	/** What the FR-030 flood offers: 256 MB against a 1 kB bound — 262,144× the bound. */
+	private static final long FLOOD_ATTEMPT = 256L * 1024 * 1024;
+
+	/**
+	 * The byte count above which the flood would mean "it accumulated first". An eighth of the offer.
+	 * Measured here: the peer gets ≈2.7 MB away before the connection is cut, essentially all of it
+	 * sitting in the two kernels' socket buffers rather than in the server — so the ceiling clears the
+	 * observed figure by more than a factor of ten, which is the margin the host's socket-buffer
+	 * autotuning needs. The two candidate behaviours are "a few MB" and "all 256 MB".
+	 */
+	private static final long FLOOD_CEILING = FLOOD_ATTEMPT / 8;
+
+	/** Builds a server over an arbitrary servlet — the small-bound variants of the FR-030 cases. */
+	private JsonRpcHttpTestServer listen(AsyncServlet servlet) throws IOException {
+		JsonRpcHttpTestServer server = JsonRpcHttpTestServer.builder(eventloop)
+			.withServlet(servlet)
+			.build();
+		server.listen();
+		return server;
 	}
 
 	/** A bodyless response carries no {@code Content-Type} line (FR-017's rule, applied to the 413). */

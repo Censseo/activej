@@ -26,20 +26,34 @@ import org.jetbrains.annotations.Nullable;
 import java.util.Objects;
 
 /**
- * One call awaiting its answer: the value of {@code JsonRpcClient}'s correlation table, and — deliberately —
- * the holder of any future deadline (FR-067).
+ * One call awaiting its answer: the value of {@code JsonRpcClient}'s correlation table, and the holder of its
+ * per-call deadline.
  *
  * <h2>One object, not two (ADR-030, detail 1)</h2>
  * {@code cloud-rpc}'s {@code RpcClientConnection} keeps a {@code ScheduledCallback} that <b>is</b> both the
  * map value and the scheduled timeout, so disarming a deadline when the answer arrives is a field access
  * rather than a second lookup in a second structure. That shape is copied here; none of its code is (verdict
  * 00-C).
+ * <p>
+ * The slot that shape reserved is now live. Feature 012 declared {@link #deadline} and never wrote it, so
+ * that the per-call timeout would later add a <b>mechanism</b> and not a <b>data structure</b>; feature 019
+ * added exactly that mechanism, and nothing else here changed.
  *
- * <h2>{@link #deadline} is reserved and stays {@code null}</h2>
- * This feature never writes {@link #deadline}. It exists so that the per-call timeout of a later feature adds
- * a <b>mechanism</b> — schedule on registration, cancel in the removal path — and not a <b>data structure</b>:
- * changing the table's value type later would touch every call site that this feature is deliberately keeping
- * to one. A reader who finds the field always {@code null} has found the intended state, not dead code.
+ * <h2>The arm/disarm contract (FR-010, FR-011, FR-014)</h2>
+ * <ul>
+ *     <li><b>Armed</b> by {@code JsonRpcClient} at registration — after the entry is in the table and
+ *     <b>before</b> the document reaches the transport, so a transport that answers inside {@code send()}
+ *     finds a fully-formed entry. Scheduled with {@code scheduleBackground}, so a pending call never keeps
+ *     an eventloop alive.</li>
+ *     <li><b>{@code null} when the timeout is disabled</b> ({@code callTimeout} of {@link
+ *     java.time.Duration#ZERO}), and only then. A {@code null} here is "no deadline was ever armed", never
+ *     "a deadline was armed and forgotten".</li>
+ *     <li><b>Disarmed exactly once</b>, inside the client's single private {@code remove(id)} — so a nominal
+ *     answer, a remote error, a {@code -32004}, a send failure, a local close, a peer close <i>and</i> the
+ *     expiry itself all disarm through the same statement. Cancelling a task that is currently running is a
+ *     no-op by construction: the scheduler clears the queue reference before invoking it.</li>
+ * </ul>
+ * Nothing outside {@code JsonRpcClient} writes this field, and nothing at all reads it except that disarm.
  *
  * <h2>Removal precedes completion, and precedes decoding (FR-068, FR-069)</h2>
  * A {@code PendingCall} leaves the table through exactly one private {@code remove(id)} on the client, and it
@@ -68,8 +82,10 @@ public final class PendingCall {
 	public final @Nullable JsonCodec<?> resultCodec;
 
 	/**
-	 * Reserved for a later feature's per-call deadline. <b>Always {@code null} in this feature</b> — see the
-	 * class documentation; nothing reads it and nothing writes it.
+	 * This call's per-call deadline: armed at registration and cancelled inside the client's single
+	 * {@code remove(id)}, or {@code null} when the client's {@code callTimeout} is
+	 * {@link java.time.Duration#ZERO} and the timeout is therefore disabled. See the class documentation for
+	 * the full arm/disarm contract; nothing outside {@code JsonRpcClient} touches it.
 	 */
 	public @Nullable ScheduledRunnable deadline;
 

@@ -23,9 +23,14 @@ import io.activej.inject.module.Module;
 import io.activej.launcher.Launcher;
 import io.activej.launchers.jsonrpc.fixtures.UserApi;
 import io.activej.launchers.jsonrpc.fixtures.UserApiImpl;
+import io.activej.test.rules.ActivePromisesRule;
+import io.activej.test.rules.ByteBufRule;
+import io.activej.test.rules.EventloopRule;
 import org.junit.After;
+import org.junit.ClassRule;
 import org.junit.Test;
 
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -34,12 +39,31 @@ import static org.junit.Assert.assertTrue;
  * the rejected key and the controlling {@code ApplicationSettings} property — {@code ConfigModule}
  * reports unconsumed keys as {@code ##} in the dump but never fails, so the launcher's own check in
  * {@code onStart()} is what an operator's mistake hits.
+ * <p>
+ * ⚠ <b>The reserved set shrank twice in feature 019</b>, and is now <b>two</b> keys. {@code jsonrpc.callTimeout}
+ * was admitted first (FR-021) and belongs to {@link JsonRpcClientModule}; {@code jsonrpc.maxInFlight} followed
+ * (FR-039) once {@code JsonRpcDispatcher.Builder.withMaxInFlight} gave the bound a per-instance seam, and is
+ * read by the server launchers themselves. {@code jsonrpc.maxBatchSize} and {@code jsonrpc.maxJsonDepth} keep
+ * failing exactly as before — those two are still read straight off the {@code JsonRpcLimits} statics with no
+ * per-instance seam at all. The still-rejected cases are asserted here beside the admitted ones, so that
+ * widening the admission by accident is a red test rather than a silent security downgrade.
  */
 public class JsonRpcServerLauncherConfigRejectionTest {
+	// the two admitted-key cases actually start and stop a launcher, and LauncherTestHarness.stop awaits
+	// the complete future on the current reactor — the two rejection cases never reach one
+	@ClassRule
+	public static final EventloopRule eventloopRule = new EventloopRule();
+	@ClassRule
+	public static final ByteBufRule byteBufRule = new ByteBufRule();
+	@ClassRule
+	public static final ActivePromisesRule activePromisesRule = new ActivePromisesRule();
+
 	@After
 	public void tearDown() {
 		System.clearProperty("config.jsonrpc.maxBatchSize");
 		System.clearProperty("config.jsonrpc.maxJsonDepth");
+		System.clearProperty("config.jsonrpc.maxInFlight");
+		System.clearProperty("config.jsonrpc.callTimeout");
 	}
 
 	@Test
@@ -105,5 +129,59 @@ public class JsonRpcServerLauncherConfigRejectionTest {
 			() -> launcher.launch(Launcher.NO_ARGS));
 		assertTrue(e.getMessage().contains("jsonrpc.maxJsonDepth"));
 		assertTrue(e.getMessage().contains("-DJsonRpcLimits.maxJsonDepth"));
+	}
+
+	@Test
+	public void maxInFlightKeyIsNoLongerRejected() throws Exception {
+		// FR-039: the second reservation feature 014 placed is spent too. JsonRpcDispatcher.Builder now has
+		// withMaxInFlight, so this launcher reads the key instead of refusing it — and unlike callTimeout,
+		// which a server-only deployment merely ignores, this one is consumed right here
+		System.setProperty("config.jsonrpc.maxInFlight", "10");
+
+		JsonRpcServerLauncher launcher = launcher();
+		LauncherTestHarness.launch(launcher);
+		try {
+			assertNotNull("the launcher started with the key present", launcher.getStartFuture());
+		} finally {
+			LauncherTestHarness.stop(launcher);
+		}
+	}
+
+	@Test
+	public void callTimeoutKeyIsNoLongerRejected() throws Exception {
+		// FR-021: the reservation feature 014 placed on this key is spent. It is now the client module's,
+		// so a server-only launcher simply does not consume it — what must not happen is a startup failure
+		System.setProperty("config.jsonrpc.callTimeout", "5 seconds");
+
+		JsonRpcServerLauncher launcher = launcher();
+		LauncherTestHarness.launch(launcher);
+		try {
+			assertNotNull("the launcher started with the key present", launcher.getStartFuture());
+		} finally {
+			LauncherTestHarness.stop(launcher);
+		}
+	}
+
+	private static JsonRpcServerLauncher launcher() {
+		return new JsonRpcServerLauncher() {
+			@Override
+			protected Module getBusinessLogicModule() {
+				return new AbstractModule() {
+					@ProvidesIntoSet
+					JsonRpcServiceBinding userApi() {
+						return new JsonRpcServiceBinding(UserApi.class, new UserApiImpl());
+					}
+				};
+			}
+
+			@Override
+			Config config() {
+				// :0 keeps the test off the 8080 default — same rationale as the two cases above
+				return super.config().overrideWith(Config.create().with("http.listenAddresses", "0"));
+			}
+
+			@Override
+			protected void onFatalError(Throwable throwable) {}
+		};
 	}
 }

@@ -16,6 +16,7 @@
 
 package io.activej.jsonrpc.service;
 
+import io.activej.common.ApplicationSettings;
 import io.activej.common.builder.AbstractBuilder;
 import io.activej.common.inspector.AbstractInspector;
 import io.activej.common.inspector.BaseInspector;
@@ -65,6 +66,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.function.BiConsumer;
 
+import static io.activej.common.Checks.checkArgument;
 import static io.activej.reactor.Reactive.checkInReactorThread;
 import static java.nio.charset.StandardCharsets.US_ASCII;
 
@@ -115,7 +117,26 @@ import static java.nio.charset.StandardCharsets.US_ASCII;
  *         <td><b>no</b> — the dispatcher owns it</td></tr>
  *     <tr><td>{@code rpc.discover}, discovery disabled</td><td>{@code -32601}, like any unknown name</td>
  *         <td><b>no</b></td></tr>
+ *     <tr><td>request, at the in-flight bound</td><td>{@code -32005 Server busy}</td><td><b>no</b></td></tr>
+ *     <tr><td>notification, at the in-flight bound</td><td><b>nothing</b></td><td><b>no</b></td></tr>
  * </table>
+ *
+ * <h2>The in-flight bound (FR-033…FR-036)</h2>
+ * A batch bounds how many <i>elements</i> arrive at once; it bounds no <i>work</i> at all, because every
+ * element is dispatched concurrently. {@link #MAX_IN_FLIGHT} closes that gap: a reactor-confined counter of
+ * service invocations that have started and not yet completed, and at the ceiling further elements are
+ * <b>shed</b> rather than queued — a request answers {@code -32005 Server busy}, a notification answers
+ * nothing at all, and neither reaches an implementation. Rejection is <b>per element and in document
+ * order</b>, so the part of a batch that fits proceeds exactly as it would have alone.
+ * <p>
+ * The counter brackets the <b>invocation</b> only. An unknown name ({@code -32601}), {@code params} that
+ * fail to decode ({@code -32602}) and a malformed element never reach a handler, so they neither consume a
+ * slot nor can be shed by the bound; and every invocation decrements on completion, <b>failure included</b>,
+ * or the ceiling would ratchet upwards until nothing was ever admitted again.
+ * <p>
+ * This is a counter, not a registry: no per-call state is retained, nothing is cancelled and there is still
+ * no {@code close()} (FR-057a). The bound is <b>per dispatcher</b>, which under a worker pool means per
+ * reactor — the correct granularity, since what it protects is one reactor's own queue.
  *
  * <h2>{@code rpc.discover} is a table entry, not a special case (FR-030)</h2>
  * {@link Builder#withDiscovery(OpenRpcInfo)} makes {@code doBuild()} generate the OpenRPC document once and
@@ -135,6 +156,18 @@ import static java.nio.charset.StandardCharsets.US_ASCII;
  * <b>same array</b> the table entry answers with, so the two cannot drift.
  */
 public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpcPeerHandler, ReactiveJmxBean {
+	/**
+	 * The concurrent-invocation ceiling every dispatcher starts with — {@code 1000}, overridable process-wide
+	 * with {@code -DJsonRpcDispatcher.maxInFlight=...} (or the fully qualified spelling) and per dispatcher
+	 * with {@link Builder#withMaxInFlight(int)}.
+	 * <p>
+	 * An order of magnitude above {@code JsonRpcLimits.MAX_BATCH_SIZE} (100), so a full legitimate batch is
+	 * never shed by the default, and far below any reactor-queue comfort zone under hostile fan-out. There is
+	 * no "off" value: a consumer opts out by raising the bound, never by disabling it (constitution III), and
+	 * anything below {@code 1} is refused at {@code build()}.
+	 */
+	public static final int MAX_IN_FLIGHT = ApplicationSettings.getInt(JsonRpcDispatcher.class, "maxInFlight", 1000);
+
 	/** The wire rendering of a {@code Promise<Void>} result: the JSON literal {@code null} (FR-030). */
 	private static final byte[] NULL_LITERAL = "null".getBytes(US_ASCII);
 
@@ -144,6 +177,14 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 	@Nullable Inspector inspector;
 	private Map<String, Handler> handlers = Map.of();
 	private Set<String> wireNames = Set.of();
+	/** Immutable after {@code build()}, which is also where {@code < 1} is refused. */
+	private int maxInFlight = MAX_IN_FLIGHT;
+	/**
+	 * Service invocations started and not yet completed. Reactor-confined, so a plain {@code int} is the
+	 * honest type — every mutation happens on the dispatcher's own thread, behind the reactor-thread guard
+	 * that opens both {@code dispatch} entry points.
+	 */
+	private int inFlight;
 	/** The array {@link #DISCOVER}'s table entry answers with, or {@code null} when discovery is off. */
 	private byte @Nullable [] discoveryDocument;
 	private BiConsumer<JsonRpcMethodDescriptor, Exception> failureHandler;
@@ -188,6 +229,21 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		void onMalformed();
 
 		/**
+		 * <b>Aggregate-only.</b> One element was shed at the in-flight bound — a request answered
+		 * {@code -32005 Server busy}, or a notification answered nothing at all (FR-034, FR-035).
+		 * <p>
+		 * There is deliberately no argument: a shed element never reached a handler, so it has no
+		 * {@link JsonRpcMethodDescriptor}, and the wire name it carried must not become a key (FR-034 —
+		 * the same rule that makes {@link #onMethodNotFound(String)} aggregate-only). Requests and
+		 * notifications fold into one count, because "how much was shed" is one question.
+		 * <p>
+		 * A {@code default} no-op, like {@link #initialize(Set)}: this callback was added after the seam
+		 * shipped, and an existing {@link Inspector} that does not know about it must keep compiling and
+		 * keep working. An implementation that wants the count overrides it.
+		 */
+		default void onRejected() {}
+
+		/**
 		 * The lifecycle hook the dispatcher's {@code doBuild()} calls exactly once, when the handler table
 		 * is frozen, with the <b>closed</b> registered wire-name set (FR-034 — it can never grow from the
 		 * wire). A default no-op, so a logging or tracing inspector needs no implementation; an inspector
@@ -223,6 +279,19 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		private final EventStats malformedDocuments = EventStats.create(SMOOTHING_WINDOW);
 		private final EventStats totalRequests = EventStats.create(SMOOTHING_WINDOW);
 		private final EventStats totalErrors = EventStats.create(SMOOTHING_WINDOW);
+		private final EventStats rejectedRequests = EventStats.create(SMOOTHING_WINDOW);
+
+		/**
+		 * The dispatcher this inspector was wired into, set once by the same {@code doBuild()} that calls
+		 * {@link #initialize(Set)}. The counters above are <b>events</b> this seam is told about; the two
+		 * in-flight attributes are <b>gauges</b> — a configuration value and a live count — that only the
+		 * dispatcher owns, so they are read through here rather than mirrored and kept in step by hand.
+		 * <p>
+		 * {@code null} only for an inspector no dispatcher ever built with, in which case both gauges read
+		 * {@code 0} — a value {@code maxInFlight} can never legally take, so "not wired" is legible rather
+		 * than plausible.
+		 */
+		private @Nullable JsonRpcDispatcher dispatcher;
 
 		@Override
 		public void onRequest(JsonRpcMethodDescriptor descriptor) {
@@ -262,6 +331,31 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		@Override
 		public void onMalformed() {
 			malformedDocuments.recordEvent();
+		}
+
+		/**
+		 * Aggregate-only, by construction: a shed element never reached a handler, so there is no row to
+		 * attribute it to and no {@code -32005} bucket to fill — {@link JsonRpcErrors#named()} deliberately
+		 * excludes {@code SERVER_BUSY} for exactly this reason. Requests and notifications fold together.
+		 * <p>
+		 * It moves <b>this counter and nothing else</b>: not {@code totalRequests} (no request was ever
+		 * announced), not {@code totalErrors} (no method produced one), and no {@code methodStats} row.
+		 */
+		@Override
+		public void onRejected() {
+			rejectedRequests.recordEvent();
+		}
+
+		/**
+		 * The dispatcher's own hook, called once at {@code build()} beside {@link #initialize(Set)}.
+		 * <p>
+		 * Not itself guarded against a second call: an instance is meant for **one** dispatcher
+		 * (class Javadoc above), and wiring it into a second {@code doBuild()} silently rebinds
+		 * {@link #dispatcher} to the new one — the first dispatcher's gauges would then read through
+		 * an inspector that no longer points at it. Don't reuse an instance across dispatchers.
+		 */
+		private void bindTo(JsonRpcDispatcher dispatcher) {
+			this.dispatcher = dispatcher;
 		}
 
 		/**
@@ -330,6 +424,17 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		}
 
 		/**
+		 * How many elements were shed at the in-flight bound, cumulatively — requests and notifications
+		 * together (FR-038). Summed across workers, like every other {@code EventStats} here: shedding is
+		 * per reactor, and the operator's question is how much was shed in total.
+		 */
+		@JmxAttribute(reducer = JmxReducerSum.class, extraSubAttributes = "totalCount",
+			description = "elements shed at the in-flight bound (-32005), requests and notifications")
+		public EventStats getRejectedRequests() {
+			return rejectedRequests;
+		}
+
+		/**
 		 * The number of registered wire names. Deliberately <b>without</b> a reducer: it is identical on every
 		 * worker, and the platform's default aggregation ({@code JmxReducerDistinct}) reads the single correct
 		 * value — a sum reducer would report {@code workers × methods} on the aggregated bean, exactly like the
@@ -352,6 +457,37 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		@JmxAttribute(description = "effective JsonRpcLimits.MAX_JSON_DEPTH (process-wide, read-only)")
 		public int getMaxJsonDepth() {
 			return JsonRpcLimits.MAX_JSON_DEPTH;
+		}
+
+		/**
+		 * This dispatcher's configured in-flight ceiling — read-only, so an operator can read what is in
+		 * force beside the two envelope limits above (FR-038).
+		 * <p>
+		 * Deliberately <b>without</b> a reducer, exactly like {@link #getMaxBatchSize()}: the value is
+		 * identical on every worker and the platform's default aggregation reads the single correct one. A
+		 * sum would report {@code workers × maxInFlight}, which is the aggregate ceiling — a real number,
+		 * but not the one this attribute names, and {@link #getInFlight()} beside it is what makes the
+		 * per-worker reading the useful one.
+		 */
+		@JmxAttribute(description = "the configured concurrent in-flight ceiling (per dispatcher, read-only)")
+		public int getMaxInFlight() {
+			return dispatcher == null ? 0 : dispatcher.maxInFlight;
+		}
+
+		/**
+		 * Service invocations in progress <b>right now</b> — a gauge, not a counter (FR-038). Summed across
+		 * workers, because concurrent work in a worker pool is what an operator watches against the
+		 * aggregate ceiling.
+		 * <p>
+		 * A JMX read happens on the reading thread rather than on the dispatcher's, so this may observe a
+		 * momentarily stale value — the same property every {@code EventStats} attribute here already has,
+		 * and the reason the counter itself is never <i>written</i> anywhere but the reactor thread. The
+		 * bound is enforced against the field, never against this getter.
+		 */
+		@JmxAttribute(reducer = JmxReducerSum.class,
+			description = "service invocations in progress right now")
+		public int getInFlight() {
+			return dispatcher == null ? 0 : dispatcher.inFlight;
 		}
 
 		@Override
@@ -428,6 +564,26 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		}
 
 		/**
+		 * The ceiling on <b>concurrent service invocations</b> for this dispatcher, overriding
+		 * {@link #MAX_IN_FLIGHT} (FR-033). At the ceiling a request is answered {@code -32005 Server busy}
+		 * and a notification is answered nothing at all — per element, in document order — and neither
+		 * reaches an implementation.
+		 * <p>
+		 * This is not {@code JsonRpcLimits.MAX_BATCH_SIZE}: that one bounds how many elements one document
+		 * may carry, this one bounds how much work may be outstanding at once, across every document and
+		 * every connection this dispatcher serves.
+		 *
+		 * @param maxInFlight at least {@code 1}; validated at {@link #build()}, not here, so a whole
+		 *                    configuration is reported by one failure rather than by the first setter that
+		 *                    happens to run
+		 */
+		public Builder withMaxInFlight(int maxInFlight) {
+			checkNotBuilt(this);
+			JsonRpcDispatcher.this.maxInFlight = maxInFlight;
+			return this;
+		}
+
+		/**
 		 * Installs the observation seam. The inspector's per-method table is pre-populated from the frozen
 		 * {@code wireNames()} inside {@link #doBuild()}; a throwing inspector never breaks a dispatch (FR-040).
 		 */
@@ -474,11 +630,17 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		}
 
 		/**
+		 * @throws IllegalArgumentException if {@code maxInFlight} is below {@code 1} (FR-033)
 		 * @throws JsonRpcContractException if any registered interface breaks the contract, or if two
 		 *                                  interfaces claim the same wire name (FR-036, FR-037)
 		 */
 		@Override
 		protected JsonRpcDispatcher doBuild() {
+			// the cheap configuration check first: a dispatcher that could never admit an invocation is a
+			// misconfiguration, and reporting it costs nothing next to validating every registered contract
+			checkArgument(maxInFlight >= 1,
+				"maxInFlight must be at least 1 (there is no value that disables the bound): %s", maxInFlight);
+
 			Map<String, Handler> built = new LinkedHashMap<>();
 			List<String> collisions = new ArrayList<>();
 			List<JsonRpcServiceContract> contracts = new ArrayList<>(services.size());
@@ -530,6 +692,11 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 			// Called through the Inspector interface (default no-op) so the resolution path matches
 			// getStats()'s BaseInspector.lookup — a composite inspector reached there is reached here too
 			if (inspector != null) inspector.initialize(JsonRpcDispatcher.this.wireNames);
+			// FR-038: the two in-flight attributes are gauges over dispatcher state, so the JmxInspector
+			// getStats() will hand out — resolved through the very same lookup — is given the back-reference
+			// here, once, when everything it may read is final
+			JmxInspector jmx = BaseInspector.lookup(inspector, JmxInspector.class);
+			if (jmx != null) jmx.bindTo(JsonRpcDispatcher.this);
 			return JsonRpcDispatcher.this;
 		}
 	}
@@ -705,6 +872,14 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 			return Promise.of(error(request.id(), JsonRpcErrors.METHOD_NOT_FOUND));
 		}
 
+		// FR-034: shed before decoding the params and before announcing a request that will not happen —
+		// the element was never attempted, which is exactly what -32005 says. Checked on the handler and
+		// not on the wire name, so the dispatcher's own rpc.discover entry is bound like any other (ADR-045)
+		if (inFlight >= maxInFlight) {
+			notifyRejected();
+			return Promise.of(error(request.id(), JsonRpcErrors.SERVER_BUSY));
+		}
+
 		notifyRequest(handler.descriptor);
 
 		Object[] args;
@@ -718,13 +893,18 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		}
 
 		long startNanos = System.nanoTime();
+		// FR-033: the counter brackets the invocation itself — nothing above this line has entered an
+		// implementation, and both branches below decrement, so a failing method frees its slot too
+		inFlight++;
 		return handler.invoke(args)
 			.map(
 				value -> {
+					inFlight--;
 					notifyResponse(handler.descriptor, durationMillis(startNanos));
 					return respond(handler, request.id(), value);
 				},
 				e -> {
+					inFlight--;
 					notifyError(handler.descriptor, codeOf(e), durationMillis(startNanos));
 					return error(request.id(), errorOf(e));
 				});
@@ -735,6 +915,14 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		// §4.1 forbids answering a notification, so an unknown one is dropped rather than turned into -32601
 		if (handler == null) {
 			notifyMethodNotFound(notification.method());
+			return Promise.of(JsonRpcOutput.none());
+		}
+
+		// FR-035: the same bound, and the same aggregate count — but nothing on the wire, because §4.1
+		// forbids answering a notification and being overloaded does not change that. Deliberately NOT the
+		// failure handler either: load shedding is a property of this server, not an application fault
+		if (inFlight >= maxInFlight) {
+			notifyRejected();
 			return Promise.of(JsonRpcOutput.none());
 		}
 
@@ -751,13 +939,17 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		}
 
 		long startNanos = System.nanoTime();
+		// a notification's invocation costs exactly what a request's does, so it counts the same (FR-033)
+		inFlight++;
 		return handler.invoke(args)
 			.map(
 				value -> {
+					inFlight--;
 					notifyResponse(handler.descriptor, durationMillis(startNanos));
 					return JsonRpcOutput.none();
 				},
 				e -> {
+					inFlight--;
 					reportFailure(handler.descriptor, e);
 					notifyError(handler.descriptor, codeOf(e), durationMillis(startNanos));
 					return JsonRpcOutput.none();
@@ -817,6 +1009,15 @@ public final class JsonRpcDispatcher extends AbstractReactive implements JsonRpc
 		if (inspector == null) return;
 		try {
 			inspector.onMalformed();
+		} catch (Throwable ignored) {
+			// an inspector that itself fails must not break totality (FR-040)
+		}
+	}
+
+	private void notifyRejected() {
+		if (inspector == null) return;
+		try {
+			inspector.onRejected();
 		} catch (Throwable ignored) {
 			// an inspector that itself fails must not break totality (FR-040)
 		}

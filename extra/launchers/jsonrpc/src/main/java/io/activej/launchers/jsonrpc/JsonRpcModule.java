@@ -84,7 +84,10 @@ public final class JsonRpcModule extends AbstractModule {
 		Config config
 	) {
 		JsonRpcDispatcher.Builder builder = JsonRpcDispatcher.builder(reactor)
-			.withCodecFactory(codecFactory.orElse(JsonCodecFactory.defaultInstance()));
+			.withCodecFactory(codecFactory.orElse(JsonCodecFactory.defaultInstance()))
+			// FR-039: the ApplicationSettings value is the default; a configured key overrides it per
+			// dispatcher, exactly as jsonrpc.maxBodySize overrides JsonRpcLimits.MAX_BODY_SIZE below
+			.withMaxInFlight(maxInFlight(config.getChild("jsonrpc")));
 		for (JsonRpcServiceBinding binding : bindings.orElse(Set.of())) {
 			@SuppressWarnings("unchecked")
 			Class<Object> serviceType = (Class<Object>) binding.serviceType();
@@ -231,6 +234,26 @@ public final class JsonRpcModule extends AbstractModule {
 	static @Nullable Integer tcpPort(Config jsonrpc) {
 		if (jsonrpc.get("tcp.port", "").isEmpty()) return null;
 		return jsonrpc.get(ofInteger(), "tcp.port");
+	}
+
+	/**
+	 * The dispatcher's concurrent-invocation ceiling, read from the {@code jsonrpc} subtree (FR-039):
+	 * {@link JsonRpcDispatcher#MAX_IN_FLIGHT} when {@code jsonrpc.maxInFlight} is absent, the configured
+	 * value otherwise. Anything below {@code 1} is refused by {@code JsonRpcDispatcher.build()} — there is
+	 * no value that disables the bound, so an opt-out is a higher ceiling and never a switch.
+	 * <p>
+	 * <b>The bound is per dispatcher</b>, and this helper is called once per dispatcher — which under
+	 * {@link MultithreadedJsonRpcServerLauncher} means <b>once per worker</b>, each worker's ceiling being
+	 * the configured value <i>whole</i>. The aggregate, system-wide ceiling is therefore
+	 * {@code workers × maxInFlight}, not the configured value shared out among the workers. That is the
+	 * correct granularity: what the bound protects is one reactor's own queued work, and a worker cannot
+	 * take work off another's queue. It is also why the JMX attribute carries no sum reducer.
+	 * <p>
+	 * Shared with {@link MultithreadedJsonRpcServerLauncher}'s {@code @Worker} dispatcher provider, so the
+	 * two construction sites cannot drift — the same rule as {@link #tcpPort} and {@link #discoveryInfo}.
+	 */
+	static int maxInFlight(Config jsonrpc) {
+		return jsonrpc.get(ofInteger(), "maxInFlight", JsonRpcDispatcher.MAX_IN_FLIGHT);
 	}
 
 	/**

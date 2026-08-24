@@ -2,7 +2,89 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- **JSON-RPC calls now time out.** `JsonRpcClient` (in `extra/cloud-jsonrpc`,
+  `activej-jsonrpc`) applies a per-call deadline of **30 seconds** by default;
+  previously there was none, so a call to a peer that never answered stayed
+  pending for the life of the client. On expiry the correlation entry is
+  reclaimed and the caller's `Promise` fails with `AsyncTimeoutException` naming
+  the wire method and the configured delay. **Nothing goes on the wire**:
+  JSON-RPC 2.0 defines no cancellation message, so an expiry is purely local
+  bookkeeping and the peer's eventual answer arrives for an id that is in no
+  entry — the orphan case, already ignored silently.
+
+  Adjust it per client with
+  `JsonRpcClient.builder(...).withCallTimeout(Duration)`, process-wide with
+  `-Dio.activej.jsonrpc.service.JsonRpcClient.callTimeout=…` (the short
+  `-DJsonRpcClient.callTimeout=…` spelling resolves too), or per deployment with
+  the launcher key `jsonrpc.callTimeout` — new in `extra/launchers/jsonrpc`,
+  where it previously failed startup as a reserved non-key. **`Duration.ZERO`
+  disables the deadline entirely** and restores the previous behavior; a
+  negative value is refused at `build()`.
+
+  ⚠ Two things about the opt-out. The duration format **requires whitespace
+  before the unit**, so it is `callTimeout=0 seconds` (or the ISO `PT0S`) —
+  `0` and `0s` parse as nothing and fail. And `jsonrpc.callTimeout` is read by
+  `JsonRpcClientModule` alone, so on a server-only launcher with no client bound
+  the key is **inert** and reported as unconsumed in the effective config. That
+  is expected rather than a defect — it is the ordinary fate of a client key,
+  not the silent downgrade the fail-closed key check exists to prevent.
+
+- **A JSON-RPC dispatcher now sheds work above a concurrency ceiling.**
+  `JsonRpcDispatcher` bounds the service invocations that have started and not
+  yet completed at **1000** by default; previously the count was unbounded.
+  `maxBatchSize` bounds how many *elements* one document may carry and bounds no
+  *work* at all, since every element is dispatched concurrently — this closes
+  that gap. At the ceiling a request is answered **`-32005 Server busy`** and a
+  notification produces nothing at all; neither reaches an implementation, and
+  both are counted in the dispatcher's `rejectedRequests` aggregate. Rejection
+  is per element and in document order, so the prefix of a batch that fits
+  proceeds exactly as it would have alone. The counter brackets the invocation
+  only, and decrements on failure as well as success.
+
+  `-32005 Server busy` is a **newly allocated code** on `JsonRpcErrors`, inside
+  the `-32099 … -32000` band the specification reserves for
+  implementation-defined errors, beside the existing `-32001 Request too large`,
+  `-32002 Batch too large`, `-32003 Nesting too deep` and `-32004 Invalid
+  response`. It is deliberately **not** a member of `JsonRpcErrors.named()`, so
+  no per-code JMX bucket appeared: a shed element never reached a handler and
+  belongs to no method's row.
+
+  Raise the ceiling per dispatcher with
+  `JsonRpcDispatcher.builder(...).withMaxInFlight(int)`, process-wide with
+  `-Dio.activej.jsonrpc.service.JsonRpcDispatcher.maxInFlight=<n>` (short
+  spelling `-DJsonRpcDispatcher.maxInFlight=<n>`), or per deployment with the
+  launcher key `jsonrpc.maxInFlight` — also new, and also previously rejected.
+  **There is no value that disables this bound**: anything below `1` is refused
+  at `build()`, so a consumer opts out by raising it, never by switching it off.
+  Unlike `jsonrpc.callTimeout` above, this key is consumed by **both**
+  `JsonRpcServerLauncher` and `MultithreadedJsonRpcServerLauncher` and is never
+  inert. Under the multithreaded launcher the bound is **per worker**, since
+  each worker owns its dispatcher — the effective system-wide ceiling is
+  `workers × maxInFlight`. Three read-only JMX attributes were added to
+  `JsonRpcDispatcher.JmxInspector` alongside the existing ones: `maxInFlight`
+  (the configured per-dispatcher value, with **no** summing reducer, so the
+  aggregated bean reports the ceiling and not the multiple), `inFlight` (the
+  current count, summed) and `rejectedRequests` (cumulative, summed).
+
 ### Notable additions
+
+- **CI builds and tests the `extra/` profile, informationally.**
+  [.github/workflows/build.yml](.github/workflows/build.yml) gains a second job,
+  `extra`, running `mvn -B -T1C -P extra verify` on every push and pull request
+  beside the default `build` job. The `extra` profile is `activeByDefault=false`
+  and the default job does not pass it, so nothing under `extra/` — CRDT,
+  dataflow, the LSMT cube, memcache, redis, OT, etcd, JSON and the whole
+  JSON-RPC line — had ever had any CI coverage. The new job is
+  `continue-on-error: true`: **it reports, it does not block.** A full-tree
+  `-P extra` run on `master` fails today for exactly one reason, environmental
+  and foreign to the modules the job exists to cover — `launchers/http`'s
+  `HttpServerLauncherTest.bindNonZeroPort` and its multithreaded twin hardcode
+  port 8080. The promotion criterion is written into the workflow: fix that pair
+  to bind `:0` and read the bound address back, record one green full-tree run,
+  then flip `continue-on-error` to `false` (one line). The default `build` job
+  is unchanged and still does not pass `-P extra`.
 
 - **OpenRPC schema discovery for the JSON-RPC line.** A service can now describe
   itself: a built-in `rpc.discover` method answering an OpenRPC document derived
@@ -198,9 +280,12 @@ Fixes a latent platform defect found while verifying this surface against a real
   seam is additive; the `boot-jmx` fix only removes a startup crash). The new
   launcher's config surface is `jsonrpc.path`, `jsonrpc.maxBodySize`,
   `jsonrpc.emptyResponseCode` plus the inherited `http.*` / `eventloop.*` / `workers`
-  keys; setting `jsonrpc.maxBatchSize`, `jsonrpc.maxJsonDepth`,
-  `jsonrpc.callTimeout` or `jsonrpc.maxInFlight` fails startup loudly rather than
-  being silently ignored.
+  keys; setting `jsonrpc.maxBatchSize` or `jsonrpc.maxJsonDepth` fails startup
+  loudly rather than being silently ignored. (`jsonrpc.callTimeout` and
+  `jsonrpc.maxInFlight` were reserved the same way and are **admitted** in this
+  same unreleased line — see Breaking changes above; the remaining two stay
+  rejected, since `JsonRpcDecoder` reads the `JsonRpcLimits` statics directly and
+  no per-instance seam exists for them.)
 
 - **`JsonCodecFactory` derives a `JsonCodec` for any `record`, and for eleven more
   built-in types.** In `extra/util-json` (`activej-json`, profile-gated behind
