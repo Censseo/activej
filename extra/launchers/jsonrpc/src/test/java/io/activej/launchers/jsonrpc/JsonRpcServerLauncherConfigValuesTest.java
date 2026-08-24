@@ -33,9 +33,12 @@ import org.junit.Before;
 import org.junit.ClassRule;
 import org.junit.Test;
 
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.lang.management.ManagementFactory;
 import java.net.Socket;
 import java.net.URL;
 import java.net.URLClassLoader;
@@ -48,8 +51,10 @@ import java.util.concurrent.atomic.AtomicReference;
 import static io.activej.launchers.jsonrpc.LauncherTestHarness.ReadResponse;
 import static io.activej.launchers.jsonrpc.LauncherTestHarness.assertListens;
 import static io.activej.launchers.jsonrpc.LauncherTestHarness.causeChainHas;
+import static io.activej.launchers.jsonrpc.LauncherTestHarness.dispatcherBeans;
 import static io.activej.launchers.jsonrpc.LauncherTestHarness.post;
 import static io.activej.launchers.jsonrpc.LauncherTestHarness.stop;
+import static io.activej.launchers.jsonrpc.LauncherTestHarness.unregisterDispatcherBeans;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -259,6 +264,92 @@ public class JsonRpcServerLauncherConfigValuesTest {
 			}
 		} finally {
 			stop(launcher);
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// FR-039 — jsonrpc.maxInFlight, admitted by feature 019 (the same oracle: never starts illegal)
+	// ---------------------------------------------------------------------------------------------
+
+	@Test
+	public void maxInFlightZeroAndNegativeAreRefusedAtBuildAndNeverStart() {
+		// there is no value that disables the bound — an opt-out is a higher ceiling, never a switch — so
+		// the dispatcher refuses anything below 1 at build() and the launcher never binds
+		for (String value : List.of("0", "-1")) {
+			JsonRpcServerLauncher launcher = singleLauncher(
+				Config.create().with("jsonrpc.maxInFlight", value));
+			DIException e = assertThrows("maxInFlight=" + value,
+				DIException.class, () -> launcher.launch(Launcher.NO_ARGS));
+			assertTrue("maxInFlight=" + value + " must fail at build with IllegalArgumentException, got: " + e,
+				causeChainHas(e, IllegalArgumentException.class));
+			assertTrue("the offending key must be named: " + e, messageContains(e, "maxInFlight"));
+			assertTrue("no server may exist after a refused bound", launcher.httpServer == null);
+		}
+	}
+
+	@Test
+	public void maxInFlightNonNumericFailsConversionAndNeverStarts() {
+		JsonRpcServerLauncher launcher = singleLauncher(
+			Config.create().with("jsonrpc.maxInFlight", "many"));
+		DIException e = assertThrows(DIException.class, () -> launcher.launch(Launcher.NO_ARGS));
+		assertTrue("maxInFlight=many must fail conversion, got: " + e,
+			causeChainHas(e, NumberFormatException.class));
+		assertTrue("no server may exist after a refused bound", launcher.httpServer == null);
+	}
+
+	@Test
+	public void maxInFlightAppliesPerWorkerUnderTheMultithreadedLauncher() throws Exception {
+		// FR-033: the bound is per DISPATCHER, and each worker builds its own — so the key configures a
+		// per-reactor ceiling, and the system-wide ceiling is workers × maxInFlight (2 × 7 = 14 here), never
+		// one shared pool of 7 divided among the workers. That distinction is the whole reason the JMX
+		// attribute carries no sum reducer.
+		unregisterDispatcherBeans();
+		MultithreadedJsonRpcServerLauncher launcher = new MultithreadedJsonRpcServerLauncher() {
+			@Override
+			protected Module getBusinessLogicModule() {
+				return new AbstractModule() {
+					@ProvidesIntoSet
+					JsonRpcServiceBinding userApi() {
+						return new JsonRpcServiceBinding(UserApi.class, new UserApiImpl());
+					}
+				};
+			}
+
+			@Override
+			Config config() {
+				return super.config()
+					.overrideWith(Config.create()
+						.with("http.listenAddresses", "0")
+						.with("workers", "2")
+						.with("jsonrpc.maxInFlight", "7"));
+			}
+
+			@Override
+			protected void onFatalError(Throwable throwable) {}
+		};
+		launchAndAwaitStart(launcher);
+		try {
+			MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+			List<ObjectName> workerBeans = dispatcherBeans().stream()
+				.filter(name -> name.getKeyPropertyList().containsKey("workerId"))
+				.toList();
+			assertEquals("one dispatcher bean per worker", 2, workerBeans.size());
+			for (ObjectName worker : workerBeans) {
+				assertEquals("each worker's dispatcher gets the configured ceiling, whole: " + worker,
+					7, (int) (Integer) mbs.getAttribute(worker, "maxInFlight"));
+			}
+
+			// the aggregated bean reads the single distinct per-worker value; a sum reducer there would
+			// report the aggregate ceiling (14) under a name that means the per-dispatcher one
+			ObjectName aggregated = dispatcherBeans().stream()
+				.filter(name -> !name.getKeyPropertyList().containsKey("workerId"))
+				.findFirst()
+				.orElseThrow(() -> new AssertionError("no aggregated MBean found"));
+			assertEquals("the aggregated read is the per-worker value, not the sum",
+				7, (int) (Integer) mbs.getAttribute(aggregated, "maxInFlight"));
+		} finally {
+			stop(launcher);
+			unregisterDispatcherBeans();
 		}
 	}
 

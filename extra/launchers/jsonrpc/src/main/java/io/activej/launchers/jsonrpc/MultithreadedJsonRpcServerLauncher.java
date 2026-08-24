@@ -89,6 +89,11 @@ import static io.activej.launchers.initializers.Initializers.ofPrimaryServer;
  * <b>disabled by default</b>. Each worker generates the document from the same contracts and the same
  * {@code jsonrpc.discovery.info.*} values, so whichever worker the {@link PrimaryServer} hands a
  * connection to answers with identical bytes.
+ * <p>
+ * Since feature 019 {@code jsonrpc.maxInFlight} bounds concurrent service invocations <b>per worker</b>
+ * (FR-039): each worker builds its own dispatcher, so the configured value is each worker's ceiling
+ * <i>whole</i> and the aggregate system-wide ceiling is {@code workers × maxInFlight} — see
+ * {@link JsonRpcModule#maxInFlight}.
  *
  * @see Launcher
  */
@@ -156,7 +161,11 @@ public abstract class MultithreadedJsonRpcServerLauncher extends Launcher {
 	) {
 		JsonRpcDispatcher.Builder builder = JsonRpcDispatcher.builder(reactor)
 			.withCodecFactory(codecFactory.orElse(JsonCodecFactory.defaultInstance()))
-			.withInspector(inspector);
+			.withInspector(inspector)
+			// FR-039, read through the same shared helper as JsonRpcModule: the bound is per dispatcher and
+			// this provider runs once per worker, so each worker's ceiling is the configured value WHOLE and
+			// the aggregate system-wide ceiling is workers × maxInFlight — see JsonRpcModule.maxInFlight
+			.withMaxInFlight(JsonRpcModule.maxInFlight(config.getChild("jsonrpc")));
 		for (JsonRpcServiceBinding binding : bindings.orElse(Set.of())) {
 			@SuppressWarnings("unchecked")
 			Class<Object> serviceType = (Class<Object>) binding.serviceType();
@@ -339,7 +348,7 @@ public abstract class MultithreadedJsonRpcServerLauncher extends Launcher {
 		return Module.empty();
 	}
 
-	/** The FR-036 fail-closed check — the same four rejected keys as {@link JsonRpcServerLauncher}. */
+	/** The FR-036 fail-closed check — the same rejected keys as {@link JsonRpcServerLauncher}. */
 	@Override
 	protected void onStart() throws Exception {
 		JsonRpcServerLauncher.rejectNonKeys(config.getChild("jsonrpc"));

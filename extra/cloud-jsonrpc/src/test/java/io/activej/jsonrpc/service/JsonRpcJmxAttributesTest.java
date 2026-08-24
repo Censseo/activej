@@ -27,8 +27,11 @@ import io.activej.jsonrpc.JsonRpcLimits;
 import io.activej.jsonrpc.schema.OpenRpcInfo;
 import io.activej.jsonrpc.service.fixtures.FailingApi;
 import io.activej.jsonrpc.service.fixtures.FailingApiImpl;
+import io.activej.jsonrpc.service.fixtures.SlowApi;
+import io.activej.jsonrpc.service.fixtures.SlowApiImpl;
 import io.activej.jsonrpc.service.fixtures.UserApi;
 import io.activej.jsonrpc.service.fixtures.UserApiImpl;
+import io.activej.promise.Promise;
 import io.activej.reactor.Reactor;
 import io.activej.test.rules.ActivePromisesRule;
 import io.activej.test.rules.ByteBufRule;
@@ -45,9 +48,12 @@ import javax.management.MBeanServerFactory;
 import javax.management.ObjectName;
 import javax.management.openmbean.CompositeData;
 import javax.management.openmbean.TabularData;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static io.activej.promise.TestUtils.await;
@@ -266,13 +272,120 @@ public class JsonRpcJmxAttributesTest {
 
 	@Test
 	public void attributeNamesAreExactlyTheContractSurface() throws Exception {
-		// the §2 base attributes, plus the platform's standard extraSubAttributes flattening (_totalCount)
+		// the §2 base attributes, plus the platform's standard extraSubAttributes flattening (_totalCount).
+		// Feature 019 appends three names and renames or reshapes none — this set is the whole proof of that
 		Set<String> expected = Set.of(
 			"methodStats", "totalRequests", "totalErrors", "methodNotFound", "malformedDocuments",
 			"registeredMethods", "maxBatchSize", "maxJsonDepth",
 			"totalRequests_totalCount", "totalErrors_totalCount", "methodNotFound_totalCount",
-			"malformedDocuments_totalCount");
+			"malformedDocuments_totalCount",
+			"maxInFlight", "inFlight", "rejectedRequests", "rejectedRequests_totalCount");
 		assertEquals(expected, attributeNames(dispatcherName()));
+	}
+
+	// ---------------------------------------------------------------------------------------------------
+	// T033 — the three additive in-flight attributes (FR-038, contracts/jmx-attributes.md).
+	// ---------------------------------------------------------------------------------------------------
+
+	@Test
+	public void theInFlightAttributesAreReadOnlyAndReportTheConfiguredAndLiveValues() throws Exception {
+		ObjectName name = dispatcherName();
+
+		assertEquals(JsonRpcDispatcher.MAX_IN_FLIGHT, mbs.getAttribute(name, "maxInFlight"));
+		assertEquals("nothing is in flight between dispatches", 0, mbs.getAttribute(name, "inFlight"));
+		assertEquals(0L, mbs.getAttribute(name, "rejectedRequests_totalCount"));
+
+		Set<String> readOnly = new HashSet<>(Set.of("maxInFlight", "inFlight", "rejectedRequests"));
+		for (MBeanAttributeInfo attribute : mbs.getMBeanInfo(name).getAttributes()) {
+			if (readOnly.remove(attribute.getName())) {
+				assertFalse(attribute.getName() + " must be read-only", attribute.isWritable());
+			}
+		}
+		assertTrue("missing attributes: " + readOnly, readOnly.isEmpty());
+	}
+
+	@Test
+	public void maxInFlightReportsTheBuilderValueNotTheProcessDefault() throws Exception {
+		Registered registered = register(dispatcherBuilder()
+			.withMaxInFlight(7)
+			.withInspector(new JsonRpcDispatcher.JmxInspector()));
+
+		assertEquals(7, registered.server.getAttribute(registered.name, "maxInFlight"));
+	}
+
+	@Test
+	public void inFlightReadsTheLiveCountAndDrainsBackToZero() throws Exception {
+		SlowApiImpl slow = new SlowApiImpl();
+		Registered registered = register(JsonRpcDispatcher.builder(Reactor.getCurrentReactor())
+			.withService(SlowApi.class, slow)
+			.withInspector(new JsonRpcDispatcher.JmxInspector()));
+
+		List<Promise<byte[]>> held = new ArrayList<>();
+		for (int i = 1; i <= 3; i++) {
+			held.add(registered.dispatcher.dispatch(
+				("{\"jsonrpc\":\"2.0\",\"id\":" + i + ",\"method\":\"slow.call\",\"params\":[\"x\"]}")
+					.getBytes(UTF_8)));
+			assertEquals("the live count, read while the invocations are held", i,
+				registered.server.getAttribute(registered.name, "inFlight"));
+		}
+
+		slow.releaseAll();
+		for (Promise<byte[]> promise : held) {
+			await(promise);
+		}
+		assertEquals("every completion gave its slot back", 0,
+			registered.server.getAttribute(registered.name, "inFlight"));
+	}
+
+	@Test
+	public void rejectedRequestsFoldsRequestsAndNotificationsIntoOneAggregate() throws Exception {
+		SlowApiImpl slow = new SlowApiImpl();
+		Registered registered = register(JsonRpcDispatcher.builder(Reactor.getCurrentReactor())
+			.withService(SlowApi.class, slow)
+			.withMaxInFlight(1)
+			.withFailureHandler((descriptor, e) -> {})
+			.withInspector(new JsonRpcDispatcher.JmxInspector()));
+		MBeanServer server = registered.server;
+		ObjectName name = registered.name;
+
+		Promise<byte[]> held = registered.dispatcher.dispatch(
+			"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"slow.call\",\"params\":[\"a\"]}".getBytes(UTF_8));
+		assertEquals(1, server.getAttribute(name, "inFlight"));
+
+		await(registered.dispatcher.dispatch(
+			"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"slow.call\",\"params\":[\"b\"]}".getBytes(UTF_8)));
+		await(registered.dispatcher.dispatch(
+			"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"slow.call\",\"params\":[\"c\"]}".getBytes(UTF_8)));
+		await(registered.dispatcher.dispatch(
+			"{\"jsonrpc\":\"2.0\",\"method\":\"slow.notify\",\"params\":[\"d\"]}".getBytes(UTF_8)));
+
+		// two shed requests and one shed notification, in one aggregate — the rejection carries no wire
+		// name by construction, so there is nothing else it could be keyed by
+		assertEquals(3L, server.getAttribute(name, "rejectedRequests_totalCount"));
+
+		// and it is counted THERE and nowhere else: -32005 is deliberately not in JsonRpcErrors.named(),
+		// so no per-method row exists for it and none was invented
+		TabularData methodStats = (TabularData) server.getAttribute(name, "methodStats");
+		CompositeData row = (CompositeData) methodStats.get(new Object[]{"slow.call"});
+		assertNotNull(row);
+		assertEquals(0L, row.get("failedRequests_totalCount"));
+		assertEquals(0L, row.get("otherErrors_totalCount"));
+		TabularData errorsByCode = (TabularData) row.get("errorsByCode");
+		assertEquals("the closed key set stays at the nine named codes", 9, errorsByCode.size());
+		assertFalse("-32005 must not appear as an errorsByCode key: " + errorsByCode.keySet(),
+			rowKeys(errorsByCode).contains("-32005"));
+
+		// a shed element is not a method-not-found and not an error the server chose per method
+		assertEquals(0L, server.getAttribute(name, "methodNotFound_totalCount"));
+		assertEquals(0L, server.getAttribute(name, "totalErrors_totalCount"));
+		assertEquals("only the admitted invocation was announced", 1L,
+			server.getAttribute(name, "totalRequests_totalCount"));
+
+		slow.releaseAll();
+		await(held);
+		assertEquals("the counter is cumulative, not a gauge", 3L,
+			server.getAttribute(name, "rejectedRequests_totalCount"));
+		assertEquals(0, server.getAttribute(name, "inFlight"));
 	}
 
 	// ---------------------------------------------------------------------------------------------------
@@ -350,6 +463,107 @@ public class JsonRpcJmxAttributesTest {
 	}
 
 	// ---------------------------------------------------------------------------------------------------
+	// T032 — characterization (FR-037). Nothing indexed by wire input, proven from three sides at once:
+	// the rendered JMX surface, the inspector's own field graph, and the callbacks a wire miss can reach.
+	//
+	// This test is green the day it is written. That is its point: it pins a property the code already has
+	// so that the change which breaks it — a computeIfAbsent, a per-name row, a "helpful" diagnostic map —
+	// fails loudly here instead of shipping as a memory-exhaustion primitive.
+	// ---------------------------------------------------------------------------------------------------
+
+	@Test
+	public void manyUnknownWireNamesMoveOnlyTheAggregateCounterAndCreateNoStructure() throws Exception {
+		ObjectName name = dispatcherName();
+		Set<String> frozenRows = rowKeys((TabularData) mbs.getAttribute(name, "methodStats"));
+		Set<String> frozenAttributes = attributeNames(name);
+		assertEquals(dispatcher.wireNames(), frozenRows);
+
+		int distinctNames = 64;
+		for (int i = 0; i < distinctNames; i++) {
+			// a request miss and a notification miss: both reach the same aggregate-only callback
+			dispatch("{\"jsonrpc\":\"2.0\",\"id\":" + i + ",\"method\":\"ghost.request." + i + "\"}");
+			dispatch("{\"jsonrpc\":\"2.0\",\"method\":\"ghost.notification." + i + "\"}");
+		}
+
+		// the one thing that moved
+		assertEquals(2L * distinctNames, mbs.getAttribute(name, "methodNotFound_totalCount"));
+
+		// the row set, the attribute set and every map inside the inspector are exactly what they were
+		assertEquals("no per-name row appeared", frozenRows,
+			rowKeys((TabularData) mbs.getAttribute(name, "methodStats")));
+		assertEquals("no per-name attribute appeared", frozenAttributes, attributeNames(name));
+		assertNoWireKeyedMap(inspector, frozenRows);
+
+		// and no rendered value anywhere carries one of the names
+		List<String> renderings = new ArrayList<>();
+		for (String attributeName : frozenAttributes) {
+			collectRenderings(mbs.getAttribute(name, attributeName), renderings);
+		}
+		String all = String.join("\n", renderings);
+		assertFalse("a wire-supplied name leaked into the JMX surface: " + all, all.contains("ghost."));
+	}
+
+	@Test
+	public void anUnknownWireNameReachesOnlyTheAggregateOnlyCallback() {
+		RecordingInspector recording = new RecordingInspector();
+		JsonRpcDispatcher built = dispatcherBuilder().withInspector(recording).build();
+
+		for (int i = 0; i < 32; i++) {
+			await(built.dispatch(("{\"jsonrpc\":\"2.0\",\"id\":" + i + ",\"method\":\"ghost." + i + "\"}")
+				.getBytes(UTF_8)));
+		}
+
+		// FR-034's type-system argument, read from the call side: a descriptor-typed callback can only be
+		// reached through the closed handler table, so a miss reaches exactly one callback and no other
+		assertEquals(32, recording.methodNotFound);
+		assertTrue("no descriptor-typed callback may fire for a name that matched nothing: " +
+				   recording.descriptors, recording.descriptors.isEmpty());
+		assertEquals(0, recording.malformed);
+		assertEquals(0, recording.rejected);
+	}
+
+	/**
+	 * Every {@link Map} reachable through the inspector's own fields, and through each statistics row's
+	 * fields, is keyed by a <b>closed</b> set — the registered wire names, or the nine named error codes.
+	 * Reflection rather than getters, so a map added later without a {@code @JmxAttribute} is caught too.
+	 */
+	private static void assertNoWireKeyedMap(JsonRpcDispatcher.JmxInspector inspector, Set<String> wireNames)
+		throws Exception {
+		Set<String> namedCodes = new HashSet<>();
+		for (JsonRpcError error : JsonRpcErrors.named()) {
+			namedCodes.add(Integer.toString(error.code()));
+		}
+
+		for (Field field : JsonRpcDispatcher.JmxInspector.class.getDeclaredFields()) {
+			if (Modifier.isStatic(field.getModifiers())) continue;
+			field.setAccessible(true);
+			Object value = field.get(inspector);
+			if (!(value instanceof Map<?, ?> map)) continue;
+
+			assertEquals("JmxInspector." + field.getName() + " grew a key from the wire",
+				wireNames, keysAsStrings(map));
+			for (Object row : map.values()) {
+				for (Field rowField : row.getClass().getDeclaredFields()) {
+					if (Modifier.isStatic(rowField.getModifiers())) continue;
+					rowField.setAccessible(true);
+					Object rowValue = rowField.get(row);
+					if (!(rowValue instanceof Map<?, ?> rowMap)) continue;
+					assertEquals(row.getClass().getSimpleName() + '.' + rowField.getName() +
+								 " grew a key from the wire", namedCodes, keysAsStrings(rowMap));
+				}
+			}
+		}
+	}
+
+	private static Set<String> keysAsStrings(Map<?, ?> map) {
+		Set<String> keys = new HashSet<>();
+		for (Object key : map.keySet()) {
+			keys.add(String.valueOf(key));
+		}
+		return keys;
+	}
+
+	// ---------------------------------------------------------------------------------------------------
 	// Helpers.
 	// ---------------------------------------------------------------------------------------------------
 
@@ -366,6 +580,20 @@ public class JsonRpcJmxAttributesTest {
 			.withService(FailingApi.class, new FailingApiImpl());
 	}
 
+	/** A dispatcher on its own {@link MBeanServer}, so a test can register a second one of the same key. */
+	private record Registered(JsonRpcDispatcher dispatcher, MBeanServer server, ObjectName name) {}
+
+	private static Registered register(JsonRpcDispatcher.Builder builder) throws Exception {
+		JsonRpcDispatcher built = builder.build();
+		MBeanServer server = MBeanServerFactory.newMBeanServer();
+		JmxRegistry.create(server, DynamicMBeanFactory.create())
+			.registerSingleton(Key.of(JsonRpcDispatcher.class), built, JmxBeanSettings.create());
+		ObjectName name = server
+			.queryNames(new ObjectName("io.activej.jsonrpc.service:type=JsonRpcDispatcher"), null)
+			.iterator().next();
+		return new Registered(built, server, name);
+	}
+
 	private static Set<String> rowKeys(TabularData tabularData) {
 		Set<String> keys = new HashSet<>();
 		for (Object rowKey : tabularData.keySet()) {
@@ -374,11 +602,20 @@ public class JsonRpcJmxAttributesTest {
 		return keys;
 	}
 
-	/** Captures the one argument {@code doBuild()} hands {@link JsonRpcDispatcher.Inspector#initialize(Set)}. */
+	/**
+	 * Captures the one argument {@code doBuild()} hands {@link JsonRpcDispatcher.Inspector#initialize(Set)},
+	 * and — for T032 — which callbacks a dispatch actually reached. The descriptor-typed callbacks are
+	 * collected by wire name; a name that matched nothing can never appear there, which is the property
+	 * FR-034 pushes into the type system.
+	 */
 	private static final class RecordingInspector
 		extends AbstractInspector<JsonRpcDispatcher.Inspector>
 		implements JsonRpcDispatcher.Inspector {
 		private @Nullable Set<String> wireNames;
+		private final List<String> descriptors = new ArrayList<>();
+		private int methodNotFound;
+		private int malformed;
+		private int rejected;
 
 		@Override
 		public void initialize(Set<String> wireNames) {
@@ -386,19 +623,34 @@ public class JsonRpcJmxAttributesTest {
 		}
 
 		@Override
-		public void onRequest(JsonRpcMethodDescriptor descriptor) {}
+		public void onRequest(JsonRpcMethodDescriptor descriptor) {
+			descriptors.add(descriptor.wireName());
+		}
 
 		@Override
-		public void onResponse(JsonRpcMethodDescriptor descriptor, long durationMillis) {}
+		public void onResponse(JsonRpcMethodDescriptor descriptor, long durationMillis) {
+			descriptors.add(descriptor.wireName());
+		}
 
 		@Override
-		public void onError(JsonRpcMethodDescriptor descriptor, int errorCode, long durationMillis) {}
+		public void onError(JsonRpcMethodDescriptor descriptor, int errorCode, long durationMillis) {
+			descriptors.add(descriptor.wireName());
+		}
 
 		@Override
-		public void onMethodNotFound(String requestedName) {}
+		public void onMethodNotFound(String requestedName) {
+			methodNotFound++;
+		}
 
 		@Override
-		public void onMalformed() {}
+		public void onMalformed() {
+			malformed++;
+		}
+
+		@Override
+		public void onRejected() {
+			rejected++;
+		}
 	}
 
 	private Set<String> attributeNames(ObjectName name) throws Exception {

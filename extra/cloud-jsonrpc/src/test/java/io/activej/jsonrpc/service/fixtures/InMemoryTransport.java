@@ -51,6 +51,24 @@ import static io.activej.common.Checks.checkState;
  * turns a correlation bug into a flaky test and proves nothing on the runs where the shuffle was the
  * identity.
  *
+ * <h2>Silent and on-demand answering</h2>
+ * A per-call deadline can only be observed against a peer that does not answer, and a late answer can only be
+ * observed against a peer that answers <i>when the test says so</i>. Two shapes cover both:
+ * <ul>
+ *     <li>{@link #silent()} — no peer at all. Every document is accepted and recorded, nothing is ever
+ *     delivered. The server that never responds.</li>
+ *     <li>{@link #startDeferringAnswers()} — a real peer, consulted only when the test calls
+ *     {@link #answer(int)} or {@link #answerInOrder()}. The answer is therefore the peer's genuine one,
+ *     correlated with whatever id the client chose, which is what a late-response test needs and what a
+ *     hand-written document cannot supply.</li>
+ * </ul>
+ * The two modes compose with reorder mode: an answer produced on demand is still subject to the hold.
+ *
+ * <h2>Reorder mode versus on-demand mode</h2>
+ * They queue different things and the difference is the point. Reorder mode holds documents the peer has
+ * <b>already produced</b>; on-demand mode holds documents the peer has <b>not yet seen</b>. Only the latter
+ * can place the answer's <i>computation</i> after an event the test triggers in between.
+ *
  * <h2>What this double deliberately does not do</h2>
  * It never fragments a document, so obligation 1 ("join before decoding") is satisfied by construction and
  * obligation 2 ({@code JsonRpcLimits.MAX_BODY_SIZE} applied <i>during</i> accumulation) has nothing to
@@ -77,13 +95,18 @@ public final class InMemoryTransport implements JsonRpcTransport {
 		Promise<byte[]> respond(byte[] document);
 	}
 
+	/** The answer of a peer that has nothing to say — never delivered, by obligation 3. */
+	private static final byte[] NO_ANSWER = {};
+
 	private final Peer peer;
 
 	private final List<byte[]> sent = new ArrayList<>();
 	private final List<byte[]> held = new ArrayList<>();
+	private final List<byte[]> deferred = new ArrayList<>();
 
 	private @Nullable Listener listener;
 	private boolean holding;
+	private boolean deferring;
 	private boolean closed;
 	private @Nullable Exception closeException;
 
@@ -93,6 +116,19 @@ public final class InMemoryTransport implements JsonRpcTransport {
 
 	public static InMemoryTransport create(Peer peer) {
 		return new InMemoryTransport(peer);
+	}
+
+	/**
+	 * A transport with no peer: every document is accepted and recorded in {@link #sentDocuments()}, and
+	 * nothing is ever delivered to the listener. The server that never responds — the only peer against which
+	 * a client-side deadline is observable at all.
+	 * <p>
+	 * Deliberately not the same thing as {@link #startDeferringAnswers()}: there is no answer withheld here,
+	 * so there is none to release later either. A test that needs the answer <i>eventually</i> wants a real
+	 * peer in on-demand mode.
+	 */
+	public static InMemoryTransport silent() {
+		return new InMemoryTransport(document -> Promise.of(NO_ANSWER));
 	}
 
 	// region JsonRpcTransport
@@ -111,15 +147,20 @@ public final class InMemoryTransport implements JsonRpcTransport {
 	 * <p>
 	 * A peer that fails its promise closes this transport with that exception: a double must not swallow a
 	 * failure nobody else is watching.
+	 * <p>
+	 * In on-demand mode the peer is not consulted at all until the test asks — but the promise still completes
+	 * here, because obligation 4 is about the <i>write</i> and nothing about it has been deferred.
 	 */
 	@Override
 	public Promise<Void> send(byte[] document) {
 		checkState(listener != null, "no listener registered — call setListener before sending");
 		if (closed) return Promise.ofException(closeException);
 		sent.add(document);
-		peer.respond(document)
-			.whenResult(this::inbound)
-			.whenException(this::closeEx);
+		if (deferring) {
+			deferred.add(document);
+		} else {
+			toPeer(document);
+		}
 		return Promise.complete();
 	}
 
@@ -221,6 +262,68 @@ public final class InMemoryTransport implements JsonRpcTransport {
 
 	// endregion
 
+	// region on-demand mode
+
+	/**
+	 * Turns on-demand mode on: a document {@link #send(byte[])} accepts is recorded and the peer is <b>not</b>
+	 * consulted, so no answer is computed until {@link #answer(int)} or {@link #answerInOrder()} asks for one.
+	 * <p>
+	 * That gap is the whole point — it is where a test puts the event the answer must arrive after, such as a
+	 * client's per-call deadline expiring.
+	 */
+	public void startDeferringAnswers() {
+		deferring = true;
+	}
+
+	/**
+	 * Turns on-demand mode off. Documents already deferred stay deferred — answering is always explicit, so
+	 * that a test never depends on when the mode was flipped.
+	 */
+	public void stopDeferringAnswers() {
+		deferring = false;
+	}
+
+	public boolean isDeferringAnswers() {
+		return deferring;
+	}
+
+	/** How many sent documents are waiting for the test to ask the peer for their answer. */
+	public int deferredCount() {
+		return deferred.size();
+	}
+
+	/** Every deferred document, in send order, decoded as UTF-8. */
+	public List<String> deferredText() {
+		return deferred.stream().map(InMemoryTransport::asString).toList();
+	}
+
+	/**
+	 * Hands the deferred document at {@code index} to the peer and leaves the rest deferred. The answer
+	 * reaches the listener exactly as an immediate one would — subject to the hold, dropped if zero-length.
+	 *
+	 * @throws IndexOutOfBoundsException if nothing is deferred at {@code index} — an answer nobody can supply
+	 *                                   is a broken test, not a no-op
+	 */
+	public void answer(int index) {
+		byte[] document = deferred.remove(index);
+		toPeer(document);
+	}
+
+	/** Hands every deferred document to the peer, in the order it was sent. */
+	public void answerInOrder() {
+		for (byte[] document : drainDeferred()) {
+			toPeer(document);
+		}
+	}
+
+	// endregion
+
+	private void toPeer(byte[] document) {
+		peer.respond(document)
+			.whenResult(this::inbound)
+			.whenException(this::closeEx);
+	}
+
 	private void inbound(@Nullable byte[] document) {
 		if (closed) return;
 		// obligation 3: "no response" is the absence of a call, not an empty one
@@ -245,11 +348,20 @@ public final class InMemoryTransport implements JsonRpcTransport {
 		return batch;
 	}
 
+	/** As {@link #drainHeld()}: a peer answering re-entrantly must not have its own document answered here. */
+	private List<byte[]> drainDeferred() {
+		List<byte[]> batch = List.copyOf(deferred);
+		deferred.clear();
+		return batch;
+	}
+
 	private void doClose(@Nullable Exception cause) {
 		if (closed) return;
 		closed = true;
 		closeException = cause != null ? cause : new AsyncCloseException("peer closed");
 		held.clear();
+		// a closed transport must not reach the peer either: the answer could only be dropped on arrival
+		deferred.clear();
 		if (listener != null) listener.onClosed(cause);
 	}
 

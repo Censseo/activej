@@ -29,3 +29,31 @@ jobs:
           cache: maven
       - name: Build and test
         run: mvn -B -T1C verify
+
+  extra:
+    runs-on: ubuntu-latest
+    name: Extra profile (JDK 25)
+    # The `extra` profile is activeByDefault=false and the `build` job above does not pass it, so
+    # nothing under extra/ has ever had CI coverage. This job closes that gap INFORMATIONALLY: it
+    # reports, it does not block.
+    #
+    # Measured baseline 2026-08-23, `mvn -B -T1C -P extra clean verify` on master (1e950a338):
+    # FAILURE from exactly one cause, environmental and foreign to the modules this job exists to
+    # cover -- launchers/http's HttpServerLauncherTest.bindNonZeroPort and
+    # MultithreadedHttpServerLauncherTest.bindNonZeroPort hardcode port 8080, which was occupied.
+    #
+    # Promotion criterion (informational -> required), all three, in order:
+    #   1. That bindNonZeroPort pair binds port :0 and reads the bound address back (ADR-028) -- a
+    #      separate, maintainer-agreed change to launchers/http, not part of this job's feature.
+    #   2. One full-tree `mvn -B -T1C -P extra clean verify` recorded green after that fix.
+    #   3. Flip `continue-on-error` below to `false` (one line).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: 25
+          cache: maven
+      - name: Build and test extra modules
+        run: mvn -B -T1C -P extra verify

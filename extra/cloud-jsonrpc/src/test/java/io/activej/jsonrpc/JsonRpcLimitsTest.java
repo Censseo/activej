@@ -17,12 +17,27 @@
 package io.activej.jsonrpc;
 
 import io.activej.common.MemSize;
+import io.activej.common.inspector.AbstractInspector;
+import io.activej.jsonrpc.service.JsonRpcDispatcher;
+import io.activej.jsonrpc.service.JsonRpcMethodDescriptor;
+import io.activej.jsonrpc.service.fixtures.SlowApi;
+import io.activej.jsonrpc.service.fixtures.SlowApiImpl;
+import io.activej.promise.Promise;
+import io.activej.reactor.Reactor;
+import io.activej.test.ExpectedException;
+import io.activej.test.rules.ActivePromisesRule;
+import io.activej.test.rules.ByteBufRule;
+import io.activej.test.rules.EventloopRule;
+import org.junit.ClassRule;
 import org.junit.Test;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Modifier;
+import java.util.ArrayList;
+import java.util.List;
 
+import static io.activej.promise.TestUtils.await;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -33,8 +48,29 @@ import static org.junit.Assert.fail;
 /**
  * User Story 4 — the three bounds ship enabled, are overridable, and each refuses <b>before</b> paying the
  * cost it exists to prevent (FR-050…FR-054).
+ * <p>
+ * Feature 019 adds the <b>fourth</b> bound to this class: the dispatcher's in-flight ceiling (FR-033…FR-036).
+ * It is not an envelope bound — it lives on {@link JsonRpcDispatcher} rather than on {@link JsonRpcLimits} —
+ * but the limits' home is this class, and the source feature's documented command names it, so the suite
+ * lives here rather than in a fifth dispatcher test class.
  */
 public class JsonRpcLimitsTest {
+	// The three envelope cases below need none of these — the reactor never turns and nothing allocates a
+	// ByteBuf. The in-flight suite does hold promises across dispatches, and a rule added later is a rule
+	// that never protected the tests written in between (the module's convention).
+	@ClassRule
+	public static final EventloopRule eventloopRule = new EventloopRule();
+
+	@ClassRule
+	public static final ByteBufRule byteBufRule = new ByteBufRule();
+
+	@ClassRule
+	public static final ActivePromisesRule activePromisesRule = new ActivePromisesRule();
+
+	/** One held-invocation fixture per test method — JUnit builds a fresh instance for each. */
+	private final SlowApiImpl slow = new SlowApiImpl();
+	private final List<Exception> failures = new ArrayList<>();
+	private final RecordingInspector inspector = new RecordingInspector();
 
 	// ---------------------------------------------------------------------------------------------------
 	// T052 — the three defaults, their keys, and their error codes.
@@ -217,6 +253,387 @@ public class JsonRpcLimitsTest {
 			JsonRpcMalformed malformed = (JsonRpcMalformed) JsonRpcDecoder.decode(envelope);
 			assertEquals(JsonRpcId.NULL, malformed.id());
 			assertTrue(malformed.error().data().isAbsent());
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------------
+	// T030 — the fourth bound: the dispatcher's concurrent in-flight ceiling (FR-033…FR-036).
+	//
+	// Everything here runs on one reactor thread, so "concurrent" can only mean "entered and not yet
+	// completed". SlowApiImpl is what makes that state reachable: its promises stay pending until the test
+	// releases them, so the ceiling is filled deliberately rather than raced into.
+	// ---------------------------------------------------------------------------------------------------
+
+	@Test
+	public void theInFlightBoundShipsEnabledWithADefaultOfOneThousand() {
+		// FR-033: an order of magnitude above maxBatchSize (100), so one full batch is never rejected by
+		// default, and far below any reactor-queue comfort zone under hostile fan-out
+		assertEquals(1000, JsonRpcDispatcher.MAX_IN_FLIGHT);
+		assertTrue("the bound ships on; a consumer opts out by raising it, never by enabling it",
+			JsonRpcDispatcher.MAX_IN_FLIGHT > 0);
+		assertTrue(JsonRpcDispatcher.MAX_IN_FLIGHT > JsonRpcLimits.MAX_BATCH_SIZE);
+	}
+
+	@Test
+	public void theInFlightBoundIsAPublicStaticFinalSettingLikeTheEnvelopeBounds() throws Exception {
+		int modifiers = JsonRpcDispatcher.class.getField("MAX_IN_FLIGHT").getModifiers();
+		assertTrue("MAX_IN_FLIGHT must be static", Modifier.isStatic(modifiers));
+		assertTrue("MAX_IN_FLIGHT must be final — resolved once, never mutated (DI-5)",
+			Modifier.isFinal(modifiers));
+		assertTrue("MAX_IN_FLIGHT must be public", Modifier.isPublic(modifiers));
+	}
+
+	@Test
+	public void theInFlightBoundIsOverridableByItsSimpleNameKey() throws Exception {
+		assertDispatcherOverride("JsonRpcDispatcher.maxInFlight", "17", 17);
+	}
+
+	@Test
+	public void theInFlightBoundIsOverridableByItsFullyQualifiedKey() throws Exception {
+		assertDispatcherOverride("io.activej.jsonrpc.service.JsonRpcDispatcher.maxInFlight", "23", 23);
+	}
+
+	@Test
+	public void withMaxInFlightOverridesTheSettingForOneDispatcher() {
+		// the builder wins over the process-wide default, and the ceiling it sets is the one that fires
+		JsonRpcDispatcher dispatcher = saturable(1);
+
+		Promise<byte[]> first = dispatcher.dispatch(call(1, "a"));
+		assertEquals(1, slow.pendingCount());
+
+		JsonRpcResponse rejected = single(await(dispatcher.dispatch(call(2, "b"))));
+		assertServerBusy(rejected, 2);
+		assertEquals("the rejected element never reached the implementation", 1, slow.pendingCount());
+
+		slow.releaseAll();
+		assertResult(single(await(first)), 1, "\"a\"");
+	}
+
+	@Test
+	public void withMaxInFlightRejectsAnythingBelowOneAtBuild() {
+		for (int refused : new int[]{0, -1, Integer.MIN_VALUE}) {
+			try {
+				JsonRpcDispatcher.builder(Reactor.getCurrentReactor())
+					.withService(SlowApi.class, slow)
+					.withMaxInFlight(refused)
+					.build();
+				fail("maxInFlight " + refused + " must be refused at build()");
+			} catch (IllegalArgumentException e) {
+				assertTrue("the message must name the refused value: " + e.getMessage(),
+					e.getMessage().contains(Integer.toString(refused)));
+			}
+		}
+
+		// 1 is the smallest legal ceiling: a dispatcher serving one invocation at a time builds fine
+		assertEquals(2, saturable(1).wireNames().size());
+	}
+
+	@Test
+	public void aBatchBeyondTheCeilingIsAnsweredServerBusyOnExactlyTheExcessInDocumentOrder() {
+		JsonRpcDispatcher dispatcher = saturable(2);
+
+		Promise<byte[]> answer = dispatcher.dispatch(
+			batch(call(1, "a"), call(2, "b"), call(3, "c"), call(4, "d")));
+
+		// FR-034: elements admitted before the bound is hit proceed; only the excess is rejected
+		assertEquals(2, slow.pendingCount());
+		assertEquals(List.of("a", "b"), slow.pendingTags());
+
+		slow.releaseAll();
+		List<JsonRpcResponse> responses = responses(await(answer));
+
+		assertEquals(4, responses.size());
+		assertResult(responses.get(0), 1, "\"a\"");
+		assertResult(responses.get(1), 2, "\"b\"");
+		assertServerBusy(responses.get(2), 3);
+		assertServerBusy(responses.get(3), 4);
+		assertTrue("a rejection is not an application fault: " + failures, failures.isEmpty());
+	}
+
+	@Test
+	public void theAdmittedPrefixOfARejectedBatchIsUnaffected() {
+		// the prefix must behave exactly as it would in a batch that was never over the ceiling: same
+		// results, same inspector callbacks, same order
+		JsonRpcDispatcher dispatcher = saturable(3);
+
+		Promise<byte[]> answer = dispatcher.dispatch(
+			batch(call(1, "a"), call(2, "b"), call(3, "c"), call(4, "d"), call(5, "e")));
+
+		assertEquals(List.of("a", "b", "c"), slow.pendingTags());
+		assertEquals("only the admitted elements were announced to the inspector",
+			List.of("slow.call", "slow.call", "slow.call"), inspector.requests);
+		assertEquals(2, inspector.rejected);
+
+		// released out of order: the prefix's answers still come back in document order
+		slow.release(2);
+		slow.release(0);
+		slow.releaseAll();
+
+		List<JsonRpcResponse> responses = responses(await(answer));
+		assertEquals(5, responses.size());
+		assertResult(responses.get(0), 1, "\"a\"");
+		assertResult(responses.get(1), 2, "\"b\"");
+		assertResult(responses.get(2), 3, "\"c\"");
+		assertServerBusy(responses.get(3), 4);
+		assertServerBusy(responses.get(4), 5);
+	}
+
+	@Test
+	public void aRejectedNotificationEmitsNothingAtAllAndNeverReachesTheFailureHandler() {
+		JsonRpcDispatcher dispatcher = saturable(1);
+
+		Promise<byte[]> held = dispatcher.dispatch(call(1, "a"));
+		assertEquals(1, slow.pendingCount());
+
+		// FR-035: §4.1 forbids answering a notification, at the bound exactly as everywhere else
+		assertEquals("a rejected notification produces zero bytes, not an error document",
+			0, await(dispatcher.dispatch(notification("b"))).length);
+		assertEquals("the notification never reached the implementation", 1, slow.pendingCount());
+		assertEquals(List.of("call(a)"), slow.invocations());
+		assertTrue("load shedding is not an application fault: " + failures, failures.isEmpty());
+
+		// … but it is counted, on the same aggregate a rejected request moves
+		assertEquals(1, inspector.rejected);
+		assertEquals("a rejection announces no request", List.of("slow.call"), inspector.requests);
+
+		slow.releaseAll();
+		assertResult(single(await(held)), 1, "\"a\"");
+	}
+
+	@Test
+	public void aBatchOfNothingButRejectedNotificationsIsZeroBytes() {
+		JsonRpcDispatcher dispatcher = saturable(1);
+
+		Promise<byte[]> held = dispatcher.dispatch(call(1, "a"));
+
+		byte[] answer = await(dispatcher.dispatch(
+			batch(notification("b"), notification("c"), notification("d"))));
+
+		assertEquals("no response document exists, and it is not \"[]\"", 0, answer.length);
+		assertEquals(3, inspector.rejected);
+		assertTrue(failures.isEmpty());
+
+		slow.releaseAll();
+		await(held);
+	}
+
+	@Test
+	public void dispatchNeverCompletesExceptionallyWhenEveryElementIsRejected() {
+		JsonRpcDispatcher dispatcher = saturable(1);
+
+		Promise<byte[]> held = dispatcher.dispatch(call(1, "a"));
+
+		// FR-036: a rejected element is an ordinary error response element, never a failed promise
+		List<JsonRpcResponse> responses = responses(await(dispatcher.dispatch(
+			batch(call(2, "b"), call(3, "c"), call(4, "d"), call(5, "e"), call(6, "f")))));
+		assertEquals(5, responses.size());
+		for (int i = 0; i < responses.size(); i++) {
+			assertServerBusy(responses.get(i), i + 2);
+		}
+
+		// and a lone rejected request is one ordinary error document
+		assertServerBusy(single(await(dispatcher.dispatch(call(7, "g")))), 7);
+
+		slow.releaseAll();
+		assertResult(single(await(held)), 1, "\"a\"");
+	}
+
+	@Test
+	public void theCounterDecrementsOnSuccessfulCompletion() {
+		JsonRpcDispatcher dispatcher = saturable(1);
+
+		Promise<byte[]> first = dispatcher.dispatch(call(1, "a"));
+		assertServerBusy(single(await(dispatcher.dispatch(call(2, "b")))), 2);
+
+		slow.releaseAll();
+		assertResult(single(await(first)), 1, "\"a\"");
+
+		// the slot came back: the very next call is admitted, not rejected
+		Promise<byte[]> third = dispatcher.dispatch(call(3, "c"));
+		assertEquals(1, slow.pendingCount());
+		slow.releaseAll();
+		assertResult(single(await(third)), 3, "\"c\"");
+		assertEquals("exactly one rejection over the whole test", 1, inspector.rejected);
+	}
+
+	@Test
+	public void theCounterDecrementsOnFailedCompletion() {
+		JsonRpcDispatcher dispatcher = saturable(1);
+
+		Promise<byte[]> first = dispatcher.dispatch(call(1, "a"));
+		slow.failAll(new ExpectedException("the handler failed"));
+		assertError(single(await(first)), 1, JsonRpcErrors.INTERNAL_ERROR);
+
+		// a failed invocation must free its slot exactly as a successful one does, or the ceiling leaks
+		// upwards under load until nothing is ever admitted again
+		Promise<byte[]> second = dispatcher.dispatch(call(2, "b"));
+		assertEquals(1, slow.pendingCount());
+		slow.releaseAll();
+		assertResult(single(await(second)), 2, "\"b\"");
+		assertEquals("no rejection was ever due", 0, inspector.rejected);
+	}
+
+	@Test
+	public void aFailedNotificationAlsoFreesItsSlot() {
+		JsonRpcDispatcher dispatcher = saturable(1);
+
+		// an admitted notification holds its slot until the invocation completes, so the dispatch promise
+		// is still pending here — awaiting it before the release would hang the loop, not the assertion
+		Promise<byte[]> admittedNotification = dispatcher.dispatch(notification("a"));
+		assertEquals(1, slow.pendingCount());
+		slow.failAll(new ExpectedException("the notification failed"));
+		assertEquals("a notification still has nowhere to put its answer", 0, await(admittedNotification).length);
+		assertEquals("the failure went to the failure handler, as it always has", 1, failures.size());
+
+		Promise<byte[]> admitted = dispatcher.dispatch(call(1, "b"));
+		assertEquals(1, slow.pendingCount());
+		slow.releaseAll();
+		assertResult(single(await(admitted)), 1, "\"b\"");
+		assertEquals(0, inspector.rejected);
+	}
+
+	@Test
+	public void aLookupMissAndAParamsFailureNeverTouchTheCounter() {
+		// the counter brackets the handler invocation only: -32601 and -32602 invoke nothing, so they can
+		// neither consume a slot nor be rejected by the bound
+		JsonRpcDispatcher dispatcher = saturable(1);
+
+		for (int i = 0; i < 20; i++) {
+			assertError(single(await(dispatcher.dispatch(
+				("{\"jsonrpc\":\"2.0\",\"id\":" + i + ",\"method\":\"no.such\"}").getBytes(UTF_8)))),
+				i, JsonRpcErrors.METHOD_NOT_FOUND);
+			assertError(single(await(dispatcher.dispatch(
+				("{\"jsonrpc\":\"2.0\",\"id\":" + i + ",\"method\":\"slow.call\",\"params\":[1,2,3]}")
+					.getBytes(UTF_8)))),
+				i, JsonRpcErrors.INVALID_PARAMS);
+		}
+
+		Promise<byte[]> admitted = dispatcher.dispatch(call(99, "a"));
+		assertEquals("the ceiling is still free after 40 non-invoking elements", 1, slow.pendingCount());
+		slow.releaseAll();
+		assertResult(single(await(admitted)), 99, "\"a\"");
+		assertEquals(0, inspector.rejected);
+	}
+
+	// ---------------------------------------------------------------------------------------------------
+	// In-flight helpers.
+	// ---------------------------------------------------------------------------------------------------
+
+	/** A dispatcher over the held-invocation fixture, with every observation seam this suite reads. */
+	private JsonRpcDispatcher saturable(int maxInFlight) {
+		return JsonRpcDispatcher.builder(Reactor.getCurrentReactor())
+			.withService(SlowApi.class, slow)
+			.withMaxInFlight(maxInFlight)
+			.withFailureHandler((descriptor, e) -> failures.add(e))
+			.withInspector(inspector)
+			.build();
+	}
+
+	private static byte[] call(long id, String tag) {
+		return ("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"method\":\"slow.call\",\"params\":[\"" + tag + "\"]}")
+			.getBytes(UTF_8);
+	}
+
+	private static byte[] notification(String tag) {
+		return ("{\"jsonrpc\":\"2.0\",\"method\":\"slow.notify\",\"params\":[\"" + tag + "\"]}").getBytes(UTF_8);
+	}
+
+	private static byte[] batch(byte[]... elements) {
+		StringBuilder json = new StringBuilder("[");
+		for (int i = 0; i < elements.length; i++) {
+			if (i > 0) json.append(',');
+			json.append(new String(elements[i], UTF_8));
+		}
+		return json.append(']').toString().getBytes(UTF_8);
+	}
+
+	private static List<JsonRpcResponse> responses(byte[] document) {
+		JsonRpcInput input = JsonRpcDecoder.decode(document);
+		if (!(input instanceof JsonRpcBatch batch)) {
+			throw new AssertionError("expected a batch response, got " + input);
+		}
+		List<JsonRpcResponse> responses = new ArrayList<>(batch.size());
+		for (JsonRpcDecoded element : batch.elements()) {
+			responses.add((JsonRpcResponse) element);
+		}
+		return responses;
+	}
+
+	private static JsonRpcResponse single(byte[] document) {
+		JsonRpcInput input = JsonRpcDecoder.decode(document);
+		if (!(input instanceof JsonRpcResponse response)) {
+			throw new AssertionError("expected one response, got " + input);
+		}
+		return response;
+	}
+
+	private static void assertResult(JsonRpcResponse response, long id, String rawResult) {
+		assertEquals(new JsonRpcId.Num(id), response.id());
+		assertFalse("expected a result, got " + response.error(), response.isError());
+		assertEquals(rawResult, new String(response.result().toByteArray(), UTF_8));
+	}
+
+	private static void assertError(JsonRpcResponse response, long id, JsonRpcError expected) {
+		assertEquals(new JsonRpcId.Num(id), response.id());
+		assertTrue("expected an error, got " + response.result(), response.isError());
+		assertEquals(expected.code(), response.error().code());
+	}
+
+	/** {@code -32005 Server busy}, verbatim: the fixed message, no {@code data}, and the element's own id. */
+	private static void assertServerBusy(JsonRpcResponse response, long id) {
+		assertError(response, id, JsonRpcErrors.SERVER_BUSY);
+		assertEquals("Server busy", response.error().message());
+		assertTrue("a rejection discloses nothing beyond the fixed message",
+			response.error().data().isAbsent());
+	}
+
+	/**
+	 * Reloads {@link JsonRpcDispatcher} in a child loader with {@code key} set, so its {@code static final}
+	 * setting is resolved again — the same trick the envelope bounds above use.
+	 */
+	private static void assertDispatcherOverride(String key, String value, int expected) throws Exception {
+		System.setProperty(key, value);
+		try {
+			Class<?> reloaded = Class.forName("io.activej.jsonrpc.service.JsonRpcDispatcher", true,
+				new ModuleReloadingClassLoader(JsonRpcLimitsTest.class.getClassLoader()));
+			assertFalse("the class must have been re-initialised", reloaded == JsonRpcDispatcher.class);
+			assertEquals(key + '=' + value, expected, (int) (Integer) reloaded.getField("MAX_IN_FLIGHT").get(null));
+		} finally {
+			System.clearProperty(key);
+		}
+	}
+
+	/**
+	 * The observation seam this suite reads: what was announced as a request, and how many elements were
+	 * shed at the bound. The rejection count is <b>aggregate</b> — a rejected element carries no descriptor
+	 * by construction, because it never reached a handler.
+	 */
+	private static final class RecordingInspector
+		extends AbstractInspector<JsonRpcDispatcher.Inspector>
+		implements JsonRpcDispatcher.Inspector {
+		private final List<String> requests = new ArrayList<>();
+		private int rejected;
+
+		@Override
+		public void onRequest(JsonRpcMethodDescriptor descriptor) {
+			requests.add(descriptor.wireName());
+		}
+
+		@Override
+		public void onResponse(JsonRpcMethodDescriptor descriptor, long durationMillis) {}
+
+		@Override
+		public void onError(JsonRpcMethodDescriptor descriptor, int errorCode, long durationMillis) {}
+
+		@Override
+		public void onMethodNotFound(String requestedName) {}
+
+		@Override
+		public void onMalformed() {}
+
+		@Override
+		public void onRejected() {
+			rejected++;
 		}
 	}
 

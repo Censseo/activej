@@ -28,8 +28,13 @@ import io.activej.inject.binding.DIException;
 import io.activej.inject.annotation.Provides;
 import io.activej.inject.annotation.ProvidesIntoSet;
 import io.activej.inject.module.AbstractModule;
+import io.activej.jsonrpc.service.JsonRpcDispatcher;
+import io.activej.launchers.jsonrpc.fixtures.User;
 import io.activej.launchers.jsonrpc.fixtures.UserApi;
 import io.activej.launchers.jsonrpc.fixtures.UserApiImpl;
+import io.activej.promise.Promise;
+import io.activej.promise.Promises;
+import io.activej.promise.SettablePromise;
 import io.activej.reactor.Reactor;
 import io.activej.reactor.nio.NioReactor;
 import io.activej.test.EventloopThread;
@@ -41,13 +46,16 @@ import org.junit.ClassRule;
 import org.junit.Test;
 
 import java.net.InetSocketAddress;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static io.activej.promise.TestUtils.await;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.Objects.requireNonNull;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -161,6 +169,60 @@ public class JsonRpcModuleConfigTest {
 		assertEquals(200, ok.code());
 	}
 
+	// ---------------------------------------------------------------------------------------------
+	// FR-039 — jsonrpc.maxInFlight, admitted by feature 019 and wired into the dispatcher builder
+	// ---------------------------------------------------------------------------------------------
+
+	@Test
+	public void maxInFlightIsAdmittedAndReachesTheDispatcherBuilder() {
+		// the dispatcher publishes its configured ceiling as a read-only JMX attribute (FR-038), which is
+		// exactly the read-back an operator gets — so the wiring is asserted through the shipped surface
+		JsonRpcDispatcher configured = dispatcher(Config.create().with("jsonrpc.maxInFlight", "7"), new UserApiImpl());
+		assertEquals(7, requireNonNull(configured.getStats()).getMaxInFlight());
+	}
+
+	@Test
+	public void anAbsentMaxInFlightLeavesTheApplicationSettingsDefaultInForce() {
+		JsonRpcDispatcher defaulted = dispatcher(Config.create(), new UserApiImpl());
+
+		assertEquals("the documented default", 1000, JsonRpcDispatcher.MAX_IN_FLIGHT);
+		assertEquals(JsonRpcDispatcher.MAX_IN_FLIGHT, requireNonNull(defaulted.getStats()).getMaxInFlight());
+	}
+
+	@Test
+	public void theConfiguredMaxInFlightIsTheBoundActuallyInForce() {
+		// a read-back alone would pass on a key that were read, reported and then dropped. With the ceiling
+		// at 1 and an implementation that never answers, the SECOND call is shed with -32005 — an outcome the
+		// 1000 default could not produce — and a third succeeds once the slot is freed, so the counter is
+		// shown to decrement rather than to ratchet
+		BlockingUserApi blocking = new BlockingUserApi();
+		JsonRpcDispatcher dispatcher = dispatcher(Config.create().with("jsonrpc.maxInFlight", "1"), blocking);
+
+		Promise<byte[]> held = dispatcher.dispatch(userGet(1));
+		// the guard is the harness, never the thing under test: without the bound in force this element
+		// would be admitted and never answered, and a bare await would hang the whole suite rather than fail
+		String shed = new String(await(Promises.timeout(Duration.ofSeconds(5), dispatcher.dispatch(userGet(2)))), UTF_8);
+
+		assertTrue("the excess element must be shed with -32005: " + shed, shed.contains("\"code\":-32005"));
+		assertFalse("the admitted element must still be in flight", held.isComplete());
+
+		blocking.release();
+		assertTrue(new String(await(held), UTF_8).contains("\"result\""));
+		String afterRelease = new String(await(dispatcher.dispatch(userGet(3))), UTF_8);
+		assertTrue("the freed slot must be reusable: " + afterRelease, afterRelease.contains("\"result\""));
+	}
+
+	@Test
+	public void aMaxInFlightBelowOneIsRefusedAtBuild() {
+		// the dispatcher's build-time refusal surfaces wrapped by the DI machinery, exactly like the
+		// servlet's emptyResponseCode refusal below
+		DIException wrapper = assertThrows(DIException.class,
+			() -> dispatcher(Config.create().with("jsonrpc.maxInFlight", "0"), new UserApiImpl()));
+		assertTrue("unexpected cause: " + wrapper.getCause(), wrapper.getCause() instanceof IllegalArgumentException);
+		assertTrue("the offending key must be named: " + wrapper.getCause().getMessage(),
+			wrapper.getCause().getMessage().contains("maxInFlight"));
+	}
+
 	@Test
 	public void emptyResponseCodeSwitches204To200AndRefusesOthers() throws Exception {
 		// default is 204 for an empty dispatcher result (a lone notification)
@@ -179,5 +241,67 @@ public class JsonRpcModuleConfigTest {
 			() -> startServer(Config.create().with("jsonrpc.emptyResponseCode", "418")));
 		assertTrue("unexpected cause: " + wrapper.getCause(), wrapper.getCause() instanceof IllegalArgumentException);
 		assertTrue(wrapper.getCause().getMessage().contains("emptyResponseCode"));
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// Harness for the dispatcher-only cases above.
+	// ---------------------------------------------------------------------------------------------
+
+	/** The dispatcher alone — no server, no listen channel, so it runs on the test reactor. */
+	private JsonRpcDispatcher dispatcher(Config config, UserApi implementation) {
+		Injector injector = Injector.of(new JsonRpcModule(), new AbstractModule() {
+			@Provides
+			NioReactor reactor() {
+				return Reactor.getCurrentReactor();
+			}
+
+			@Provides
+			Config config() {
+				return config;
+			}
+
+			@Provides
+			JsonRpcDispatcher.Inspector inspector() {
+				return new JsonRpcDispatcher.JmxInspector();
+			}
+
+			@ProvidesIntoSet
+			JsonRpcServiceBinding userApi() {
+				return new JsonRpcServiceBinding(UserApi.class, implementation);
+			}
+		});
+		return injector.getInstance(JsonRpcDispatcher.class);
+	}
+
+	private static byte[] userGet(long id) {
+		return ("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"method\":\"user.get\",\"params\":[" + id + "]}").getBytes(UTF_8);
+	}
+
+	/**
+	 * {@link UserApi} whose calls stay in flight until {@link #release()} — the only shape against which a
+	 * concurrency ceiling is observable at all. Reactor-confined, like the counter it exercises.
+	 */
+	private static final class BlockingUserApi implements UserApi {
+		private final List<SettablePromise<User>> pending = new ArrayList<>();
+		private boolean blocking = true;
+
+		@Override
+		public Promise<User> getUser(long id) {
+			if (!blocking) return Promise.of(new User(id, "user-" + id));
+			SettablePromise<User> promise = new SettablePromise<>();
+			pending.add(promise);
+			return promise;
+		}
+
+		@Override
+		public void touch(long id) {}
+
+		void release() {
+			blocking = false;
+			for (SettablePromise<User> promise : pending) {
+				promise.set(new User(0, "released"));
+			}
+			pending.clear();
+		}
 	}
 }

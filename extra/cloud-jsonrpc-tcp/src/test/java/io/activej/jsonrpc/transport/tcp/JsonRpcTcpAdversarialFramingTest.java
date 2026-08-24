@@ -49,6 +49,9 @@ import org.junit.Test;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -71,6 +74,9 @@ import static org.junit.Assert.assertTrue;
  * Domain A of the feature 017 adversarial test plan — wire &amp; framing under a hostile peer.
  * Seven scenarios, A1–A7, each verified against {@code contracts/tcp-framing.md} and the production
  * source (never against "what the code happens to do today") before the assertion was written.
+ * Feature 019 (T039) added an eighth, A2b, for FR-030: A2 pins where the transport tier sits, A2b
+ * pins that reaching it costs the <i>sender</i> its connection rather than costing the receiver the
+ * whole stream — the property "the bound is applied during accumulation" actually names.
  *
  * <h2>What every scenario in this class shares</h2>
  * The framing decoder ({@code OfByteTerminated}) understands exactly one byte value, {@code 0x0A} —
@@ -219,6 +225,95 @@ public final class JsonRpcTcpAdversarialFramingTest {
 
 		assertEquals("the closed session left the registry", 0, sessionCount());
 	}
+
+	// -------------------------------------------------------------------------------------------
+	// A2b (feature 019, T039): FR-030 — the transport tier refuses DURING accumulation, so nothing of
+	// the attempted size is ever allocated. A2 above pins the bound's exact position; this pins that
+	// reaching it costs the sender its connection rather than costing the receiver the whole stream.
+	// -------------------------------------------------------------------------------------------
+
+	@Test
+	public void testAnUnterminatedFloodIsRefusedDuringAccumulationNotAfterIt() {
+		// A2 writes exactly maxSize bytes — enough to locate the boundary, not enough to say anything
+		// about memory: at the boundary, "capped incrementally as the bytes arrive" and "read it all,
+		// then check" are the same observation. FR-030 is the second question, and it needs a stream
+		// the receiver could not possibly be meant to hold: this one offers 262,144× the tier.
+		//
+		// OfByteTerminated's scan is what makes the answer "during": it fails at index maxSize-1 while
+		// ACCUMULATING, so the refusal lands after ~8 kB of an offered 2 GiB and the connection closes.
+		// A decoder that framed first and checked afterwards would keep taking bytes until the whole
+		// flood was in — the assertion below is the byte count that separates the two.
+		startServer(SMALL_TIER);
+		byte[] block = new byte[16 * 1024];
+		Arrays.fill(block, (byte) 'z');                                  // no 0x0A anywhere: never a boundary
+
+		Flood flood = flood(new InetSocketAddress("localhost", port), block, FLOOD_ATTEMPT);
+
+		assertTrue("the framing tier must cut the connection, not keep taking bytes: " + flood,
+			flood.refused());
+		assertTrue("the tier is applied during accumulation: " + FLOOD_ATTEMPT + " bytes were offered " +
+				   "against a " + SMALL_TIER + " tier and the server took " + flood.written(),
+			flood.written() < FLOOD_CEILING);
+		assertEquals("a framing violation closes the connection, it does not answer", "", flood.received());
+	}
+
+	/** What the FR-030 flood offers: 2 GiB against an 8 kB tier. */
+	private static final long FLOOD_ATTEMPT = 2L * 1024 * 1024 * 1024;
+
+	/**
+	 * The byte count above which the flood would mean "it accumulated first". A sixty-fourth of the
+	 * offer. Deliberately loose, and the looseness is not slack: what the sender gets away with is
+	 * dominated by both kernels' socket buffers — a property of the pipe, not of the message, and one
+	 * that does not grow with the offer. Measured here at ≈2.7 MB, so the ceiling clears it twelve
+	 * times over; the two candidate behaviours are "a few MB" and "all 2 GiB".
+	 */
+	private static final long FLOOD_CEILING = FLOOD_ATTEMPT / 64;
+
+	/** What a {@link #flood} peer managed to push, whether it was cut off, and anything it read back. */
+	private record Flood(long written, boolean refused, String received) {}
+
+	/**
+	 * Pushes {@code block} at {@code address} over and over — up to {@code attempt} bytes — and reports
+	 * how many the server was still willing to take before it cut the connection.
+	 * <p>
+	 * A non-blocking {@link SocketChannel} rather than the module's blocking
+	 * {@link JsonRpcTcpRawSocket}: a blocking {@code write} has <b>no</b> timeout ({@code SO_TIMEOUT}
+	 * bounds reads only), so a server that stopped reading without closing would hang the suite instead
+	 * of failing it — the worst diagnostic there is (ADR-040, applied to the peer side). Every loop here
+	 * is bounded by a wall-clock deadline as well as by {@code attempt}: the failure mode is a red test
+	 * carrying a byte count, never a hang.
+	 */
+	private static Flood flood(InetSocketAddress address, byte[] block, long attempt) {
+		long deadline = System.currentTimeMillis() + FLOOD_DEADLINE_MILLIS;
+		StringBuilder received = new StringBuilder();
+		long written = 0;
+		try (SocketChannel channel = SocketChannel.open()) {
+			channel.connect(address);
+			channel.configureBlocking(false);
+			ByteBuffer sink = ByteBuffer.allocate(4096);
+			ByteBuffer out = ByteBuffer.wrap(block);
+			while (written < attempt && System.currentTimeMillis() < deadline) {
+				sink.clear();
+				int read = channel.read(sink);
+				if (read > 0) received.append(new String(sink.array(), 0, read, UTF_8));
+				if (read == -1) return new Flood(written, true, received.toString());
+				out.rewind();
+				int wrote = channel.write(out);
+				written += wrote;
+				if (wrote == 0 && read == 0) Thread.sleep(1);
+			}
+			return new Flood(written, false, received.toString());
+		} catch (IOException e) {
+			// the peer closed and RST our next write: a refusal, observed from the other end
+			return new Flood(written, true, received.toString());
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new AssertionError(e);
+		}
+	}
+
+	/** Wall-clock bound on {@link #flood} — its failure mode must be a red test, never a hung suite. */
+	private static final long FLOOD_DEADLINE_MILLIS = 30_000;
 
 	// -------------------------------------------------------------------------------------------
 	// A3 (P0): outright invalid UTF-8 bytes before the terminator.

@@ -17,7 +17,10 @@
 package io.activej.jsonrpc.service;
 
 import io.activej.async.exception.AsyncCloseException;
+import io.activej.async.exception.AsyncTimeoutException;
 import io.activej.async.process.AsyncCloseable;
+import io.activej.common.ApplicationSettings;
+import io.activej.common.StringFormatUtils;
 import io.activej.common.builder.AbstractBuilder;
 import io.activej.common.exception.MalformedDataException;
 import io.activej.json.JsonCodec;
@@ -47,6 +50,7 @@ import io.activej.reactor.Reactor;
 import org.jetbrains.annotations.Nullable;
 
 import java.lang.reflect.Proxy;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -54,6 +58,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.function.Consumer;
 
+import static io.activej.common.Checks.checkArgument;
 import static io.activej.reactor.Reactive.checkInReactorThread;
 
 /**
@@ -95,6 +100,31 @@ import static io.activej.reactor.Reactive.checkInReactorThread;
  * entry created (FR-070). A duplicate answer is the same case by construction, since the first one already
  * emptied the slot.
  *
+ * <h2>The per-call deadline, and why cancellation is local only</h2>
+ * Every call carries a deadline — {@link #CALL_TIMEOUT} by default, {@link Builder#withCallTimeout(Duration)}
+ * per client, {@link Duration#ZERO} to switch it off. It is armed at registration, <b>before</b> the document
+ * reaches the transport, scheduled with {@code scheduleBackground} so a pending call never keeps an eventloop
+ * alive, held in the entry's own {@link PendingCall#deadline} slot, and cancelled inside the same single
+ * {@code remove(id)} that settles the promise — so every exit disarms exactly once (FR-010…FR-014).
+ * <p>
+ * On expiry the entry leaves the table and the caller's promise fails with {@link AsyncTimeoutException}
+ * naming the wire name and the configured delay. <b>The server is never informed</b> (FR-023): JSON-RPC 2.0
+ * defines no cancellation message, so an expiry is purely local bookkeeping — the correlation entry is
+ * reclaimed here and nothing goes on the wire. Whatever the peer eventually answers arrives for an identifier
+ * that is in no entry, which is the orphan case above: ignored silently, with nothing constructed and nothing
+ * reported (FR-015).
+ * <p>
+ * <b>There is no per-call override on this API</b>, deliberately (FR-024). A caller who needs <i>less</i> than
+ * this client's timeout for one call composes the platform's existing race:
+ * <pre>{@code
+ * Promises.timeout(Duration.ofMillis(250), api.getUser(42))
+ * }</pre>
+ * which releases <i>the caller</i> early and discards whatever arrives afterwards. The correlation entry it
+ * does <b>not</b> release: ActiveJ promises have no cancellation or unsubscribe primitive, so nothing can
+ * reach back into the table, and the entry lives until this client's own deadline reclaims it. A per-call
+ * parameter on the proxy would therefore be new API surface promising something the pattern already gives —
+ * and promising it more strongly than the platform can deliver.
+ *
  * <h2>Closing</h2>
  * {@link #closeEx} completes every pending call through the removal path, empties the table and closes the
  * transport; it is idempotent. A close originating at the peer takes the same path with the transport's cause
@@ -102,6 +132,16 @@ import static io.activej.reactor.Reactive.checkInReactorThread;
  * immediately, hands no document to the transport and records nothing (FR-078b).
  */
 public final class JsonRpcClient extends AbstractReactive implements AsyncCloseable {
+	/**
+	 * The per-call deadline every client starts with — {@code 30 seconds}, overridable process-wide with
+	 * {@code -DJsonRpcClient.callTimeout=...} (or the fully qualified spelling) and per client with
+	 * {@link Builder#withCallTimeout(Duration)}. {@link Duration#ZERO} disables the timeout entirely.
+	 * <p>
+	 * On by default, because the alternative is a silent peer pending a caller forever (constitution III).
+	 */
+	public static final Duration CALL_TIMEOUT =
+		ApplicationSettings.getDuration(JsonRpcClient.class, "callTimeout", Duration.ofSeconds(30));
+
 	private final JsonRpcTransport transport;
 
 	/** The correlation table. Reactor-confined, so a plain {@link HashMap} is the honest structure. */
@@ -116,6 +156,7 @@ public final class JsonRpcClient extends AbstractReactive implements AsyncClosea
 	private JsonRpcPeerHandler peerHandler = JsonRpcPeerHandler.methodNotFound();
 	private JsonRpcParamStyle paramStyle = JsonRpcParamStyle.POSITIONAL;
 	private Consumer<Exception> failureHandler;
+	private Duration callTimeout = CALL_TIMEOUT;
 
 	/** The identifier counter: monotonic, starting at 1, reactor-confined (FR-065). */
 	private long lastId;
@@ -188,8 +229,29 @@ public final class JsonRpcClient extends AbstractReactive implements AsyncClosea
 			return this;
 		}
 
+		/**
+		 * How long a call may wait for its answer before its promise fails with
+		 * {@link AsyncTimeoutException} and its correlation entry is reclaimed (FR-020). Defaults to
+		 * {@link #CALL_TIMEOUT}.
+		 * <p>
+		 * {@link Duration#ZERO} <b>disables</b> the timeout: no deadline is armed at all, and a call waits
+		 * as long as the peer takes. A negative duration is rejected at {@link #build()} — it names neither
+		 * a bound nor an opt-out.
+		 *
+		 * @throws NullPointerException if {@code callTimeout} is {@code null}
+		 */
+		public Builder withCallTimeout(Duration callTimeout) {
+			checkNotBuilt(this);
+			JsonRpcClient.this.callTimeout = Objects.requireNonNull(callTimeout, "callTimeout");
+			return this;
+		}
+
 		@Override
 		protected JsonRpcClient doBuild() {
+			// before the listener is registered: a build that is going to be refused must not have joined
+			// this client to a transport documents could already be arriving on
+			checkArgument(!callTimeout.isNegative(),
+				"callTimeout must not be negative (Duration.ZERO disables the per-call deadline): %s", callTimeout);
 			transport.setListener(new JsonRpcTransport.Listener() {
 				@Override
 				public void onDocument(byte[] document) {
@@ -271,15 +333,26 @@ public final class JsonRpcClient extends AbstractReactive implements AsyncClosea
 
 	/**
 	 * <b>The</b> removal path. Every exit from the table — success, remote error, transport send failure,
-	 * local close, peer close, and any future expiry — is this method and nothing else (FR-068). The sixth
-	 * trigger of FR-068, a local encoding failure, reaches it vacuously: it fails before an identifier is
-	 * allocated, so there is no entry to remove.
+	 * local close, peer close and expiry — is this method and nothing else (FR-068). The sixth trigger of
+	 * FR-068, a local encoding failure, reaches it vacuously: it fails before an identifier is allocated, so
+	 * there is no entry to remove.
+	 * <p>
+	 * It is also <b>the</b> disarm point (FR-011, FR-014): the entry's deadline is cancelled here, so no exit
+	 * can settle a promise while leaving a timer task behind, and none can disarm twice. Cancelling from
+	 * inside the expiry's own task is a no-op by construction — the scheduler clears a task's queue reference
+	 * before invoking it — so the expiry path needs no special case.
 	 *
 	 * @return the entry that was removed, or {@code null} when the identifier was in no entry: an orphan
 	 * answer, which is ignored silently (FR-070)
 	 */
 	private @Nullable PendingCall remove(JsonRpcId id) {
-		return pending.remove(id);
+		PendingCall removed = pending.remove(id);
+		// null when the timeout is disabled (callTimeout == ZERO) and only then, so this is not a "maybe
+		// somebody armed it" check — it is the disabled case, stated once
+		if (removed != null && removed.deadline != null) {
+			removed.deadline.cancel();
+		}
+		return removed;
 	}
 
 	private Promise<Object> call(JsonRpcMethodDescriptor descriptor, JsonRpcPayload params) {
@@ -299,7 +372,15 @@ public final class JsonRpcClient extends AbstractReactive implements AsyncClosea
 		SettablePromise<Object> promise = new SettablePromise<>();
 		// registered BEFORE the send: a transport that answers inside send() — the in-memory one does — must
 		// find the entry already there
-		pending.put(id, new PendingCall(id, promise, descriptor.resultCodec()));
+		PendingCall call = new PendingCall(id, promise, descriptor.resultCodec());
+		pending.put(id, call);
+		// FR-010/FR-012: armed before the document is handed over, and in the BACKGROUND so that a call in
+		// flight never keeps an eventloop alive. Nothing beyond this is resolved per call (FR-022) — the wire
+		// name is the descriptor's, decided once at contract construction
+		if (!callTimeout.isZero()) {
+			String wireName = descriptor.wireName();
+			call.deadline = reactor.delayBackground(callTimeout, () -> expire(id, wireName));
+		}
 
 		transport.send(document)
 			.whenException(e -> {
@@ -309,6 +390,24 @@ public final class JsonRpcClient extends AbstractReactive implements AsyncClosea
 			});
 
 		return promise;
+	}
+
+	/**
+	 * The deadline fired (FR-013). The entry leaves through {@link #remove(JsonRpcId)} like every other exit,
+	 * and the caller learns the wire name and the delay it was given — the two facts that make a timeout
+	 * actionable without disclosing anything a peer sent.
+	 * <p>
+	 * <b>Nothing goes on the wire.</b> JSON-RPC 2.0 defines no cancellation message, so an expiry is local
+	 * bookkeeping only and the peer is never told (FR-023). Its eventual answer is then an orphan, ignored
+	 * silently by {@link #complete}.
+	 */
+	private void expire(JsonRpcId id, String wireName) {
+		PendingCall expired = remove(id);
+		// null if the entry left between this task being taken from the queue and this method running
+		if (expired == null) return;
+		expired.promise.setException(new AsyncTimeoutException(
+			"the JSON-RPC call '" + wireName + "' timed out after " +
+			StringFormatUtils.formatDuration(callTimeout)));
 	}
 
 	private Promise<Void> sendNotification(JsonRpcMethodDescriptor descriptor, JsonRpcPayload params) {
