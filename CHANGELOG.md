@@ -480,6 +480,25 @@ Fixes a latent platform defect found while verifying this surface against a real
 
 ### Notable fixes
 
+- **`WebSocket.readMessage()` no longer strands the payload of a fragment that pushes a message over
+  `maxWebSocketMessageSize`** (in `core-http`). Every fragment's `ByteBuf` was taken from the frame and
+  either added to the running `messageBufs` accumulator or, on the crossing fragment, handed to
+  `protocolError(MESSAGE_TOO_BIG, cb)` and dropped — neither added to `messageBufs` (whose own
+  `.whenException(e -> messageBufs.recycle())` would have recycled it) nor recycled directly. One
+  pooled `ByteBuf` leaked per fragmented message that crossed the cap; reproduces with two fragments
+  and no flood. The **unfragmented** oversize path never leaked — `WebSocketBufsToFrames.processMask`
+  refuses it on the frame's declared length before any payload buffer exists — which is why only the
+  running-total check in `readMessage` was exposed and no existing test caught it. The fix recycles
+  the crossing fragment's payload immediately before the error is reported. Regression tests:
+  `WebSocketTest` (`aFragmentedMessageThatCrossesMaxMessageSizeDoesNotStrandTheCrossingFragmentsPayload`),
+  a new unit-level test of `WebSocket.readMessage()` built directly over a fake `ChannelSupplier<Frame>`
+  with no socket involved; and (`-P extra`) `extra/cloud-jsonrpc-ws`'s `JsonRpcWsFragmentedOversizeTest`,
+  the original discovery, which loses its class-level `@IgnoreLeaks` as proof. Found by the feature 019
+  (`019-jsonrpc-robustness-ci`) adversarial sweep, outside its own scope, and deliberately deferred
+  (SC-007) to this non-SpecForge follow-up, in the same shape as `016-websocket-leak-fixes`. A second,
+  smaller (~64 byte) leak in `WebSocketFramesToBufs.encodeClose` on the client remains open and is out
+  of scope for this fix — far less characterized, with no ready-made regression test.
+
 - **`WebSocketServlet` no longer strands the request body stream when an upgrade is
   refused** (in `core-http`). `takeBodyStream()` used to run *before* `onRequest`,
   with the recycler wired only to the *returned* promise's exception path — so a

@@ -100,6 +100,10 @@ public final class WebSocket extends AbstractAsyncCloseable implements IWebSocke
 						}
 						ByteBuf payload = frame.getPayload();
 						if (messageBufs.remainingBytes() + payload.readRemaining() > maxMessageSize) {
+							// The crossing fragment is refused here and never reaches messageBufs, so it is not covered
+							// by this method's own .whenException(e -> messageBufs.recycle()) above -- recycle it directly,
+							// the same way every other branch in this method disposes of a payload it does not keep.
+							payload.recycle();
 							protocolError(MESSAGE_TOO_BIG, cb);
 							return;
 						}
