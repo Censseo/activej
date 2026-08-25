@@ -1,5 +1,21 @@
 # Changelog
 
+## v7.1.1 — 2026-08-25 — jitpack: pin a modern Maven
+
+### Notable fixes
+
+- **JitPack builds no longer fail on the first module.** [jitpack.yml](jitpack.yml)'s
+  `before_install` now also pins Maven via sdkman (`sdk install maven 3.9.9`). JitPack's
+  build image runs its own bundled `/opt/apache-maven-3.6.1` regardless of which JDK is
+  active — the existing sdkman step only swaps the JVM, not the `mvn` binary — and
+  `maven-compiler-plugin:3.13.0` (pinned in `pom.xml` since before this fork existed)
+  declares a `<maven>` prerequisite of `3.6.3`, so every build failed at the very first
+  module (`activej-types`) with `requires Maven version 3.6.3`. Confirmed 2026-08-25
+  building `v7.1.0`: only the root POM and the unrelated `archetypes/` reactor were
+  published — none of the real reactor, JSON-RPC included. `v7.1.0`'s tag and GitHub
+  release are unchanged; this is a build-pipeline-only fix, released separately rather
+  than by moving a published tag.
+
 ## v7.1.0 — 2026-08-25 — JSON-RPC 2.0: protocol, transports, launchers and discovery
 
 The JSON-RPC 2.0 line lands end to end and closes the `002-json-rpc` idea's open

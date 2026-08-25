@@ -7,10 +7,20 @@
 jdk:
   - openjdk21
 
+# JitPack's build image invokes its own bundled /opt/apache-maven-3.6.1, regardless of
+# which JDK is active — the sdkman step above only fixes the JVM, not the mvn binary
+# that runs the reactor. maven-compiler-plugin:3.13.0 (pinned in pom.xml) declares a
+# <maven> prerequisite of 3.6.3, so 3.6.1 fails every build at the very first module
+# (activej-types) with "requires Maven version 3.6.3" — confirmed 2026-08-25 building
+# v7.1.0: only the root POM and the unrelated archetypes/ reactor got published, nothing
+# from the real reactor. Same fix as the JDK, applied to Maven.
 before_install:
   - sdk install java 25-open
   - sdk use java 25-open
+  - sdk install maven 3.9.9
+  - sdk use maven 3.9.9
   - java -version
+  - mvn -version
 
 # JitPack's default build command is a plain `mvn install -DskipTests`, and the `extra`
 # profile is activeByDefault=false — so without `-P extra` every artifact under extra/
