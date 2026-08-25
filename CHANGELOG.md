@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased
+## v7.1.0 — 2026-08-25 — JSON-RPC 2.0: protocol, transports, launchers and discovery
+
+The JSON-RPC 2.0 line lands end to end and closes the `002-json-rpc` idea's open
+set: an envelope and dispatcher, an annotated service layer, three
+interchangeable transports (HTTP POST, WebSocket, framed TCP), turnkey
+launchers with per-method JMX, OpenRPC schema discovery (`rpc.discover`), and
+the robustness work — a 30 s call deadline, a 1000-call in-flight ceiling —
+that makes it deployable rather than merely demonstrable. None of this existed
+in `v7.0.0`, so nothing below breaks anything that shipped before: every entry
+under Breaking changes is scoped to this new line, never released until now.
+
+Also in this release: `JsonCodecFactory` (`activej-json`) derives a `JsonCodec`
+for any `record` and eleven more built-in types; five WebSocket leak and
+correctness fixes land in `core-http`, plus one in `core-csp`; CI now builds
+and tests the `extra/` profile, informationally; and JitPack publishes the
+`extra/` artefacts for the first time.
 
 ### Breaking changes
 
