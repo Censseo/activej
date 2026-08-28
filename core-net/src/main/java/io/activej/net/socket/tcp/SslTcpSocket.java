@@ -139,7 +139,13 @@ public final class SslTcpSocket extends AbstractNioReactive implements ITcpSocke
 			return Promise.ofException(new AsyncCloseException());
 		}
 		if (buf == null) {
-			throw new UnsupportedOperationException("SSL cannot work in half-duplex mode");
+			// SSL has no half-close, so end of output is a graceful shutdown:
+			// flush whatever is still buffered, then close() emits close_notify
+			// and defers the upstream close behind it
+			if (write != null) return write.then(() -> write(null));
+			assert !app2engine.canRead();
+			close();
+			return Promise.complete();
 		}
 		if (!buf.canRead()) {
 			buf.recycle();

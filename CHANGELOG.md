@@ -1,5 +1,43 @@
 # Changelog
 
+## v7.1.2 — 2026-08-28 — core-net: SslTcpSocket no longer kills the reactor on graceful close
+
+### Notable fixes
+
+- **`SslTcpSocket.write(null)` now performs a graceful TLS shutdown instead of throwing into the
+  reactor.** [`SslTcpSocket.write`](core-net/src/main/java/io/activej/net/socket/tcp/SslTcpSocket.java)
+  threw `UnsupportedOperationException("SSL cannot work in half-duplex mode")` synchronously whenever
+  it was handed `null` — the standard end-of-stream marker of the `ITcpSocket.write` contract — on a
+  still-open socket. `null` is not a rare or malformed input: `ChannelConsumers.ofSocket`'s
+  acknowledgement, `Messaging.sendEndOfStream()` and `RedisConnection.sendEndOfStream()` all send it
+  as a matter of routine, and `RpcStream` binds `ChannelConsumers.ofSocket(socket)` as the serializer
+  output on both the compressed and uncompressed paths — so this was the *normal* graceful-close path
+  of every RPC connection over TLS, not an edge case. Because the throw happened inside a promise
+  callback, it escaped straight to the reactor's `FatalErrorHandler`; under the default `rethrow()`
+  policy the whole eventloop died. `write(null)` now flushes whatever TLS application data is still
+  buffered, then performs the graceful TLS shutdown (`close()`, which already emits `close_notify` via
+  the existing `tryCloseOutbound()`), and completes the returned promise successfully — no public
+  signature changed. The existing "socket already closed → `Promise.ofException(new
+  AsyncCloseException())`" branch is unchanged.
+
+  No existing test caught this: `core-csp`'s `SslTcpSocketTest` — the only SSL socket test in the
+  tree — never called `write(null)` on an open socket, and neither `cloud-rpc` nor `cloud-fs` had any
+  TLS test coverage at all.
+
+  Regression tests: `SslTcpSocketTest#testWriteEndOfStreamFlushesBufferedDataAndClosesGracefully`,
+  `#testWriteEndOfStreamToClosedSocket`, `#testChannelConsumerOfSocketAcknowledgesWithEndOfStream`,
+  `#testMessagingSendEndOfStream` (`core-csp`), and `RpcSslShutdownTest` (`cloud-rpc`, new — the
+  first TLS test in the module).
+
+  Left deliberately unfixed: `SslTcpSocket` still has no true half-close — `write(null)` ends the
+  whole session, not just the output direction — and `closeEx` still recycles `engine2app` on close,
+  so already-decrypted inbound plaintext not yet consumed by `read()` is discarded either way. Both
+  predate this fix and are unrelated to it.
+
+  This is a behavioural change for the `ITcpSocket` state machine documented in
+  [`core-net/CLAUDE.md`](core-net/CLAUDE.md): for `SslTcpSocket`, `write(null)` now transitions to
+  `CLOSED`, not the `WRITE_CLOSED` state that plain `TcpSocket` reaches for the same call.
+
 ## v7.1.1 — 2026-08-25 — jitpack: pin a modern Maven
 
 ### Notable fixes

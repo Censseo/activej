@@ -5,8 +5,11 @@ import io.activej.bytebuf.ByteBuf;
 import io.activej.bytebuf.ByteBufStrings;
 import io.activej.common.exception.TruncatedDataException;
 import io.activej.csp.binary.BinaryChannelSupplier;
+import io.activej.csp.binary.codec.ByteBufsCodec;
+import io.activej.csp.binary.codec.ByteBufsCodecs;
 import io.activej.csp.binary.decoder.ByteBufsDecoder;
 import io.activej.csp.binary.decoder.ByteBufsDecoders;
+import io.activej.csp.consumer.ChannelConsumers;
 import io.activej.csp.supplier.ChannelSuppliers;
 import io.activej.net.SimpleServer;
 import io.activej.net.socket.tcp.ITcpSocket;
@@ -46,9 +49,11 @@ import static io.activej.promise.TestUtils.awaitException;
 import static io.activej.reactor.Reactor.getCurrentReactor;
 import static io.activej.test.TestUtils.assertCompleteFn;
 import static io.activej.test.TestUtils.getFreePort;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public final class SslTcpSocketTest {
 	private static final String KEYSTORE_PATH = "./src/test/resources/keystore.jks";
@@ -71,6 +76,9 @@ public final class SslTcpSocketTest {
 	private static final ByteBufsDecoder<String> DECODER_LARGE = ByteBufsDecoders.ofFixedSize(LENGTH)
 		.andThen(ByteBuf::asArray)
 		.andThen(ByteBufStrings::decodeAscii);
+
+	private static final ByteBufsCodec<String, String> STRING_CODEC = ByteBufsCodecs.nullTerminated()
+		.transform(buf -> buf.asString(UTF_8), str -> ByteBuf.wrapForReading(str.getBytes(UTF_8)));
 
 	@ClassRule
 	public static final EventloopRule eventloopRule = new EventloopRule();
@@ -242,6 +250,77 @@ public final class SslTcpSocketTest {
 			.map(tcpSocket -> SslTcpSocket.wrapClientSocket(reactor, tcpSocket, sslContext, executor))
 			.then(socket -> socket.write(ByteBufStrings.wrapUtf8("hello"))));
 		assertThat(exception, instanceOf(AsyncCloseException.class));
+	}
+
+	@Test
+	public void testWriteEndOfStreamFlushesBufferedDataAndClosesGracefully() throws IOException {
+		startServer(sslContext, serverSsl -> BinaryChannelSupplier.of(ChannelSuppliers.ofSocket(serverSsl))
+			.decode(DECODER)
+			.whenComplete(serverSsl::close)
+			.whenComplete(assertCompleteFn(result -> assertEquals(TEST_STRING, result))));
+
+		SslTcpSocket sslSocket = await(TcpSocket.connect(reactor, address)
+			.map(socket -> SslTcpSocket.wrapClientSocket(reactor, socket, sslContext, executor))
+			.then(clientSsl -> {
+				// Deliberately NOT awaited. The TLS handshake is still in flight, so the payload is
+				// provably still sitting in app2engine when write(null) is called on the next line -
+				// write(null) has to flush it. The assertCompleteFn also pins that write(null) must
+				// not fail the in-flight data write.
+				clientSsl.write(wrapAscii(TEST_STRING))
+					.whenComplete(assertCompleteFn());
+
+				return clientSsl.write(null)
+					.map($ -> clientSsl);
+			}));
+
+		assertTrue(sslSocket.isClosed());
+	}
+
+	@Test
+	public void testWriteEndOfStreamToClosedSocket() throws IOException {
+		startServer(sslContext, ITcpSocket::close);
+
+		Exception e = awaitException(TcpSocket.connect(reactor, address)
+			.map(socket -> SslTcpSocket.wrapClientSocket(reactor, socket, sslContext, executor))
+			.then(clientSsl -> {
+				clientSsl.close();
+				return clientSsl.write(null);
+			}));
+
+		assertThat(e, instanceOf(AsyncCloseException.class));
+	}
+
+	@Test
+	public void testChannelConsumerOfSocketAcknowledgesWithEndOfStream() throws IOException {
+		startServer(sslContext, serverSsl -> BinaryChannelSupplier.of(ChannelSuppliers.ofSocket(serverSsl))
+			.decode(DECODER)
+			.whenComplete(serverSsl::close)
+			.whenComplete(assertCompleteFn(result -> assertEquals(TEST_STRING, result))));
+
+		// Exactly RpcStream's wiring: serializer.getOutput().set(ChannelConsumers.ofSocket(socket)).
+		// The acknowledgement of ChannelConsumers.ofSocket ends in socket.write(null).
+		await(TcpSocket.connect(reactor, address)
+			.map(socket -> SslTcpSocket.wrapClientSocket(reactor, socket, sslContext, executor))
+			.then(clientSsl -> ChannelSuppliers.ofValue(wrapAscii(TEST_STRING))
+				.streamTo(ChannelConsumers.ofSocket(clientSsl))));
+	}
+
+	@Test
+	public void testMessagingSendEndOfStream() throws IOException {
+		startServer(sslContext, serverSsl -> {
+			Messaging<String, String> messaging = Messaging.create(serverSsl, STRING_CODEC);
+			messaging.receive()
+				.whenComplete(messaging::close)
+				.whenComplete(assertCompleteFn(msg -> assertEquals(TEST_STRING, msg)));
+		});
+
+		await(TcpSocket.connect(reactor, address)
+			.map(socket -> SslTcpSocket.wrapClientSocket(reactor, socket, sslContext, executor))
+			.then(clientSsl -> {
+				Messaging<String, String> messaging = Messaging.create(clientSsl, STRING_CODEC);
+				return messaging.send(TEST_STRING)
+					.then(messaging::sendEndOfStream);
+			}));
 	}
 
 	void startServer(SSLContext sslContext, Consumer<ITcpSocket> logic) throws IOException {
