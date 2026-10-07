@@ -598,6 +598,7 @@ public class Promises {
 			}
 		}
 
+		if (resultPromise.isComplete()) return resultPromise;
 		return resultPromise.countdown == 0 ? Promise.of(resultPromise.getList()) : resultPromise;
 	}
 

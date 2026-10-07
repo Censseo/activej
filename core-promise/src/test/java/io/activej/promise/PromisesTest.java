@@ -71,6 +71,26 @@ public final class PromisesTest {
 	}
 
 	@Test
+	public void toListWithAlreadyFailedPromiseFirst() {
+		assertToListFails(Promise.ofException(new Exception("boom")), Promise.of(2), Promise.of(3));
+	}
+
+	@Test
+	public void toListWithAlreadyFailedPromiseInMiddle() {
+		assertToListFails(Promise.of(1), Promise.ofException(new Exception("boom")), Promise.of(3));
+	}
+
+	@Test
+	public void toListWithAlreadyFailedPromiseLast() {
+		assertToListFails(Promise.of(1), Promise.of(2), Promise.ofException(new Exception("boom")));
+	}
+
+	private static void assertToListFails(Promise<Integer> p1, Promise<Integer> p2, Promise<Integer> p3) {
+		assertEquals("boom", awaitException(toList(List.of(p1, p2, p3))).getMessage());
+		assertEquals("boom", awaitException(toList(List.of(p1, p2, p3).iterator())).getMessage());
+	}
+
+	@Test
 	public void toListPreservesOrder() {
 		List<Integer> list = await(toList(List.of(
 			delay(20)
