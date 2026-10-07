@@ -71,6 +71,17 @@ public final class PromisesTest {
 	}
 
 	@Test
+	public void toListFailsOnAlreadyFailedPromise() {
+		Exception expected = new Exception("boom");
+		// the failure is known before any promise is pending: must fail, never a truncated list with a null
+		assertSame(expected, awaitException(toList(Promise.ofException(expected))));
+		assertSame(expected, awaitException(toList(Promise.of(1), Promise.ofException(expected), Promise.of(3))));
+		assertSame(expected, awaitException(toList(List.of(Promise.ofException(expected), Promise.of(2)))));
+		assertSame(expected, awaitException(toList(Stream.of(Promise.of(1), Promise.ofException(expected)))));
+		assertSame(expected, awaitException(toArray(Integer.class, Promise.ofException(expected), Promise.of(2), Promise.of(3))));
+	}
+
+	@Test
 	public void toListPreservesOrder() {
 		List<Integer> list = await(toList(List.of(
 			delay(20)
