@@ -598,6 +598,9 @@ public class Promises {
 			}
 		}
 
+		// an already failed promise completes the result while iterating, with nothing pending (countdown == 0):
+		// answer that failure, not the half-filled list
+		if (resultPromise.isComplete()) return resultPromise;
 		return resultPromise.countdown == 0 ? Promise.of(resultPromise.getList()) : resultPromise;
 	}
 
