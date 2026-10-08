@@ -1,5 +1,16 @@
 # Changelog
 
+## v7.1.3 — 2026-10-08 — core-promise: `Promises.toList` fails on an already failed promise
+
+### Notable fixes
+
+- **`Promises.toList` (and `toArray`, which goes through it) no longer answers a SUCCESS with a truncated list when a
+  promise it meets is already failed.** When one of the promises was already failed at the time `toList` iterated over
+  it and nothing else was pending, the failure completed the result while iterating, but the `countdown == 0` shortcut
+  then returned `Promise.of(getList())`: the list cut at that index, the recycled slots still `null`, as a success. The
+  failure is answered now. `all()` and `any()` were already correct. Test:
+  `PromisesTest.toListFailsOnAlreadyFailedPromise`.
+
 ## v7.1.2 — 2026-08-28 — core-net: SslTcpSocket no longer kills the reactor on graceful close
 
 ### Notable fixes
